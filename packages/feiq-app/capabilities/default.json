@@ -1,0 +1,15 @@
+{
+  "identifier": "default",
+  "description": "Default capabilities for feiq++",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "core:event:default",
+    "core:event:allow-listen",
+    "core:event:allow-emit",
+    "dialog:default",
+    "notification:default",
+    "global-shortcut:default",
+    "fs:default"
+  ]
+}
