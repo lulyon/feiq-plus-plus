@@ -82,9 +82,14 @@ impl NetworkManager {
         self.udp.send_to(ip, port, data).await
     }
 
-    /// Broadcast UDP data to the LAN
+    /// Broadcast UDP data to the LAN on own port
     pub async fn broadcast(&self, data: &[u8]) -> anyhow::Result<()> {
         self.udp.broadcast(self.port, data).await
+    }
+
+    /// Broadcast to a specific port (for cross-port discovery)
+    pub async fn broadcast_to_port(&self, port: u16, data: &[u8]) -> anyhow::Result<()> {
+        self.udp.broadcast(port, data).await
     }
 
     /// Connect to a remote peer for file transfer (TCP)

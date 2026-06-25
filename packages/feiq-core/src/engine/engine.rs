@@ -105,11 +105,17 @@ impl Engine {
         // Update version with actual MAC
         self.version = format!("feiq_plus_plus#128#{self_mac}#0#0#0#1#9");
 
-        // Send online broadcast
+        // Send online broadcast on own port
         let online_data = build_br_entry(&self.config.name, &self.config.host, &self.version);
         network.broadcast(&online_data).await?;
 
-        // Broadcast to custom IP ranges
+        // If on non-standard port, also broadcast to default port 2425
+        // so standard-port peers can discover us
+        if self.config.port != 2425 {
+            network.broadcast_to_port(2425, &online_data).await?;
+        }
+
+        // Broadcast to custom IP ranges (always on their own port, guessing 2425)
         for ip in &self.config.custom_ips {
             let _ = network.send_to(ip, 2425, &online_data).await;
         }
