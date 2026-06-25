@@ -6,8 +6,7 @@
   "build": {
     "frontendDist": "../feiq-gui/dist",
     "devUrl": "http://localhost:5173",
-    "beforeDevCommand": "cd ../feiq-gui && npm run dev",
-    "beforeBuildCommand": "cd ../feiq-gui && npm run build"
+    "beforeDevCommand": "cd ../feiq-gui && npm run dev"
   },
   "app": {
     "withGlobalTauri": true,
