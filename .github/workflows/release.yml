@@ -26,6 +26,10 @@ jobs:
         working-directory: packages/feiq-gui
         run: npm ci
 
+      - name: Build frontend
+        working-directory: packages/feiq-gui
+        run: npm run build
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: "${{ matrix.target }}"
@@ -34,7 +38,7 @@ jobs:
         with:
           workspaces: packages/feiq-core -> target
 
-      - name: Install Linux system deps for Tauri
+      - name: Install Linux deps
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
@@ -42,27 +46,58 @@ jobs:
             libayatana-appindicator3-dev librsvg2-dev \
             libjavascriptcoregtk-4.1-dev libsoup-3.0-dev
 
-      - name: Build frontend
-        working-directory: packages/feiq-gui
-        run: npm run build
+      - name: Install Tauri CLI
+        run: cargo install tauri-cli --version "^2"
 
       - name: Build Tauri app
-        uses: tauri-apps/tauri-action@v0
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        working-directory: packages/feiq-app
+        run: cargo tauri build --target ${{ matrix.target }}
+
+      - name: Collect artifacts (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          mkdir -p artifacts
+          cp target/${{ matrix.target }}/release/bundle/dmg/*.dmg artifacts/ || true
+          ls artifacts/
+
+      - name: Collect artifacts (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          mkdir artifacts -Force
+          Copy-Item target/${{ matrix.target }}/release/bundle/nsis/*.exe artifacts/ -ErrorAction SilentlyContinue
+          Copy-Item target/${{ matrix.target }}/release/bundle/msi/*.msi artifacts/ -ErrorAction SilentlyContinue
+          ls artifacts/
+
+      - name: Collect artifacts (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          mkdir -p artifacts
+          cp target/${{ matrix.target }}/release/bundle/deb/*.deb artifacts/ || true
+          cp target/${{ matrix.target }}/release/bundle/appimage/*.AppImage artifacts/ || true
+          ls artifacts/
+
+      - uses: actions/upload-artifact@v4
         with:
-          tagName: ${{ github.ref_name }}
-          releaseName: "feiq++ v__VERSION__"
-          releaseBody: |
-            ## Changes
+          name: ${{ matrix.artifact }}
+          path: artifacts/*
+          if-no-files-found: ignore
 
-            See [CHANGELOG.md](./CHANGELOG.md) for details.
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
 
-            ## Downloads
+      - run: ls -R artifacts/
 
-            - **macOS**: `.dmg` for Intel and Apple Silicon
-            - **Windows**: `.msi` / `.exe` installer
-            - **Linux**: `.AppImage` and `.deb`
-          releaseDraft: true
-          prerelease: false
-          args: --target ${{ matrix.target }}
+      - uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          generate_release_notes: true
+          files: artifacts/**/*
