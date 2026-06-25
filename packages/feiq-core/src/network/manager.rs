@@ -34,16 +34,18 @@ pub struct NetworkManager {
     self_mac: String,
     self_name: String,
     event_tx: mpsc::UnboundedSender<NetworkEvent>,
+    port: u16,
 }
 
 impl NetworkManager {
-    /// Create a new network manager. Binds to IPMSG_PORT (2425).
+    /// Create a new network manager. Binds to the given port.
     pub async fn new(
         event_tx: mpsc::UnboundedSender<NetworkEvent>,
         self_name: String,
+        port: u16,
     ) -> anyhow::Result<Self> {
-        let udp = UdpTransport::bind(IPMSG_PORT).await?;
-        let tcp_server = FileServer::bind(IPMSG_PORT).await?;
+        let udp = UdpTransport::bind(port).await?;
+        let tcp_server = FileServer::bind(port).await?;
         let self_mac = udp.mac().to_string();
         let protocol_chain = crate::protocol::parser::build_default_chain();
 
@@ -58,6 +60,7 @@ impl NetworkManager {
             self_mac,
             self_name,
             event_tx,
+            port,
         })
     }
 
@@ -71,19 +74,22 @@ impl NetworkManager {
         &self.self_name
     }
 
-    /// Send UDP data to a specific IP
-    pub async fn send_to(&self, ip: &str, data: &[u8]) -> anyhow::Result<()> {
-        self.udp.send_to(ip, IPMSG_PORT, data).await
+    /// Get the port this instance is bound to
+    pub fn port(&self) -> u16 { self.port }
+
+    /// Send UDP data to a specific IP:port
+    pub async fn send_to(&self, ip: &str, port: u16, data: &[u8]) -> anyhow::Result<()> {
+        self.udp.send_to(ip, port, data).await
     }
 
     /// Broadcast UDP data to the LAN
     pub async fn broadcast(&self, data: &[u8]) -> anyhow::Result<()> {
-        self.udp.broadcast(IPMSG_PORT, data).await
+        self.udp.broadcast(self.port, data).await
     }
 
     /// Connect to a remote peer for file transfer (TCP)
-    pub async fn connect_for_file(&self, ip: &str) -> anyhow::Result<FileTransfer> {
-        FileTransfer::connect(ip, IPMSG_PORT).await
+    pub async fn connect_for_file(&self, ip: &str, port: u16) -> anyhow::Result<FileTransfer> {
+        FileTransfer::connect(ip, port).await
     }
 
     /// Accept an incoming file transfer connection

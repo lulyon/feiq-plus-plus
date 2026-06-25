@@ -1,15 +1,38 @@
+import { useState } from "react";
+import { invoke } from "@tauri-apps/api/core";
 import { useContactStore } from "../stores/contactStore";
 import { useMessageStore } from "../stores/messageStore";
-import { Users, Wifi, WifiOff } from "lucide-react";
+import { Users, Wifi, WifiOff, Plus } from "lucide-react";
 
 export function Sidebar() {
   const contacts = useContactStore((s) => s.contacts);
   const selectedIp = useContactStore((s) => s.selectedIp);
   const selectContact = useContactStore((s) => s.selectContact);
+  const upsertContact = useContactStore((s) => s.upsertContact);
   const unreadByIp = useMessageStore((s) => s.unreadByIp);
   const markRead = useMessageStore((s) => s.markRead);
 
+  const [showAdd, setShowAdd] = useState(false);
+  const [addValue, setAddValue] = useState("");
   const onlineCount = contacts.filter((c) => c.online).length;
+
+  const handleAdd = async () => {
+    const trimmed = addValue.trim();
+    if (!trimmed) return;
+    // Parse IP[:port] format, e.g. "127.0.0.1:2426"
+    const parts = trimmed.split(":");
+    const ip = parts[0];
+    const port = parts[1] ? parseInt(parts[1], 10) : 2425;
+
+    try {
+      await invoke("add_contact", { ip }); // or add_contact_with_port
+      upsertContact({ ip, port, pc_name: "", name: ip, host: "", mac: "", online: true, version: "", alias: "", group_name: "", signature: "" });
+      setAddValue("");
+      setShowAdd(false);
+    } catch (e) {
+      console.error("Add contact failed:", e);
+    }
+  };
 
   return (
     <div className="w-64 bg-white border-r border-gray-200 flex flex-col flex-shrink-0">
@@ -25,14 +48,36 @@ export function Sidebar() {
       </div>
 
       {/* Search */}
-      <div className="px-3 py-2">
+      <div className="px-3 py-2 flex gap-1">
         <input
           type="text"
           placeholder="Search contacts..."
-          className="w-full text-sm px-2 py-1.5 rounded-md border border-gray-200
+          className="flex-1 text-sm px-2 py-1.5 rounded-md border border-gray-200
                      focus:outline-none focus:border-blue-400 bg-gray-50"
         />
+        <button
+          onClick={() => setShowAdd(!showAdd)}
+          className="w-7 h-7 flex items-center justify-center rounded-md hover:bg-gray-200 text-gray-500 cursor-pointer"
+        >
+          <Plus className="w-4 h-4" />
+        </button>
       </div>
+
+      {/* Add contact form */}
+      {showAdd && (
+        <div className="px-3 pb-2">
+          <input
+            type="text"
+            value={addValue}
+            onChange={(e) => setAddValue(e.target.value)}
+            onKeyDown={(e) => e.key === "Enter" && handleAdd()}
+            placeholder="IP:port (e.g. 127.0.0.1:2426)"
+            className="w-full text-xs px-2 py-1 rounded-md border border-blue-300
+                       focus:outline-none focus:border-blue-500 bg-white"
+            autoFocus
+          />
+        </div>
+      )}
 
       {/* Contact List */}
       <div className="flex-1 overflow-y-auto">

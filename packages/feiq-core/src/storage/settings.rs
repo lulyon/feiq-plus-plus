@@ -28,8 +28,12 @@ pub struct AppConfig {
     /// Enable contact ranking by communication frequency
     #[serde(default = "default_true")]
     pub rank_user_enable: bool,
+    /// UDP/TCP port (default 2425). Change for multi-instance testing.
+    #[serde(default = "default_port")]
+    pub port: u16,
 }
 
+fn default_port() -> u16 { 2425 }
 fn default_name() -> String { "feiq_user".to_string() }
 fn default_host() -> String { "feiq++".to_string() }
 fn default_title() -> String { "feiq++".to_string() }
@@ -45,6 +49,7 @@ impl Default for AppConfig {
             custom_group: String::new(),
             custom_ips: Vec::new(),
             rank_user_enable: true,
+            port: 2425,
         }
     }
 }

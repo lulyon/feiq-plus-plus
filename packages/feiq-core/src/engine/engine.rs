@@ -99,7 +99,7 @@ impl Engine {
 
         let (net_tx, mut net_rx) = mpsc::unbounded_channel::<NetworkEvent>();
 
-        let mut network = NetworkManager::new(net_tx, self.config.name.clone()).await?;
+        let mut network = NetworkManager::new(net_tx, self.config.name.clone(), self.config.port).await?;
         let self_mac = network.self_mac().to_string();
 
         // Update version with actual MAC
@@ -111,7 +111,7 @@ impl Engine {
 
         // Broadcast to custom IP ranges
         for ip in &self.config.custom_ips {
-            let _ = network.send_to(ip, &online_data).await;
+            let _ = network.send_to(ip, 2425, &online_data).await;
         }
 
         self.network = Some(network);
@@ -151,6 +151,47 @@ impl Engine {
         let fellow = Fellow::new(ip);
         self.contacts.upsert(fellow.clone());
         fellow
+    }
+
+    /// Add a contact with custom port
+    pub fn add_contact_with_port(&mut self, ip: &str, port: u16) -> Fellow {
+        let mut fellow = Fellow::new(ip);
+        fellow.port = port;
+        self.contacts.upsert(fellow.clone());
+        fellow
+    }
+
+    /// Send text message over the network
+    pub async fn send_text_to(&self, ip: &str, port: u16, text: &str) -> anyhow::Result<()> {
+        if let Some(ref network) = self.network {
+            let data = build_text_message(
+                self.packet_id(),
+                &self.config.name,
+                &self.config.host,
+                &self.version,
+                text,
+            );
+            network.send_to(ip, port, &data).await?;
+        }
+        Ok(())
+    }
+
+    /// Send knock over the network
+    pub async fn send_knock_to(&self, ip: &str, port: u16) -> anyhow::Result<()> {
+        if let Some(ref network) = self.network {
+            let data = build_knock(&self.config.name, &self.config.host, &self.version);
+            network.send_to(ip, port, &data).await?;
+        }
+        Ok(())
+    }
+
+    /// Generate next packet ID
+    fn packet_id(&self) -> u64 {
+        // Simple: use timestamp millis as ID
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
     }
 }
 
@@ -283,11 +324,11 @@ pub fn build_ans_entry(name: &str, host: &str, version: &str) -> Vec<u8> {
 
 /// Build IPMSG_SENDMSG text message
 pub fn build_text_message(
-    text: &str,
     packet_no: u64,
     name: &str,
     host: &str,
     version: &str,
+    text: &str,
 ) -> Vec<u8> {
     let text_gbk = encode_gbk(text);
     pack_message(

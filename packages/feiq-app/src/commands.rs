@@ -84,18 +84,14 @@ pub async fn get_emoji_list() -> Result<Vec<serde_json::Value>, String> {
 #[tauri::command]
 pub async fn send_knock(state: State<'_, AppState>, ip: String) -> Result<(), String> {
     let engine = state.engine.lock().await;
-    let config = state.config.lock().await;
+    let port = 2425u16; // default, TODO: get from contact
+    engine.send_knock_to(&ip, port).await.map_err(|e| e.to_string())
+}
 
-    let data = feiq_core::engine::engine::build_knock(
-        &config.name,
-        &config.host,
-        engine.version(),
-    );
-
-    // Need network access — but Engine doesn't expose send_to directly yet
-    // For MVP, this is a placeholder
-    tracing::info!("Knock sent to {ip}");
-    let _ = (ip, data);
-    Ok(())
+#[tauri::command]
+pub async fn send_text(state: State<'_, AppState>, ip: String, text: String) -> Result<(), String> {
+    let engine = state.engine.lock().await;
+    let port = 2425u16;
+    engine.send_text_to(&ip, port, &text).await.map_err(|e| e.to_string())
 }
 

@@ -11,6 +11,7 @@ export interface Fellow {
   alias: string;
   group_name: string;
   signature: string;
+  port: number;
 }
 
 interface ContactStore {

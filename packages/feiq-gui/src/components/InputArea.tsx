@@ -1,6 +1,8 @@
 import { useState, useRef, type KeyboardEvent } from "react";
+import { invoke } from "@tauri-apps/api/core";
 import { Send, Smile } from "lucide-react";
 import { useMessageStore } from "../stores/messageStore";
+import { useContactStore } from "../stores/contactStore";
 import { EmojiPicker } from "./EmojiPicker";
 
 export function InputArea({ fellowIp }: { fellowIp: string }) {
@@ -8,10 +10,13 @@ export function InputArea({ fellowIp }: { fellowIp: string }) {
   const [showEmoji, setShowEmoji] = useState(false);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const addMessage = useMessageStore((s) => s.addMessage);
+  const contacts = useContactStore((s) => s.contacts);
 
-  const sendText = () => {
+  const sendText = async () => {
     const trimmed = text.trim();
     if (!trimmed) return;
+
+    const fellow = contacts.find((c) => c.ip === fellowIp);
 
     addMessage(fellowIp, {
       fromIp: "self",
@@ -23,6 +28,12 @@ export function InputArea({ fellowIp }: { fellowIp: string }) {
 
     setText("");
     inputRef.current?.focus();
+
+    // Actually send over network
+    if (fellow) {
+      invoke("send_text", { ip: fellow.ip, text: trimmed })
+        .catch((e) => console.error("Send failed:", e));
+    }
   };
 
   const handleKeyDown = (e: KeyboardEvent) => {

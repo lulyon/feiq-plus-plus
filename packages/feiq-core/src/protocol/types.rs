@@ -28,7 +28,12 @@ pub struct Fellow {
     /// Personal signature
     #[serde(default)]
     pub signature: String,
+    /// UDP port (default 2425, for multi-instance testing)
+    #[serde(default = "default_fellow_port")]
+    pub port: u16,
 }
+
+fn default_fellow_port() -> u16 { 2425 }
 
 impl Fellow {
     /// Create a new fellow with just IP (rest discovered later)
@@ -44,6 +49,7 @@ impl Fellow {
             alias: String::new(),
             group_name: String::new(),
             signature: String::new(),
+            port: 2425,
         }
     }
 

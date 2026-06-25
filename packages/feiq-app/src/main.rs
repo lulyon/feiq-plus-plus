@@ -18,10 +18,29 @@ fn main() {
         )
         .init();
 
+    // Parse CLI: feiq++ --name Alice --port 2426
+    let args: Vec<String> = std::env::args().collect();
+    let mut cli_port: Option<u16> = None;
+    let mut cli_name: Option<String> = None;
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--port" => { if i+1 < args.len() { cli_port = args[i+1].parse().ok(); i+=1; } }
+            "--name" => { if i+1 < args.len() { cli_name = Some(args[i+1].clone()); i+=1; } }
+            _ => {}
+        }
+        i += 1;
+    }
+
     // Load config from ~/.feiq_setting.ini (or create default)
     let config_path = home_dir().join(".feiq_setting.ini");
-    let config = feiq_core::storage::settings::AppConfig::load(&config_path)
+    let mut config = feiq_core::storage::settings::AppConfig::load(&config_path)
         .unwrap_or_default();
+
+    // CLI overrides
+    if let Some(port) = cli_port { config.port = port; }
+    if let Some(name) = cli_name { config.name = name; }
+    tracing::info!("Starting feiq++ as '{}' on port {}", config.name, config.port);
 
     let app_state = AppState::new(config);
 
@@ -51,6 +70,7 @@ fn main() {
             commands::update_settings,
             commands::get_emoji_list,
             commands::send_knock,
+            commands::send_text,
         ])
         .run(tauri::generate_context!())
         .expect("error while running feiq++");
