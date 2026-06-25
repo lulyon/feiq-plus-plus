@@ -8,8 +8,6 @@ packages/feiq-gui/dist/
 
 # Tauri
 packages/feiq-app/gen/
-packages/feiq-app/icons/icon.icns
-packages/feiq-app/icons/icon.ico
 
 # IDE
 .vscode/
