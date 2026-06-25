@@ -1,4 +1,5 @@
 import { create } from "zustand";
+import { useContactStore } from "./contactStore";
 
 export interface Content {
   type: "text" | "knock" | "file" | "image" | "id";

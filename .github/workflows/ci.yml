@@ -11,27 +11,7 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # ── Phase 1: Rust lib compile + test ──
-  rust:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: stable
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: packages/feiq-core -> target
-
-      - name: Check compilation
-        run: cargo check --workspace
-
-      - name: Run tests
-        run: cargo test --workspace
-
-  # ── Phase 2: Frontend type-check ──
+  # ── Phase 1: Frontend type-check + build ──
   frontend:
     runs-on: ubuntu-latest
     steps:
@@ -48,19 +28,23 @@ jobs:
         working-directory: packages/feiq-gui
         run: npx tsc --noEmit
 
-      - name: Build frontend
+      - name: Build frontend (needed for Tauri build.rs)
         working-directory: packages/feiq-gui
         run: npm run build
 
-  # ── Phase 3: Tauri build (Linux only for PR checks) ──
-  tauri-check:
-    needs: [rust, frontend]
+      - name: Upload frontend dist (for downstream jobs)
+        uses: actions/upload-artifact@v4
+        with:
+          name: feiq-gui-dist
+          path: packages/feiq-gui/dist/
+          retention-days: 1
+
+  # ── Phase 2: Rust compile + test ──
+  rust:
+    needs: frontend
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: "20"
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -70,13 +54,11 @@ jobs:
         with:
           workspaces: packages/feiq-core -> target
 
-      - name: Install frontend deps
-        working-directory: packages/feiq-gui
-        run: npm ci
-
-      - name: Build frontend
-        working-directory: packages/feiq-gui
-        run: npm run build
+      - name: Download frontend dist
+        uses: actions/download-artifact@v4
+        with:
+          name: feiq-gui-dist
+          path: packages/feiq-gui/dist/
 
       - name: Install Linux system deps for Tauri
         run: |
@@ -85,5 +67,39 @@ jobs:
             libayatana-appindicator3-dev librsvg2-dev \
             libjavascriptcoregtk-4.1-dev libsoup-3.0-dev
 
-      - name: Check Tauri app compiles
-        run: cargo check --manifest-path packages/feiq-app/Cargo.toml
+      - name: Check compilation
+        run: cargo check --workspace
+
+      - name: Run tests
+        run: cargo test --workspace
+
+  # ── Phase 3: Tauri build check ──
+  tauri-check:
+    needs: frontend
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: packages/feiq-core -> target
+
+      - name: Download frontend dist
+        uses: actions/download-artifact@v4
+        with:
+          name: feiq-gui-dist
+          path: packages/feiq-gui/dist/
+
+      - name: Install Linux system deps for Tauri
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev \
+            libayatana-appindicator3-dev librsvg2-dev \
+            libjavascriptcoregtk-4.1-dev libsoup-3.0-dev
+
+      - name: Build Tauri app
+        run: cargo build --manifest-path packages/feiq-app/Cargo.toml

@@ -3,8 +3,10 @@ import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
 import { Sidebar } from "./components/Sidebar";
 import { ChatPanel } from "./components/ChatPanel";
-import { useContactStore, Fellow } from "./stores/contactStore";
-import { useMessageStore, Message, Content } from "./stores/messageStore";
+import { useContactStore } from "./stores/contactStore";
+import type { Fellow } from "./stores/contactStore";
+import { useMessageStore } from "./stores/messageStore";
+import type { Content } from "./stores/messageStore";
 
 export default function App() {
   const upsertContact = useContactStore((s) => s.upsertContact);

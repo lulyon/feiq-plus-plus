@@ -1,4 +1,4 @@
-import { Message } from "../stores/messageStore";
+import type { Message } from "../stores/messageStore";
 
 /// Emoji codes mapping (same as Rust emoji.rs)
 const EMOJI_CODES: string[] = [

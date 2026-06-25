@@ -1,4 +1,4 @@
-import { useState, useRef, KeyboardEvent } from "react";
+import { useState, useRef, type KeyboardEvent } from "react";
 import { Send, Smile } from "lucide-react";
 import { useMessageStore } from "../stores/messageStore";
 import { EmojiPicker } from "./EmojiPicker";
