@@ -7,12 +7,9 @@ use tauri::{AppHandle, Emitter};
 pub fn start_event_forwarder(app_handle: AppHandle, state: &crate::state::AppState) {
     let event_rx = state.event_rx.clone();
 
-    tokio::spawn(async move {
+    tauri::async_runtime::spawn(async move {
         loop {
-            let event = {
-                let mut rx = event_rx.lock().await;
-                rx.recv().await
-            };
+            let event = event_rx.lock().await.recv().await;
 
             match event {
                 Some(FrontendEvent::ContactUpdate { fellow }) => {
@@ -49,7 +46,7 @@ pub fn start_event_forwarder(app_handle: AppHandle, state: &crate::state::AppSta
                 Some(FrontendEvent::Error(msg)) => {
                     let _ = app_handle.emit("engine-error", &msg);
                 }
-                None => break, // Channel closed
+                None => break,
             }
         }
     });

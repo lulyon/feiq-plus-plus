@@ -10,11 +10,8 @@ use tokio::sync::{mpsc, Mutex};
 pub struct AppState {
     pub engine: Arc<Mutex<Engine>>,
     pub config: Arc<Mutex<AppConfig>>,
-    /// Channel for sending events from engine to frontend
     pub event_rx: Arc<Mutex<mpsc::UnboundedReceiver<FrontendEvent>>>,
-    /// Channel for sending events from engine to frontend (sender side, kept for engine)
     pub event_tx: mpsc::UnboundedSender<FrontendEvent>,
-    /// Engine start/stop state
     pub running: Arc<Mutex<bool>>,
 }
 
