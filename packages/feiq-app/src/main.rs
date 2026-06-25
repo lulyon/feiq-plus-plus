@@ -37,9 +37,13 @@ fn main() {
     let mut config = feiq_core::storage::settings::AppConfig::load(&config_path)
         .unwrap_or_default();
 
-    // CLI overrides
+    // Env var overrides (FEIQ_PORT=2426 FEIQ_NAME=Bob)
+    if cli_port.is_none() { if let Ok(port) = std::env::var("FEIQ_PORT") { if let Ok(p) = port.parse() { config.port = p; } } }
+    if cli_name.is_none() { if let Ok(name) = std::env::var("FEIQ_NAME") { config.name = name; } }
+    // CLI overrides (highest priority)
     if let Some(port) = cli_port { config.port = port; }
     if let Some(name) = cli_name { config.name = name; }
+
     tracing::info!("Starting feiq++ as '{}' on port {}", config.name, config.port);
 
     let app_state = AppState::new(config);
