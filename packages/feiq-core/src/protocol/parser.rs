@@ -1,0 +1,441 @@
+//! Chain-of-responsibility protocol parser.
+//! Each handler tries to parse the Post; returns true if chain should stop.
+//! Mirrors feiqengine.cpp protocol chain.
+
+use crate::protocol::constants::*;
+use crate::protocol::encoding::*;
+use crate::protocol::serializer::*;
+use crate::protocol::types::*;
+
+/// A protocol handler in the chain.
+/// Returns true if the chain should stop (no further handlers called).
+pub trait RecvProtocol: Send + Sync {
+    fn name(&self) -> &str;
+    fn read(&self, post: &mut Post, chain: &ProtocolChain) -> bool;
+}
+
+/// Manages the chain of protocol handlers
+pub struct ProtocolChain {
+    handlers: Vec<Box<dyn RecvProtocol>>,
+}
+
+impl ProtocolChain {
+    pub fn new() -> Self {
+        Self {
+            handlers: Vec::new(),
+        }
+    }
+
+    pub fn add_handler(&mut self, handler: Box<dyn RecvProtocol>) {
+        self.handlers.push(handler);
+    }
+
+    /// Run all handlers in sequence. Each handler gets a mutable reference to the Post.
+    /// If any handler returns true, the chain stops.
+    pub fn process(&self, post: &mut Post) {
+        for handler in &self.handlers {
+            if handler.read(post, self) {
+                break;
+            }
+        }
+    }
+}
+
+impl Default for ProtocolChain {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ─── Debunger: prints raw packet info (development only) ─────
+
+pub struct DebugHandler;
+
+impl RecvProtocol for DebugHandler {
+    fn name(&self) -> &str {
+        "Debug"
+    }
+
+    fn read(&self, post: &mut Post, _chain: &ProtocolChain) -> bool {
+        if tracing::enabled!(tracing::Level::TRACE) {
+            tracing::trace!(
+                "Packet from {}: cmd=0x{:X}, extra_len={}, contents={}",
+                post.from.ip,
+                post.cmd_id,
+                post.extra.len(),
+                post.contents.len(),
+            );
+        }
+        false // never stop chain
+    }
+}
+
+// ─── RecvAnsEntry: handles IPMSG_ANSENTRY ────────────────────
+
+pub struct RecvAnsEntry;
+
+impl RecvProtocol for RecvAnsEntry {
+    fn name(&self) -> &str {
+        "RecvAnsEntry"
+    }
+
+    fn read(&self, post: &mut Post, _chain: &ProtocolChain) -> bool {
+        if is_cmd_set(post.cmd_id, IPMSG_ANSENTRY) {
+            let name = decode_gbk(&post.extra);
+            if !name.is_empty() {
+                post.from.name = name;
+            }
+            return true; // fully handled
+        }
+        false
+    }
+}
+
+// ─── RecvBrEntry: handles IPMSG_BR_ENTRY (user online) ──────
+
+pub struct RecvBrEntry;
+
+impl RecvProtocol for RecvBrEntry {
+    fn name(&self) -> &str {
+        "RecvBrEntry"
+    }
+
+    fn read(&self, post: &mut Post, _chain: &ProtocolChain) -> bool {
+        if is_cmd_set(post.cmd_id, IPMSG_BR_ENTRY) {
+            let name = decode_gbk(&post.extra);
+            if !name.is_empty() {
+                post.from.name = name;
+            }
+            return true; // fully handled
+        }
+        false
+    }
+}
+
+// ─── RecvBrExit: handles IPMSG_BR_EXIT (user offline) ───────
+
+pub struct RecvBrExit;
+
+impl RecvProtocol for RecvBrExit {
+    fn name(&self) -> &str {
+        "RecvBrExit"
+    }
+
+    fn read(&self, post: &mut Post, _chain: &ProtocolChain) -> bool {
+        if is_cmd_set(post.cmd_id, IPMSG_BR_EXIT) {
+            post.from.online = false;
+            return true;
+        }
+        false
+    }
+}
+
+// ─── RecvKnock: handles IPMSG_KNOCK (window shake) ──────────
+
+pub struct RecvKnock;
+
+impl RecvProtocol for RecvKnock {
+    fn name(&self) -> &str {
+        "RecvKnock"
+    }
+
+    fn read(&self, post: &mut Post, _chain: &ProtocolChain) -> bool {
+        if is_cmd_set(post.cmd_id, IPMSG_KNOCK) {
+            post.contents.push(Content::Knock);
+        }
+        false // continue chain (EndRecv will trigger)
+    }
+}
+
+// ─── RecvSendCheck: handles SENDCHECKOPT ─────────────────────
+
+pub struct RecvSendCheck;
+
+impl RecvProtocol for RecvSendCheck {
+    fn name(&self) -> &str {
+        "RecvSendCheck"
+    }
+
+    fn read(&self, _post: &mut Post, _chain: &ProtocolChain) -> bool {
+        // Handled externally by checking is_opt_set(post.cmd_id, IPMSG_SENDCHECKOPT)
+        // This is a marker handler - the actual reply logic is in the engine
+        false
+    }
+}
+
+// ─── RecvReadCheck: handles READCHECKOPT ─────────────────────
+
+pub struct RecvReadCheck;
+
+impl RecvProtocol for RecvReadCheck {
+    fn name(&self) -> &str {
+        "RecvReadCheck"
+    }
+
+    fn read(&self, _post: &mut Post, _chain: &ProtocolChain) -> bool {
+        false
+    }
+}
+
+// ─── RecvText: handles IPMSG_SENDMSG text body ───────────────
+
+pub struct RecvText;
+
+impl RecvProtocol for RecvText {
+    fn name(&self) -> &str {
+        "RecvText"
+    }
+
+    fn read(&self, post: &mut Post, _chain: &ProtocolChain) -> bool {
+        if !is_cmd_set(post.cmd_id, IPMSG_SENDMSG) {
+            return false;
+        }
+
+        // Text data starts after the first null byte (file data follows)
+        // If no null byte, entire extra is text
+        let null_pos = post.extra.iter().position(|&b| b == 0);
+
+        let text_bytes = match null_pos {
+            Some(0) => return false, // starts with null = no text
+            Some(pos) => &post.extra[..pos],
+            None => &post.extra[..],
+        };
+
+        if !text_bytes.is_empty() {
+            let raw_text = decode_gbk(text_bytes);
+            let content = parse_text_content(&raw_text);
+            post.contents.push(content);
+        }
+
+        false // continue to let RecvFile also parse
+    }
+}
+
+/// Parse text message with optional {format} suffix
+fn parse_text_content(raw: &str) -> Content {
+    // Check for {format} suffix: text{format}
+    if let Some(begin) = raw.find('{') {
+        if let Some(end) = raw[begin + 1..].find('}') {
+            let text = raw[..begin].to_string();
+            let format = raw[begin + 1..begin + 1 + end].to_string();
+            return Content::Text { text, format };
+        }
+    }
+
+    Content::Text {
+        text: raw.to_string(),
+        format: String::new(),
+    }
+}
+
+// ─── RecvFile: handles IPMSG_FILEATTACHOPT file data ─────────
+
+pub struct RecvFile;
+
+impl RecvProtocol for RecvFile {
+    fn name(&self) -> &str {
+        "RecvFile"
+    }
+
+    fn read(&self, post: &mut Post, _chain: &ProtocolChain) -> bool {
+        if !is_opt_set(post.cmd_id, IPMSG_FILEATTACHOPT) || !is_cmd_set(post.cmd_id, IPMSG_SENDMSG)
+        {
+            return false;
+        }
+
+        // File data follows the text portion after the first null byte
+        let null_pos = match post.extra.iter().position(|&b| b == 0) {
+            Some(pos) => pos + 1,
+            None => 0,
+        };
+
+        if null_pos == 0 || null_pos >= post.extra.len() {
+            return false;
+        }
+
+        let file_data = &post.extra[null_pos..];
+
+        // Each file task is separated by FILELIST_SEPARATOR (0x07)
+        // Format: fileId:filename:size:modifyTime:fileType:...\x07
+        let mut start = 0;
+        while start < file_data.len() {
+            let end = file_data[start..]
+                .iter()
+                .position(|&b| b == FILELIST_SEPARATOR)
+                .map(|p| start + p)
+                .unwrap_or(file_data.len());
+
+            if end <= start {
+                break;
+            }
+
+            let task_bytes = &file_data[start..end];
+            if let Some(content) = parse_file_task(task_bytes) {
+                post.contents.push(Content::File(content));
+            }
+
+            start = end + 1;
+            if start >= file_data.len() {
+                break;
+            }
+        }
+
+        false
+    }
+}
+
+/// Parse a single file task from bytes
+fn parse_file_task(data: &[u8]) -> Option<FileContent> {
+    let values = split_allow_separator(data, HLIST_ENTRY_SEPARATOR);
+    if values.len() < 5 {
+        return None;
+    }
+
+    let file_id: u64 = values[0].parse().ok()?;
+    let filename = decode_gbk(values[1].as_bytes());
+    let size: i64 = i64::from_str_radix(&values[2], 16).ok()?;
+    let modify_time: i64 = i64::from_str_radix(&values[3], 16).ok()?;
+    let file_type: u32 = u32::from_str_radix(&values[4], 16).ok()?;
+
+    Some(FileContent {
+        file_id,
+        filename,
+        path: String::new(),
+        size,
+        modify_time,
+        file_type,
+        packet_no: 0, // set by caller
+    })
+}
+
+// ─── RecvImage: handles IPMSG_SENDIMAGE ──────────────────────
+
+pub struct RecvImage;
+
+impl RecvProtocol for RecvImage {
+    fn name(&self) -> &str {
+        "RecvImage"
+    }
+
+    fn read(&self, post: &mut Post, _chain: &ProtocolChain) -> bool {
+        if is_cmd_set(post.cmd_id, IPMSG_SENDIMAGE)
+            && is_opt_set(post.cmd_id, IPMSG_FILEATTACHOPT)
+            && post.extra.len() >= 8
+        {
+            let id_bytes = &post.extra[..8];
+            let id = String::from_utf8_lossy(id_bytes).into_owned();
+            post.contents.push(Content::Image { id });
+        }
+        false
+    }
+}
+
+// ─── RecvReadMessage: handles IPMSG_RECVMSG (read receipt) ───
+
+pub struct RecvReadMessage;
+
+impl RecvProtocol for RecvReadMessage {
+    fn name(&self) -> &str {
+        "RecvReadMessage"
+    }
+
+    fn read(&self, post: &mut Post, _chain: &ProtocolChain) -> bool {
+        if is_cmd_set(post.cmd_id, IPMSG_RECVMSG) {
+            let extra_str = String::from_utf8_lossy(&post.extra);
+            if let Ok(id) = extra_str.trim().parse::<u64>() {
+                post.contents.push(Content::Id { id });
+            }
+            return true;
+        }
+        false
+    }
+}
+
+// ─── EndRecv: terminal handler, triggers event if contents exist ──
+
+pub struct EndRecv;
+
+impl RecvProtocol for EndRecv {
+    fn name(&self) -> &str {
+        "EndRecv"
+    }
+
+    fn read(&self, _post: &mut Post, _chain: &ProtocolChain) -> bool {
+        // Always stops the chain. The engine checks if post.contents is non-empty.
+        true
+    }
+}
+
+// ─── Builder ─────────────────────────────────────────────────
+
+/// Build the standard protocol chain (matching original feiq)
+pub fn build_default_chain() -> ProtocolChain {
+    let mut chain = ProtocolChain::new();
+
+    chain.add_handler(Box::new(DebugHandler));
+    chain.add_handler(Box::new(RecvAnsEntry));
+    chain.add_handler(Box::new(RecvBrEntry));
+    chain.add_handler(Box::new(RecvBrExit));
+    chain.add_handler(Box::new(RecvSendCheck));
+    chain.add_handler(Box::new(RecvReadCheck));
+    chain.add_handler(Box::new(RecvReadMessage));
+    chain.add_handler(Box::new(RecvText));
+    chain.add_handler(Box::new(RecvImage));
+    chain.add_handler(Box::new(RecvKnock));
+    chain.add_handler(Box::new(RecvFile));
+    chain.add_handler(Box::new(EndRecv));
+
+    chain
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_chain_br_entry() {
+        let chain = build_default_chain();
+        let mut post = Post::new("192.168.1.100");
+        post.cmd_id = IPMSG_BR_ENTRY;
+
+        // "张三" in GBK
+        let gbk_name = b"\xd5\xc5\xc8\xfd".to_vec();
+        post.extra = gbk_name;
+
+        chain.process(&mut post);
+
+        assert_eq!(post.from.name, "张三");
+        assert!(post.contents.is_empty()); // BR_ENTRY has no display content
+    }
+
+    #[test]
+    fn test_chain_text_message() {
+        let chain = build_default_chain();
+        let mut post = Post::new("192.168.1.100");
+        post.cmd_id = IPMSG_SENDMSG | IPMSG_SENDCHECKOPT;
+
+        // "你好世界" in GBK
+        let gbk_text = b"\xc4\xe3\xba\xc3\xca\xc0\xbd\xe7".to_vec();
+        post.extra = gbk_text;
+
+        chain.process(&mut post);
+
+        assert_eq!(post.contents.len(), 1);
+        match &post.contents[0] {
+            Content::Text { text, .. } => assert_eq!(text, "你好世界"),
+            _ => panic!("Expected Text content"),
+        }
+    }
+
+    #[test]
+    fn test_chain_knock() {
+        let chain = build_default_chain();
+        let mut post = Post::new("192.168.1.100");
+        post.cmd_id = IPMSG_KNOCK;
+
+        chain.process(&mut post);
+
+        assert_eq!(post.contents.len(), 1);
+        assert!(post.contents[0].is_knock());
+    }
+}

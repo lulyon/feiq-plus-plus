@@ -1,0 +1,6 @@
+[workspace]
+members = [
+    "packages/feiq-core",
+    "packages/feiq-app",
+]
+resolver = "2"
