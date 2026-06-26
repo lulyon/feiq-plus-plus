@@ -50,8 +50,8 @@ impl FileIdGen {
 /// The main engine controller
 pub struct Engine {
     config: AppConfig,
-    contacts: ContactBook,
-    network: Option<NetworkManager>,
+    contacts: Arc<Mutex<ContactBook>>,
+    network: Option<Arc<NetworkManager>>,
     event_tx: mpsc::UnboundedSender<FrontendEvent>,
     packet_id: PacketIdGen,
     file_id: FileIdGen,
@@ -76,7 +76,7 @@ impl Engine {
 
         Self {
             config,
-            contacts: ContactBook::new(),
+            contacts: Arc::new(Mutex::new(ContactBook::new())),
             network: None,
             event_tx,
             packet_id: PacketIdGen::new(),
@@ -99,7 +99,7 @@ impl Engine {
 
         let (net_tx, mut net_rx) = mpsc::unbounded_channel::<NetworkEvent>();
 
-        let mut network = NetworkManager::new(net_tx, self.config.name.clone(), self.config.port).await?;
+        let network = NetworkManager::new(net_tx, self.config.name.clone(), self.config.port).await?;
         let self_mac = network.self_mac().to_string();
 
         // Update version with actual MAC
@@ -120,16 +120,34 @@ impl Engine {
             let _ = network.send_to(ip, 2425, &online_data).await;
         }
 
-        self.network = Some(network);
+        // Wrap in Arc for sharing between recv loop and send methods
+        let network = Arc::new(network);
 
-        // Event dispatch loop
+        // Spawn UDP receive loop
+        let n = network.clone();
+        tokio::spawn(async move {
+            if let Err(e) = n.run().await {
+                tracing::error!("Network recv loop exited: {e}");
+            }
+        });
+
+        self.network = Some(network.clone());
+
+        // Build ANSENTRY reply payload (reused for all BR_ENTRY responses)
+        let ans_entry_data = build_ans_entry(&self.config.name, &self.config.host, &self.version);
+
+        // Event dispatch loop (with network access for ANSENTRY replies)
         let event_tx = self.event_tx.clone();
-        let contacts = self.contacts.clone_arc();
+        let contacts = self.contacts.clone();
         let config = self.config.clone();
 
         tokio::spawn(async move {
             while let Some(event) = net_rx.recv().await {
-                handle_network_event(event, &event_tx, &contacts, &config);
+                let reply = handle_network_event(event, &event_tx, &contacts, &config);
+                // Reply ANSENTRY for mutual discovery
+                if let Some((ip, port)) = reply {
+                    let _ = network.send_to(&ip, port, &ans_entry_data).await;
+                }
             }
         });
 
@@ -139,23 +157,23 @@ impl Engine {
 
     /// Get all known contacts (for frontend)
     pub fn get_contacts(&self) -> Vec<Fellow> {
-        self.contacts.all()
+        self.contacts.lock().unwrap().all()
     }
 
     /// Search contacts by query
     pub fn search_contacts(&self, query: &str) -> Vec<Fellow> {
-        self.contacts.search(query)
+        self.contacts.lock().unwrap().search(query)
     }
 
     /// Get a contact by IP
     pub fn find_contact(&self, ip: &str) -> Option<Fellow> {
-        self.contacts.find_by_ip(ip)
+        self.contacts.lock().unwrap().find_by_ip(ip)
     }
 
     /// Add a contact manually (user-added by IP)
     pub fn add_contact(&mut self, ip: &str) -> Fellow {
         let fellow = Fellow::new(ip);
-        self.contacts.upsert(fellow.clone());
+        self.contacts.lock().unwrap().upsert(fellow.clone());
         fellow
     }
 
@@ -163,7 +181,7 @@ impl Engine {
     pub fn add_contact_with_port(&mut self, ip: &str, port: u16) -> Fellow {
         let mut fellow = Fellow::new(ip);
         fellow.port = port;
-        self.contacts.upsert(fellow.clone());
+        self.contacts.lock().unwrap().upsert(fellow.clone());
         fellow
     }
 
@@ -177,7 +195,10 @@ impl Engine {
                 &self.version,
                 text,
             );
+            tracing::info!("Engine sending text to {ip}:{port}: {text}");
             network.send_to(ip, port, &data).await?;
+        } else {
+            tracing::warn!("Engine::send_text_to called but network is None");
         }
         Ok(())
     }
@@ -208,9 +229,11 @@ fn handle_network_event(
     event_tx: &mpsc::UnboundedSender<FrontendEvent>,
     contacts: &Arc<Mutex<ContactBook>>,
     _config: &AppConfig,
-) {
+) -> Option<(String, u16)> {
     match event {
-        NetworkEvent::FellowOnline(post) | NetworkEvent::FellowAnsEntry(post) => {
+        NetworkEvent::FellowOnline(post) => {
+            let ip = post.from.ip.clone();
+            let port = post.from.port;
             let fellow = post.from;
             let mut book = contacts.lock().unwrap();
             let is_new = book.find_by_ip(&fellow.ip).is_none();
@@ -225,6 +248,26 @@ fn handle_network_event(
                     fellow: display_fellow,
                 });
             }
+
+            // Reply ANSENTRY for mutual discovery (return to caller)
+            Some((ip, port))
+        }
+        NetworkEvent::FellowAnsEntry(post) => {
+            let fellow = post.from;
+            let mut book = contacts.lock().unwrap();
+            let is_new = book.find_by_ip(&fellow.ip).is_none();
+            let changed = book.upsert(fellow.clone());
+
+            let mut display_fellow = book.find_by_ip(&fellow.ip)
+                .unwrap_or(fellow);
+            display_fellow.online = true;
+
+            if is_new || changed {
+                let _ = event_tx.send(FrontendEvent::ContactUpdate {
+                    fellow: display_fellow,
+                });
+            }
+            None // ANSENTRY is itself a reply, don't reply to a reply
         }
         NetworkEvent::FellowOffline(post) => {
             let mut fellow = post.from;
@@ -232,6 +275,7 @@ fn handle_network_event(
             let mut book = contacts.lock().unwrap();
             book.upsert(fellow.clone());
             let _ = event_tx.send(FrontendEvent::ContactUpdate { fellow });
+            None
         }
         NetworkEvent::Message(mut post) => {
             // Filter unsupported content types (mirrors original onMsg)
@@ -269,6 +313,12 @@ fn handle_network_event(
 
             if !post.contents.is_empty() {
                 let timestamp = post.when.timestamp_millis();
+                tracing::info!(
+                    "Dispatching message from {} (ip={}): {} contents",
+                    post.from.display_name(),
+                    post.from.ip,
+                    post.contents.len(),
+                );
                 let _ = event_tx.send(FrontendEvent::NewMessage {
                     from_ip: post.from.ip.clone(),
                     from_name: post.from.display_name().to_string(),
@@ -280,9 +330,11 @@ fn handle_network_event(
                 let mut book = contacts.lock().unwrap();
                 book.upsert(post.from);
             }
+            None
         }
         NetworkEvent::Error(msg) => {
             let _ = event_tx.send(FrontendEvent::Error(msg));
+            None
         }
     }
 }

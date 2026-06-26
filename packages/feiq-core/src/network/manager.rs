@@ -79,6 +79,7 @@ impl NetworkManager {
 
     /// Send UDP data to a specific IP:port
     pub async fn send_to(&self, ip: &str, port: u16, data: &[u8]) -> anyhow::Result<()> {
+        tracing::debug!("UDP send {} bytes to {ip}:{port}", data.len());
         self.udp.send_to(ip, port, data).await
     }
 
@@ -104,11 +105,12 @@ impl NetworkManager {
     }
 
     /// Main receive loop. Runs forever, dispatching parsed packets.
-    pub async fn run(&mut self) -> anyhow::Result<()> {
+    pub async fn run(&self) -> anyhow::Result<()> {
         loop {
             match self.udp.recv_from().await {
-                Ok((data, ip)) => {
-                    self.handle_packet(&data, &ip);
+                Ok((data, ip, port)) => {
+                    tracing::trace!("UDP recv {} bytes from {ip}:{port}", data.len());
+                    self.handle_packet(&data, &ip, port);
                 }
                 Err(e) => {
                     tracing::error!("UDP recv error: {e}");
@@ -119,9 +121,9 @@ impl NetworkManager {
     }
 
     /// Parse and dispatch a single received packet
-    fn handle_packet(&self, data: &[u8], ip: &str) {
+    fn handle_packet(&self, data: &[u8], ip: &str, sender_port: u16) {
         // Parse raw data through serializer (includes self-filter)
-        let mut post = match parse_raw(data, ip, &self.self_mac, &self.self_name) {
+        let mut post = match parse_raw(data, ip, sender_port, &self.self_mac, &self.self_name) {
             Some(post) => post,
             None => return, // filtered or malformed
         };

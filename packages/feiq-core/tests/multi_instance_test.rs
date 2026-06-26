@@ -1,7 +1,7 @@
 //! Integration test: two Engine instances on different ports exchanging messages.
 //! Tests the full protocol stack end-to-end without GUI.
 
-use feiq_core::engine::engine::{build_br_entry, build_knock, build_text_message};
+use feiq_core::engine::engine::{build_ans_entry, build_br_entry, build_knock, build_text_message};
 use feiq_core::network::manager::NetworkEvent;
 use feiq_core::protocol::constants::*;
 use feiq_core::protocol::parser::ProtocolChain;
@@ -67,9 +67,10 @@ impl TestPeer {
                     Ok((len, addr)) => {
                         let data = buf[..len].to_vec();
                         let ip = addr.ip().to_string();
+                        let port = addr.port();
 
-                        // Parse raw packet
-                        let mut post = match parse_raw(&data, &ip, &mac, &name) {
+                        // Parse raw packet (with sender's actual port)
+                        let mut post = match parse_raw(&data, &ip, port, &mac, &name) {
                             Some(p) => p,
                             None => continue, // filtered or malformed
                         };
@@ -89,6 +90,11 @@ impl TestPeer {
                                 IPMSG_BR_EXIT,
                             ) {
                                 let _ = event_tx.send(NetworkEvent::FellowOffline(post));
+                            } else if feiq_core::protocol::constants::is_cmd_set(
+                                post.cmd_id,
+                                IPMSG_ANSENTRY,
+                            ) {
+                                let _ = event_tx.send(NetworkEvent::FellowAnsEntry(post));
                             }
                         } else {
                             let _ = event_tx.send(NetworkEvent::Message(post));
@@ -109,6 +115,10 @@ impl TestPeer {
 
     fn build_knock(&self) -> Vec<u8> {
         build_knock(&self.name, "test-host", &self.ver)
+    }
+
+    fn build_ans_entry(&self) -> Vec<u8> {
+        build_ans_entry(&self.name, "test-host", &self.ver)
     }
 
     fn build_text(&self, packet_no: u64, text: &str) -> Vec<u8> {
@@ -189,6 +199,53 @@ async fn test_two_instances_exchange_text() {
         _ => panic!("Expected FellowOnline"),
     }
     println!("✅ Test 3: Bob → Alice online discovery");
+
+    // ── Test 3b: Alice replies ANSENTRY to Bob (mutual discovery) ──
+    alice
+        .send_to("127.0.0.1", bob.port, &alice.build_ans_entry())
+        .await;
+
+    let event = tokio::time::timeout(Duration::from_secs(2), bob_rx.recv())
+        .await
+        .expect("Timeout: Bob didn't receive ANSENTRY")
+        .expect("Bob channel closed");
+
+    match event {
+        NetworkEvent::FellowAnsEntry(post) => {
+            assert_eq!(post.from.name, "Alice");
+            assert!(post.from.online);
+            // Verify Bob recorded Alice's actual port (not default)
+            assert_eq!(post.from.port, alice.port,
+                "ANSENTRY should preserve sender's actual port");
+        }
+        _ => panic!("Expected FellowAnsEntry"),
+    }
+    println!("✅ Test 3b: Alice → Bob ANSENTRY (mutual discovery, port={})", alice.port);
+
+    // ── Test 3c: Verify port is not default when received from non-standard port ──
+    let bob2 = Arc::new(TestPeer::new("BobNonStd", 13553).await);
+    let (bob2_tx, mut bob2_rx) = mpsc::unbounded_channel::<NetworkEvent>();
+    let _b2 = bob2.clone().spawn_recv(bob2_tx);
+    sleep(Duration::from_millis(200)).await;
+
+    // BobNonStd on port 13553 sends BR_ENTRY to Alice on port 13551
+    bob2.send_to("127.0.0.1", alice.port, &bob2.build_br_entry()).await;
+
+    let event = tokio::time::timeout(Duration::from_secs(2), alice_rx.recv())
+        .await
+        .expect("Timeout: Alice didn't receive BR_ENTRY from non-std port")
+        .expect("Alice channel closed");
+
+    match event {
+        NetworkEvent::FellowOnline(post) => {
+            assert_eq!(post.from.name, "BobNonStd");
+            // Alice should record BobNonStd's real port (13553), not default 2425
+            assert_eq!(post.from.port, 13553,
+                "Port should be {} (sender's actual port), not 2425 (default)", 13553);
+        }
+        _ => panic!("Expected FellowOnline"),
+    }
+    println!("✅ Test 3c: Port preserved from non-standard port sender");
 
     // ── Test 4: Self-filter ──
     alice

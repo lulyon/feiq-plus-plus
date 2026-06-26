@@ -13,6 +13,14 @@ cargo check --workspace     # fast compile check
 cargo test --workspace       # run all 27 tests
 cargo build --workspace      # full build
 cargo tauri dev              # dev mode with hot-reload frontend
+
+# Multi-instance testing (2 peers on same machine):
+npm --prefix packages/feiq-gui run build   # build frontend once
+./scripts/dev-multi.sh                     # launches Alice:2425 + Bob:2426
+# Or manual:
+FEIQ_NAME=Alice cargo run --package feiq-app
+FEIQ_NAME=Bob FEIQ_PORT=2426 cargo run --package feiq-app
+# Note: requires `custom-protocol` feature in feiq-app Cargo.toml (already set)
 ```
 
 ## Architecture (MVC-like)

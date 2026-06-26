@@ -53,12 +53,12 @@ impl UdpTransport {
         self.send_to("255.255.255.255", port, data).await
     }
 
-    /// Receive one datagram. Returns (data, sender_ip).
-    pub async fn recv_from(&self) -> anyhow::Result<(Vec<u8>, String)> {
+    /// Receive one datagram. Returns (data, sender_ip, sender_port).
+    pub async fn recv_from(&self) -> anyhow::Result<(Vec<u8>, String, u16)> {
         let mut buf = vec![0u8; MAX_RCV_SIZE];
         let (len, addr) = self.socket.recv_from(&mut buf).await?;
         buf.truncate(len);
-        Ok((buf, addr.ip().to_string()))
+        Ok((buf, addr.ip().to_string(), addr.port()))
     }
 
     /// Get the local address this socket is bound to

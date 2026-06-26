@@ -4,6 +4,7 @@ use crate::state::AppState;
 use feiq_core::protocol::types::Fellow;
 use feiq_core::storage::settings::AppConfig;
 use tauri::State;
+use tracing;
 
 // ─── Engine Lifecycle ────────────────────────────────────────
 
@@ -84,14 +85,16 @@ pub async fn get_emoji_list() -> Result<Vec<serde_json::Value>, String> {
 #[tauri::command]
 pub async fn send_knock(state: State<'_, AppState>, ip: String) -> Result<(), String> {
     let engine = state.engine.lock().await;
-    let port = 2425u16; // default, TODO: get from contact
+    let port = engine.find_contact(&ip).map(|f| f.port).unwrap_or(2425);
+    tracing::info!("send_knock to {ip}: contact_port={port}");
     engine.send_knock_to(&ip, port).await.map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 pub async fn send_text(state: State<'_, AppState>, ip: String, text: String) -> Result<(), String> {
     let engine = state.engine.lock().await;
-    let port = 2425u16;
+    let port = engine.find_contact(&ip).map(|f| f.port).unwrap_or(2425);
+    tracing::info!("send_text to {ip}: contact_port={port}, text={text}");
     engine.send_text_to(&ip, port, &text).await.map_err(|e| e.to_string())
 }
 

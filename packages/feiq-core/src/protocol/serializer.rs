@@ -76,6 +76,7 @@ pub struct ParseState {
 pub fn parse_raw(
     data: &[u8],
     sender_ip: &str,
+    sender_port: u16,
     self_mac: &str,
     self_name: &str,
 ) -> Option<Post> {
@@ -116,6 +117,7 @@ pub fn parse_raw(
     post.from.host = host_name;
     post.from.version = version.to_string();
     post.from.mac = version_info.mac.clone();
+    post.from.port = sender_port;
     post.extra = extra;
 
     // Unless receiving an exit message, assume online
@@ -242,14 +244,20 @@ pub fn get_filename_from_path(path: &str) -> String {
     }
 }
 
-/// Check if string starts with pattern
+/// Check if string starts with pattern (UTF-8 safe)
 pub fn starts_with(s: &str, pattern: &str) -> bool {
-    s.len() >= pattern.len() && &s[..pattern.len()] == pattern
+    s.as_bytes()
+        .get(..pattern.len())
+        .map(|b| b == pattern.as_bytes())
+        .unwrap_or(false)
 }
 
-/// Check if string ends with pattern
+/// Check if string ends with pattern (UTF-8 safe)
 pub fn ends_with(s: &str, pattern: &str) -> bool {
-    s.len() >= pattern.len() && &s[s.len() - pattern.len()..] == pattern
+    s.as_bytes()
+        .get(s.len().saturating_sub(pattern.len())..)
+        .map(|b| b == pattern.as_bytes())
+        .unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -280,6 +288,7 @@ mod tests {
         let result = parse_raw(
             packet.as_bytes(),
             "192.168.1.1",
+            2425,
             "AABBCCDDEEFF",
             name,
         );

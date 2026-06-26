@@ -6,7 +6,7 @@ description = "Feiq++ Tauri desktop application"
 
 [dependencies]
 feiq-core = { path = "../feiq-core" }
-tauri = { version = "2", features = ["tray-icon"] }
+tauri = { version = "2", features = ["tray-icon", "custom-protocol"] }
 tauri-plugin-notification = "2"
 tauri-plugin-global-shortcut = "2"
 tauri-plugin-dialog = "2"
