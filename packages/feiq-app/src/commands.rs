@@ -3,6 +3,7 @@
 use crate::state::AppState;
 use feiq_core::protocol::types::Fellow;
 use feiq_core::storage::settings::AppConfig;
+use std::path::PathBuf;
 use tauri::State;
 use tracing;
 
@@ -24,7 +25,13 @@ pub async fn start_engine(state: State<'_, AppState>) -> Result<String, String> 
 #[tauri::command]
 pub async fn stop_engine(state: State<'_, AppState>) -> Result<String, String> {
     let mut running = state.running.lock().await;
+    if !*running {
+        return Ok("Engine not running".into());
+    }
+    let mut engine = state.engine.lock().await;
+    engine.stop().await;
     *running = false;
+    tracing::info!("Engine stopped by user request");
     Ok("Engine stopped".into())
 }
 
@@ -57,10 +64,25 @@ pub async fn get_settings(state: State<'_, AppState>) -> Result<AppConfig, Strin
 }
 
 #[tauri::command]
-pub async fn update_settings(state: State<'_, AppState>, config: AppConfig) -> Result<(), String> {
+pub async fn update_settings(state: State<'_, AppState>, config: AppConfig) -> Result<String, String> {
+    let config_path = dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".feiq_setting.ini");
+
+    // Persist to file
+    config.save(&config_path).map_err(|e| e.to_string())?;
+
+    // Update in-memory state
     let mut current = state.config.lock().await;
-    *current = config;
-    Ok(())
+    *current = config.clone();
+
+    // Update running engine (takes effect immediately for new messages,
+    // but periodic broadcast continues with old name until restart)
+    let mut engine = state.engine.lock().await;
+    engine.update_config(config);
+
+    tracing::info!("Settings saved to {:?}", config_path);
+    Ok("Settings saved. Restart recommended for full effect.".into())
 }
 
 // ─── Emoji ────────────────────────────────────────────────────

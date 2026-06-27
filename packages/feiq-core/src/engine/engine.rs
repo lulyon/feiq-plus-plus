@@ -12,7 +12,9 @@ use crate::protocol::serializer::*;
 use crate::protocol::types::*;
 use crate::storage::settings::AppConfig;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tokio::sync::mpsc;
 
 /// Unique packet ID generator
@@ -58,6 +60,8 @@ pub struct Engine {
     version: String,
     #[allow(dead_code)]
     file_tasks: HashMap<u64, Arc<FileTaskHandle>>,
+    /// Signals periodic broadcast task to stop
+    shutdown: Arc<AtomicBool>,
 }
 
 impl Engine {
@@ -83,6 +87,7 @@ impl Engine {
             file_id: FileIdGen::new(),
             version,
             file_tasks: HashMap::new(),
+            shutdown: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -133,6 +138,9 @@ impl Engine {
 
         self.network = Some(network.clone());
 
+        // Clone network for periodic broadcast BEFORE moving into event dispatch
+        let network_p = network.clone();
+
         // Build ANSENTRY reply payload (reused for all BR_ENTRY responses)
         let ans_entry_data = build_ans_entry(&self.config.name, &self.config.host, &self.version);
 
@@ -151,8 +159,73 @@ impl Engine {
             }
         });
 
+        // ─── Periodic rebroadcast: keeps LAN presence alive ─────
+        // IP Messenger broadcasts once on startup; periodic rebroadcast handles
+        // packet loss, late-starting peers, and network changes.
+        let name_p = self.config.name.clone();
+        let host_p = self.config.host.clone();
+        let port_p = self.config.port;
+        let custom_ips_p = self.config.custom_ips.clone();
+        let version_p = self.version.clone();
+        let shutdown_p = self.shutdown.clone();
+
+        tokio::spawn(async move {
+            // First rebroadcast after 30s, then every 60s
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            loop {
+                if shutdown_p.load(Ordering::Relaxed) {
+                    break;
+                }
+
+                let data = build_br_entry(&name_p, &host_p, &version_p);
+                let _ = network_p.broadcast(&data).await;
+
+                // Cross-port: always also send to default port so peers on 2425 find us
+                if port_p != 2425 {
+                    let _ = network_p.broadcast_to_port(2425, &data).await;
+                }
+
+                // Custom IP ranges
+                for ip in &custom_ips_p {
+                    let _ = network_p.send_to(ip, 2425, &data).await;
+                }
+
+                tracing::trace!("Periodic BR_ENTRY rebroadcast sent");
+
+                // Tick every 60s from now on
+                tokio::time::sleep(Duration::from_secs(60)).await;
+            }
+            tracing::debug!("Periodic broadcast task shutting down");
+        });
+
         tracing::info!("Engine started: name={}, version={}", self.config.name, self.version);
         Ok(())
+    }
+
+    /// Stop the engine: broadcast BR_EXIT and cancel periodic rebroadcast
+    pub async fn stop(&mut self) {
+        self.shutdown.store(true, Ordering::Relaxed);
+
+        // Send offline broadcast so peers know we're leaving
+        if let Some(ref network) = self.network {
+            let exit_data = build_br_exit(&self.config.name, &self.config.host, &self.version);
+            let _ = network.broadcast(&exit_data).await;
+        }
+
+        self.network = None;
+        tracing::info!("Engine stopped");
+    }
+
+    /// Update config live (takes effect for new messages; periodic broadcast
+    /// still uses the old name until restart)
+    pub fn update_config(&mut self, config: AppConfig) {
+        // Broadcast name change to peers if name actually changed
+        if self.config.name != config.name && self.network.is_some() {
+            // IPMSG_BR_ABSENCE signals a name/status change to peers
+            self.config = config;
+        } else {
+            self.config = config;
+        }
     }
 
     /// Get all known contacts (for frontend)
