@@ -170,7 +170,7 @@ impl Engine {
         let shutdown_p = self.shutdown.clone();
 
         tokio::spawn(async move {
-            // First rebroadcast after 30s, then every 60s
+            // First rebroadcast after 30s, then every 10s
             tokio::time::sleep(Duration::from_secs(30)).await;
             loop {
                 if shutdown_p.load(Ordering::Relaxed) {
@@ -192,8 +192,8 @@ impl Engine {
 
                 tracing::trace!("Periodic BR_ENTRY rebroadcast sent");
 
-                // Tick every 60s from now on
-                tokio::time::sleep(Duration::from_secs(60)).await;
+                // Tick every 10s from now on
+                tokio::time::sleep(Duration::from_secs(10)).await;
             }
             tracing::debug!("Periodic broadcast task shutting down");
         });
