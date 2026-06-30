@@ -31,6 +31,41 @@ function renderText(text: string): string {
   return result;
 }
 
+/** Normalized content with type field resolved */
+interface NormalizedContent {
+  type: string;
+  text?: string;
+  format?: string;
+  filename?: string;
+  size?: number;
+}
+
+/** Normalize Content from either externally-tagged (Rust serde) or internally-tagged (frontend) format */
+function normalizeContent(raw: Record<string, unknown>): NormalizedContent {
+  // Externally-tagged: {"text": {"text": "Hello", "format": ""}}
+  if (raw.text !== undefined && typeof raw.text === "object") {
+    const inner = raw.text as Record<string, unknown>;
+    return { type: "text", text: String(inner.text || ""), format: String(inner.format || "") };
+  }
+  if (raw.knock !== undefined) return { type: "knock" };
+  if (raw.file !== undefined && typeof raw.file === "object") {
+    const inner = raw.file as Record<string, unknown>;
+    return {
+      type: "file",
+      filename: String(inner.filename || ""),
+      size: Number(inner.size || 0),
+    };
+  }
+  if (raw.image !== undefined) return { type: "image" };
+  // Already internally-tagged or unknown — return as-is with defaults
+  return {
+    type: String(raw.type || "text"),
+    text: typeof raw.text === "string" ? raw.text : String(raw.text || ""),
+    filename: String(raw.filename || ""),
+    size: Number(raw.size || 0),
+  };
+}
+
 export function MessageBubble({ message }: { message: Message }) {
   const isSent = message.direction === "sent";
   const time = new Date(message.timestamp).toLocaleTimeString([], {
@@ -47,7 +82,8 @@ export function MessageBubble({ message }: { message: Message }) {
           </div>
         )}
 
-        {message.contents.map((content, i) => {
+        {message.contents.map((rawContent, i) => {
+          const content = normalizeContent(rawContent as unknown as Record<string, unknown>);
           if (content.type === "text") {
             return (
               <div

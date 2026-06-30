@@ -2,6 +2,7 @@
 
 use crate::state::AppState;
 use feiq_core::protocol::types::Fellow;
+use feiq_core::storage::history::MessageRecord;
 use feiq_core::storage::settings::AppConfig;
 use std::path::PathBuf;
 use tauri::State;
@@ -83,6 +84,21 @@ pub async fn update_settings(state: State<'_, AppState>, config: AppConfig) -> R
 
     tracing::info!("Settings saved to {:?}", config_path);
     Ok("Settings saved. Restart recommended for full effect.".into())
+}
+
+// ─── Chat History ────────────────────────────────────────────
+
+#[tauri::command]
+pub async fn get_chat_history(
+    state: State<'_, AppState>,
+    ip: String,
+    offset: i64,
+    limit: i64,
+) -> Result<Vec<MessageRecord>, String> {
+    let engine = state.engine.lock().await;
+    engine
+        .get_chat_history(&ip, offset, limit)
+        .map_err(|e| e.to_string())
 }
 
 // ─── Emoji ────────────────────────────────────────────────────

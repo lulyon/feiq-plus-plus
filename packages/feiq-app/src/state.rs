@@ -3,6 +3,7 @@
 use feiq_core::engine::engine::Engine;
 use feiq_core::engine::events::FrontendEvent;
 use feiq_core::storage::settings::AppConfig;
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
 
@@ -16,9 +17,9 @@ pub struct AppState {
 }
 
 impl AppState {
-    pub fn new(config: AppConfig) -> Self {
+    pub fn new(config: AppConfig, history_db_path: PathBuf) -> Self {
         let (event_tx, event_rx) = mpsc::unbounded_channel::<FrontendEvent>();
-        let engine = Engine::new(config.clone(), event_tx.clone());
+        let engine = Engine::new(config.clone(), event_tx.clone(), Some(history_db_path));
 
         Self {
             engine: Arc::new(Mutex::new(engine)),

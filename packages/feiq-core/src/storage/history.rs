@@ -7,7 +7,7 @@ use rusqlite::{params, Connection};
 use std::path::Path;
 
 /// A stored message record
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct MessageRecord {
     pub id: i64,
     pub contact_ip: String,

@@ -46,7 +46,8 @@ fn main() {
 
     tracing::info!("Starting feiq++ as '{}' on port {}", config.name, config.port);
 
-    let app_state = AppState::new(config);
+    let history_db_path = home_dir().join(".feiq_history.sqlite3");
+    let app_state = AppState::new(config, history_db_path);
 
     tauri::Builder::default()
         .plugin(tauri_plugin_notification::init())
@@ -72,6 +73,7 @@ fn main() {
             commands::add_contact,
             commands::get_settings,
             commands::update_settings,
+            commands::get_chat_history,
             commands::get_emoji_list,
             commands::send_knock,
             commands::send_text,

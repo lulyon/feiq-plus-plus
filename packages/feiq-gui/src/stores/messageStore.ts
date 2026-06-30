@@ -1,12 +1,18 @@
 import { create } from "zustand";
 import { useContactStore } from "./contactStore";
 
+// Content can be either internally-tagged (frontend) or externally-tagged (Rust serde)
+// The MessageBubble normalizes both formats, so this type is intentionally loose.
 export interface Content {
-  type: "text" | "knock" | "file" | "image" | "id";
-  text?: string;
+  type?: string;
+  text?: string | Record<string, unknown>;
   format?: string;
   filename?: string;
   size?: number;
+  knock?: unknown;
+  file?: Record<string, unknown>;
+  image?: Record<string, unknown>;
+  id?: Record<string, unknown>;
 }
 
 export interface Message {
@@ -20,13 +26,17 @@ export interface Message {
 interface MessageStore {
   messagesByIp: Record<string, Message[]>;
   unreadByIp: Record<string, number>;
+  hasHistory: Record<string, boolean>;
   addMessage: (ip: string, msg: Message) => void;
+  prependMessages: (ip: string, msgs: Message[]) => void;
   markRead: (ip: string) => void;
+  setHasHistory: (ip: string, has: boolean) => void;
 }
 
 export const useMessageStore = create<MessageStore>((set) => ({
   messagesByIp: {},
   unreadByIp: {},
+  hasHistory: {},
   addMessage: (ip, msg) =>
     set((state) => {
       const messages = [...(state.messagesByIp[ip] || []), msg];
@@ -40,8 +50,26 @@ export const useMessageStore = create<MessageStore>((set) => ({
         unreadByIp,
       };
     }),
+  prependMessages: (ip, msgs) =>
+    set((state) => {
+      const existing = state.messagesByIp[ip] || [];
+      // Avoid duplicates by checking timestamps
+      const existingTimestamps = new Set(existing.map((m) => m.timestamp));
+      const newMsgs = msgs.filter((m) => !existingTimestamps.has(m.timestamp));
+      if (newMsgs.length === 0) return state;
+      return {
+        messagesByIp: {
+          ...state.messagesByIp,
+          [ip]: [...newMsgs, ...existing],
+        },
+      };
+    }),
   markRead: (ip) =>
     set((state) => ({
       unreadByIp: { ...state.unreadByIp, [ip]: 0 },
+    })),
+  setHasHistory: (ip, has) =>
+    set((state) => ({
+      hasHistory: { ...state.hasHistory, [ip]: has },
     })),
 }));
