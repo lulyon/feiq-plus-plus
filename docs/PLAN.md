@@ -239,79 +239,75 @@
 
 ```
 feiq-plus-plus/
-├── Cargo.toml                       # workspace
-├── package.json                      # npm workspace root
+├── Cargo.toml                       # workspace (feiq-core, feiq-app, feiq-relay)
+├── CLAUDE.md                         # AI 上下文文档
+├── README.md
+├── docs/
+│   ├── PLAN.md                       # 本文件
+│   ├── relay-server-design.md        # Relay 服务器技术方案
+│   └── RELEASE_NOTES_v0.1.0.md      # v0.1.0 发布说明
+├── scripts/
+│   └── dev-multi.sh                  # 多实例开发脚本
 ├── packages/
 │   ├── feiq-core/                    # Rust: 协议引擎 + 网络 + 存储
 │   │   └── src/
+│   │       ├── lib.rs
 │   │       ├── protocol/
 │   │       │   ├── constants.rs      # 完整 IPMSG 常量 (含 v9 加密)
-│   │       │   ├── types.rs          # Fellow, Content, Post, FileContent 等
-│   │       │   ├── parser.rs         # 责任链解析器
+│   │       │   ├── types.rs          # Fellow, Content, Post, FileContent, ContactSource
+│   │       │   ├── parser.rs         # 责任链解析器 (12 handler)
 │   │       │   ├── serializer.rs     # 消息打包/解包
-│   │       │   └── encoding.rs       # GBK/UTF-8 via encoding_rs
+│   │       │   ├── encoding.rs       # GBK/UTF-8 via encoding_rs
+│   │       │   └── emoji.rs          # 96 个 QQ 表情映射
 │   │       ├── network/
 │   │       │   ├── udp.rs            # UDP socket, 广播, 异步接收
-│   │       │   ├── tcp.rs            # TCP 监听, 文件传输流
-│   │       │   ├── crypto.rs         # RSA/AES/Blowfish 加密
-│   │       │   └── manager.rs        # 网络生命周期, 自我过滤
+│   │       │   ├── tcp.rs            # TCP 监听, 文件传输流 (64KB chunk)
+│   │       │   ├── relay.rs          # WebSocket relay 客户端 transport (432 行)
+│   │       │   ├── crypto.rs         # ECDH (x25519) + AES-256-GCM 加密
+│   │       │   └── manager.rs        # 网络生命周期, 协调 UDP+TCP+Relay
 │   │       ├── engine/
-│   │       │   ├── engine.rs         # 主控制器
+│   │       │   ├── engine.rs         # 主控制器, hybrid LAN+Relay 模式
 │   │       │   ├── events.rs         # FrontendEvent 定义
 │   │       │   └── tasks.rs          # FileTask 状态机 + 进度节流
 │   │       ├── model/
-│   │       │   ├── contacts.rs       # 联系人 + 分组管理
-│   │       │   └── messages.rs       # 消息记录 + 离线消息缓存
+│   │       │   └── contacts.rs       # 线程安全联系人簿 (IP+MAC 索引, Relay peers)
 │   │       └── storage/
-│   │           ├── history.rs        # SQLite 聊天记录
-│   │           └── settings.rs       # 配置持久化
+│   │           ├── history.rs        # SQLite 聊天记录 + 离线消息 + 群组
+│   │           └── settings.rs       # 配置持久化 + ConnectionMode
 │   │
-│   ├── feiq-app/                     # Tauri 壳 (Rust)
+│   ├── feiq-app/                     # Tauri 桌面壳 (Rust)
 │   │   ├── src/
 │   │   │   ├── main.rs              # Tauri 入口
-│   │   │   ├── commands.rs          # 所有 IPC commands
+│   │   │   ├── commands.rs          # IPC commands
 │   │   │   ├── state.rs             # AppState (Arc<Engine>)
 │   │   │   ├── events.rs            # 事件发射
 │   │   │   └── tray.rs              # 系统托盘
+│   │   ├── icons/                    # 应用图标 (SVG + PNG + ICNS + ICO)
 │   │   ├── capabilities/
 │   │   └── tauri.conf.json
+│   │
+│   ├── feiq-relay/                   # Relay 服务器 (独立 crate)
+│   │   ├── src/
+│   │   │   ├── main.rs              # CLI 入口 (clap: --host --port)
+│   │   │   ├── server.rs            # 核心 RelayServer (WebSocket 路由 + 房间)
+│   │   │   └── lib.rs               # 公开导出
+│   │   └── tests/
+│   │       └── integration_test.rs  # 2 个集成测试
 │   │
 │   └── feiq-gui/                     # React 前端
 │       └── src/
 │           ├── main.tsx
 │           ├── App.tsx
 │           ├── components/
-│           │   ├── MainLayout.tsx
-│           │   ├── sidebar/
-│           │   │   ├── Sidebar.tsx
-│           │   │   ├── ContactList.tsx
-│           │   │   ├── ContactItem.tsx
-│           │   │   └── SearchBar.tsx
-│           │   ├── chat/
-│           │   │   ├── ChatPanel.tsx
-│           │   │   ├── ChatHeader.tsx
-│           │   │   ├── MessageList.tsx
-│           │   │   ├── MessageBubble.tsx
-│           │   │   └── InputArea.tsx
-│           │   ├── file/
-│           │   │   ├── FileTransferDialog.tsx
-│           │   │   └── FileTaskRow.tsx
-│           │   ├── emoji/
-│           │   │   └── EmojiPicker.tsx
-│           │   ├── screenshot/
-│           │   │   └── ScreenshotOverlay.tsx
-│           │   └── dialogs/
-│           │       ├── AddContactDialog.tsx
-│           │       ├── GroupCreateDialog.tsx
-│           │       └── SettingsDialog.tsx
-│           ├── stores/
-│           │   ├── contactStore.ts
-│           │   ├── messageStore.ts
-│           │   ├── fileTaskStore.ts
-│           │   └── uiStore.ts
-│           └── hooks/
-│               ├── useTauriCommand.ts
-│               └── useTauriEvent.ts
+│           │   ├── Sidebar.tsx       # 联系人列表 + 搜索 + 在线数 + 未读徽标
+│           │   ├── ChatPanel.tsx     # 聊天头部 + 消息列表 + 输入区
+│           │   ├── MessageBubble.tsx # 文本/抖动/文件气泡 + 表情内联渲染
+│           │   ├── InputArea.tsx     # 文本输入 + 表情选择器 + 发送按钮
+│           │   ├── EmojiPicker.tsx   # 16×6 表情网格 + 悬浮预览
+│           │   └── SettingsDialog.tsx# 配置 (用户名/主机/连接模式/Relay URL/网段/Enter发送)
+│           └── stores/
+│               ├── contactStore.ts   # Zustand: 联系人列表 + 增删改选
+│               └── messageStore.ts   # Zustand: 按 IP 索引的消息 + 未读数
 ```
 
 ---
@@ -365,6 +361,19 @@ feiq-plus-plus/
 | 前端 | 文件夹选择发送、文件夹接收进度(多文件整体进度) |
 | **交付** | 群聊、文件夹传输、离线消息、黑名单 |
 
+### Phase 4.5 — 🚀 Relay 服务器 (已实现 v0.1.4)
+
+| 模块 | 内容 |
+|------|------|
+| Rust relay server | 独立 `feiq-relay` crate。WebSocket 服务器，7 种 JSON 消息类型 (Join/Joined/PeerJoin/PeerLeave/RelayMessage/Ack/Error)。房间模型：客户端加入后仅与同房间 peers 通信 |
+| Rust relay client | `network/relay.rs` (432 行)。WebSocket 客户端 transport，产出与 UDP transport 相同的 NetworkEvent 变体。自动重连 (exponential backoff)。发送前添加 IPMSG_SENDCHECKOPT 标志 |
+| Engine hybrid mode | 同时运行 LAN (UDP) + Relay (WebSocket) transport。`ContactSource::Lan` / `ContactSource::Relay` 区分来源。MAC+name 跨 transport 去重 |
+| Settings | `ConnectionMode` 枚举: LanOnly / RelayOnly / Hybrid。Relay 配置: URL + room name |
+| Frontend UI | SettingsDialog 中连接模式选择器 (三个 radio) + Relay URL 输入框 + 房间名输入框 |
+| 离线消息 | 服务器内存队列，24h TTL，客户端重连后自动推送 |
+| 加密 | ECDH+AES 端到端加密对 relay 透明 — 服务器仅转发加密载荷，不解密 |
+| **交付** | 跨网络通信、混合模式、relay 服务器独立部署 |
+
 ### Phase 5 — 加密 + 文件共享 + 打磨
 
 | 模块 | 内容 |
@@ -410,6 +419,8 @@ feiq-plus-plus/
 | **离线消息** | 对方不在线时存入 SQLite `pending_messages` 表，对方上线(收到 BR_ENTRY)后自动重发 |
 | **断点续传** | IPMSG GETFILEDATA 请求支持 `offset` 参数，TCP 发送方 `seek(offset)` 后继续传输 |
 | **版本字符串** | 原格式 `1_lbt6_0#128#MAC#0#0#0#4001#9`。feiq++ 使用 `feiq_plus_plus#128#MAC#0#0#0#1#9` 标识自己，可与旧客户端区分 |
+| **跨网络通信** | 自建 Rust WebSocket relay server。客户端通过 `ContactSource::Lan` / `ContactSource::Relay` 区分来源，MAC+name 跨 transport 去重。7 种 JSON 消息类型 (Join/Joined/PeerJoin/PeerLeave/RelayMessage/Ack/Error)。服务端 24h TTL 离线队列 |
+| **Hybrid 模式** | Engine 同时运行 LAN (UDP) 和 Relay (WebSocket) transport，同一 mpsc channel 产出 NetworkEvent。两种 transport 完全对等 — engine 不关心消息来自哪个 transport |
 
 ---
 
@@ -419,15 +430,17 @@ feiq-plus-plus/
 
 ```
 tokio = { version = "1", features = ["full"] }
-encoding_rs = "0.8"              # GBK/UTF-8 ✅ 已验证
+tokio-tungstenite = "0.24"         # WebSocket 客户端 (relay)
+futures-util = "0.3"               # Stream/Sink 组合子
+base64 = "0.22"                     # 载荷编码 (relay 传输)
+encoding_rs = "0.8"                # GBK/UTF-8 ✅ 已验证
 rusqlite = { version = "0.32", features = ["bundled"] }
-ring = "0.17"                     # AES-256-GCM + ECDH (x25519) ✅ 已验证
+ring = "0.17"                       # AES-256-GCM + ECDH (x25519) ✅ 已验证
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 chrono = { version = "0.4", features = ["serde"] }
-mac_address = "1.1"               # 跨平台 MAC ✅ 已验证
+mac_address = "1.1"                 # 跨平台 MAC ✅ 已验证
 bitflags = "2"
-uuid = { version = "1", features = ["v4"] }
 anyhow = "1"
 thiserror = "1"
 tracing = "0.1"
@@ -438,6 +451,21 @@ tracing-subscriber = "0.3"
 # blowfish = "0.10"              # Blowfish 对称加密 (纯 Rust)
 # sha1 = "0.11"                  # SHA-1 签名
 # md5 = "0.8"                    # MD5 签名
+```
+
+### Rust (feiq-relay)
+
+```
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = "0.24"         # WebSocket 服务器
+futures-util = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"
+uuid = { version = "1", features = ["v4"] }
+clap = { version = "4", features = ["derive"] }
 ```
 
 ### Tauri (feiq-app)
