@@ -12,6 +12,7 @@ export interface Fellow {
   group_name: string;
   signature: string;
   port: number;
+  source?: "LanPeer" | { RelayPeer: string };
 }
 
 interface ContactStore {

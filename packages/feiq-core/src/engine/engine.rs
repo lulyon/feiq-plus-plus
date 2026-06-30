@@ -5,12 +5,14 @@
 use crate::engine::events::FrontendEvent;
 use crate::engine::tasks::FileTaskHandle;
 use crate::model::contacts::ContactBook;
-use crate::network::manager::{NetworkEvent, NetworkManager};
+use crate::network::manager::NetworkManager;
+use crate::network::relay::RelayClient;
+use crate::network::NetworkEvent;
 use crate::protocol::constants::*;
 use crate::protocol::encoding::*;
 use crate::protocol::serializer::*;
 use crate::protocol::types::*;
-use crate::storage::settings::AppConfig;
+use crate::storage::settings::{AppConfig, ConnectionMode};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -54,6 +56,7 @@ pub struct Engine {
     config: AppConfig,
     contacts: Arc<Mutex<ContactBook>>,
     network: Option<Arc<NetworkManager>>,
+    relay_client: Option<Arc<RelayClient>>,
     event_tx: mpsc::UnboundedSender<FrontendEvent>,
     packet_id: PacketIdGen,
     file_id: FileIdGen,
@@ -82,6 +85,7 @@ impl Engine {
             config,
             contacts: Arc::new(Mutex::new(ContactBook::new())),
             network: None,
+            relay_client: None,
             event_tx,
             packet_id: PacketIdGen::new(),
             file_id: FileIdGen::new(),
@@ -96,12 +100,36 @@ impl Engine {
         &self.version
     }
 
-    /// Start the engine: bind network, broadcast online presence
+    /// Start the engine: bind UDP, optionally connect relay, broadcast presence.
     pub async fn start(&mut self) -> anyhow::Result<()> {
-        if self.network.is_some() {
+        if self.network.is_some() || self.relay_client.is_some() {
             anyhow::bail!("Engine already started");
         }
 
+        let mode = self.config.mode.clone();
+
+        // ─── UDP layer (skip if RelayOnly) ────────────────────
+        if mode != ConnectionMode::RelayOnly {
+            self.start_udp().await?;
+        }
+
+        // ─── Relay layer (skip if LanOnly or not configured) ──
+        if mode != ConnectionMode::LanOnly
+            && !self.config.relay_server_url.is_empty()
+        {
+            self.start_relay().await?;
+        }
+
+        tracing::info!(
+            "Engine started: name={}, mode={mode:?}, version={}",
+            self.config.name,
+            self.version,
+        );
+        Ok(())
+    }
+
+    /// Start the UDP LAN transport
+    async fn start_udp(&mut self) -> anyhow::Result<()> {
         let (net_tx, mut net_rx) = mpsc::unbounded_channel::<NetworkEvent>();
 
         let network = NetworkManager::new(net_tx, self.config.name.clone(), self.config.port).await?;
@@ -110,25 +138,20 @@ impl Engine {
         // Update version with actual MAC
         self.version = format!("feiq_plus_plus#128#{self_mac}#0#0#0#1#9");
 
-        // Send online broadcast on own port
+        // Send online broadcast
         let online_data = build_br_entry(&self.config.name, &self.config.host, &self.version);
         network.broadcast(&online_data).await?;
 
-        // If on non-standard port, also broadcast to default port 2425
-        // so standard-port peers can discover us
         if self.config.port != 2425 {
             network.broadcast_to_port(2425, &online_data).await?;
         }
-
-        // Broadcast to custom IP ranges (always on their own port, guessing 2425)
         for ip in &self.config.custom_ips {
             let _ = network.send_to(ip, 2425, &online_data).await;
         }
 
-        // Wrap in Arc for sharing between recv loop and send methods
         let network = Arc::new(network);
 
-        // Spawn UDP receive loop
+        // UDP receive loop
         let n = network.clone();
         tokio::spawn(async move {
             if let Err(e) = n.run().await {
@@ -138,13 +161,12 @@ impl Engine {
 
         self.network = Some(network.clone());
 
-        // Clone network for periodic broadcast BEFORE moving into event dispatch
-        let network_p = network.clone();
+        // Clone for event dispatch and periodic rebroadcast
+        let network_for_dispatch = network.clone();
+        let network_for_rebroadcast = network.clone();
 
-        // Build ANSENTRY reply payload (reused for all BR_ENTRY responses)
+        // Event dispatch
         let ans_entry_data = build_ans_entry(&self.config.name, &self.config.host, &self.version);
-
-        // Event dispatch loop (with network access for ANSENTRY replies)
         let event_tx = self.event_tx.clone();
         let contacts = self.contacts.clone();
         let config = self.config.clone();
@@ -152,16 +174,14 @@ impl Engine {
         tokio::spawn(async move {
             while let Some(event) = net_rx.recv().await {
                 let reply = handle_network_event(event, &event_tx, &contacts, &config);
-                // Reply ANSENTRY for mutual discovery
                 if let Some((ip, port)) = reply {
-                    let _ = network.send_to(&ip, port, &ans_entry_data).await;
+                    let _ = network_for_dispatch.send_to(&ip, port, &ans_entry_data).await;
                 }
             }
         });
 
-        // ─── Periodic rebroadcast: keeps LAN presence alive ─────
-        // IP Messenger broadcasts once on startup; periodic rebroadcast handles
-        // packet loss, late-starting peers, and network changes.
+        // Periodic rebroadcast
+        let network_p = network_for_rebroadcast;
         let name_p = self.config.name.clone();
         let host_p = self.config.host.clone();
         let port_p = self.config.port;
@@ -170,35 +190,70 @@ impl Engine {
         let shutdown_p = self.shutdown.clone();
 
         tokio::spawn(async move {
-            // First rebroadcast after 30s, then every 10s
             tokio::time::sleep(Duration::from_secs(30)).await;
             loop {
                 if shutdown_p.load(Ordering::Relaxed) {
                     break;
                 }
-
                 let data = build_br_entry(&name_p, &host_p, &version_p);
                 let _ = network_p.broadcast(&data).await;
-
-                // Cross-port: always also send to default port so peers on 2425 find us
                 if port_p != 2425 {
                     let _ = network_p.broadcast_to_port(2425, &data).await;
                 }
-
-                // Custom IP ranges
                 for ip in &custom_ips_p {
                     let _ = network_p.send_to(ip, 2425, &data).await;
                 }
-
                 tracing::trace!("Periodic BR_ENTRY rebroadcast sent");
-
-                // Tick every 10s from now on
                 tokio::time::sleep(Duration::from_secs(10)).await;
             }
             tracing::debug!("Periodic broadcast task shutting down");
         });
 
-        tracing::info!("Engine started: name={}, version={}", self.config.name, self.version);
+        Ok(())
+    }
+
+    /// Start the relay client transport
+    async fn start_relay(&mut self) -> anyhow::Result<()> {
+        let (relay_tx, mut relay_rx) = mpsc::unbounded_channel::<NetworkEvent>();
+
+        let relay = RelayClient::new(
+            &self.config.relay_server_url,
+            &self.config.relay_room,
+            &self.config.name,
+            &self.config.host,
+            &self.version,
+            relay_tx,
+        );
+
+        let relay = Arc::new(relay);
+
+        // Relay receive loop
+        let r = relay.clone();
+        tokio::spawn(async move {
+            if let Err(e) = r.run().await {
+                tracing::error!("Relay recv loop exited: {e}");
+            }
+        });
+
+        self.relay_client = Some(relay.clone());
+
+        // Relay event dispatch loop
+        let event_tx = self.event_tx.clone();
+        let contacts = self.contacts.clone();
+        let config = self.config.clone();
+
+        tokio::spawn(async move {
+            while let Some(event) = relay_rx.recv().await {
+                handle_network_event(event, &event_tx, &contacts, &config);
+                // No ANSENTRY reply for relay peers — server handles presence
+            }
+        });
+
+        tracing::info!(
+            "Relay client started: server={}, room={}",
+            self.config.relay_server_url,
+            self.config.relay_room,
+        );
         Ok(())
     }
 
@@ -211,8 +266,12 @@ impl Engine {
             let exit_data = build_br_exit(&self.config.name, &self.config.host, &self.version);
             let _ = network.broadcast(&exit_data).await;
         }
+        if let Some(ref relay) = self.relay_client {
+            relay.shutdown();
+        }
 
         self.network = None;
+        self.relay_client = None;
         tracing::info!("Engine stopped");
     }
 
@@ -258,28 +317,70 @@ impl Engine {
         fellow
     }
 
-    /// Send text message over the network
+    /// Send text message. Routes via relay if peer is from relay, else UDP.
     pub async fn send_text_to(&self, ip: &str, port: u16, text: &str) -> anyhow::Result<()> {
+        let data = build_text_message(
+            self.packet_id(),
+            &self.config.name,
+            &self.config.host,
+            &self.version,
+            text,
+        );
+
+        // Check if this peer is a relay peer — extract data before await
+        let relay_peer_id = {
+            self.contacts
+                .lock()
+                .unwrap()
+                .find_by_ip(ip)
+                .and_then(|f| match &f.source {
+                    PeerSource::RelayPeer(id) => Some(id.clone()),
+                    _ => None,
+                })
+        };
+
+        if let Some(peer_id) = relay_peer_id {
+            if let Some(ref relay) = self.relay_client {
+                tracing::info!("Engine sending text via relay to {peer_id}: {text}");
+                let cmd = IPMSG_SENDMSG | IPMSG_SENDCHECKOPT;
+                return relay.send_to(&peer_id, cmd, &data).await;
+            }
+        }
+
+        // Default: UDP
         if let Some(ref network) = self.network {
-            let data = build_text_message(
-                self.packet_id(),
-                &self.config.name,
-                &self.config.host,
-                &self.version,
-                text,
-            );
-            tracing::info!("Engine sending text to {ip}:{port}: {text}");
+            tracing::info!("Engine sending text via UDP to {ip}:{port}: {text}");
             network.send_to(ip, port, &data).await?;
         } else {
-            tracing::warn!("Engine::send_text_to called but network is None");
+            tracing::warn!("Engine::send_text_to called but no transport available");
         }
         Ok(())
     }
 
-    /// Send knock over the network
+    /// Send knock. Routes via relay if peer is from relay, else UDP.
     pub async fn send_knock_to(&self, ip: &str, port: u16) -> anyhow::Result<()> {
+        let data = build_knock(&self.config.name, &self.config.host, &self.version);
+
+        // Check relay peer — extract data before await
+        let relay_peer_id = {
+            self.contacts
+                .lock()
+                .unwrap()
+                .find_by_ip(ip)
+                .and_then(|f| match &f.source {
+                    PeerSource::RelayPeer(id) => Some(id.clone()),
+                    _ => None,
+                })
+        };
+
+        if let Some(peer_id) = relay_peer_id {
+            if let Some(ref relay) = self.relay_client {
+                return relay.send_to(&peer_id, IPMSG_KNOCK, &data).await;
+            }
+        }
+
+        // Default: UDP
         if let Some(ref network) = self.network {
-            let data = build_knock(&self.config.name, &self.config.host, &self.version);
             network.send_to(ip, port, &data).await?;
         }
         Ok(())

@@ -4,6 +4,26 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+/// Connection mode for the engine
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum ConnectionMode {
+    /// Pure LAN UDP broadcast (default)
+    #[serde(rename = "lan")]
+    LanOnly,
+    /// Relay server only
+    #[serde(rename = "relay")]
+    RelayOnly,
+    /// LAN + Relay simultaneously, LAN preferred
+    #[serde(rename = "hybrid")]
+    Hybrid,
+}
+
+impl Default for ConnectionMode {
+    fn default() -> Self {
+        Self::LanOnly
+    }
+}
+
 /// Application configuration, serializable for INI storage
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
@@ -31,6 +51,15 @@ pub struct AppConfig {
     /// UDP/TCP port (default 2425). Change for multi-instance testing.
     #[serde(default = "default_port")]
     pub port: u16,
+    /// Connection mode: LAN, Relay, or Hybrid
+    #[serde(default)]
+    pub mode: ConnectionMode,
+    /// Relay server WebSocket URL (e.g. ws://server:2426)
+    #[serde(default)]
+    pub relay_server_url: String,
+    /// Relay room name
+    #[serde(default = "default_relay_room")]
+    pub relay_room: String,
 }
 
 fn default_port() -> u16 { 2425 }
@@ -38,6 +67,7 @@ fn default_name() -> String { "feiq_user".to_string() }
 fn default_host() -> String { "feiq++".to_string() }
 fn default_title() -> String { "feiq++".to_string() }
 fn default_true() -> bool { true }
+fn default_relay_room() -> String { "default".to_string() }
 
 impl Default for AppConfig {
     fn default() -> Self {
@@ -50,6 +80,9 @@ impl Default for AppConfig {
             custom_ips: Vec::new(),
             rank_user_enable: true,
             port: 2425,
+            mode: ConnectionMode::default(),
+            relay_server_url: String::new(),
+            relay_room: default_relay_room(),
         }
     }
 }
@@ -89,6 +122,19 @@ impl AppConfig {
                     "rank_user/enable" | "rank_user_enable" => {
                         config.rank_user_enable = value != "0";
                     }
+                    "network/mode" | "mode" => {
+                        config.mode = match value {
+                            "relay" => ConnectionMode::RelayOnly,
+                            "hybrid" => ConnectionMode::Hybrid,
+                            _ => ConnectionMode::LanOnly,
+                        };
+                    }
+                    "network/relay_server_url" | "relay_server_url" => {
+                        config.relay_server_url = value.to_string();
+                    }
+                    "network/relay_room" | "relay_room" => {
+                        config.relay_room = value.to_string();
+                    }
                     _ => {}
                 }
             }
@@ -108,6 +154,16 @@ impl AppConfig {
         content.push_str(&format!("send_by_enter = {}\n", if self.send_by_enter { "1" } else { "0" }));
         content.push_str("\n[network]\n");
         content.push_str(&format!("custom_group = {}\n", self.custom_group));
+        let mode_str = match self.mode {
+            ConnectionMode::LanOnly => "lan",
+            ConnectionMode::RelayOnly => "relay",
+            ConnectionMode::Hybrid => "hybrid",
+        };
+        content.push_str(&format!("mode = {mode_str}\n"));
+        if !self.relay_server_url.is_empty() {
+            content.push_str(&format!("relay_server_url = {}\n", self.relay_server_url));
+        }
+        content.push_str(&format!("relay_room = {}\n", self.relay_room));
         content.push_str("\n[rank_user]\n");
         content.push_str(&format!("enable = {}\n", if self.rank_user_enable { "1" } else { "0" }));
         std::fs::write(path, content)?;

@@ -3,6 +3,21 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Where a peer was discovered from — determines which transport to use
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum PeerSource {
+    /// Discovered via LAN UDP broadcast (default)
+    LanPeer,
+    /// Discovered via relay server; String is the relay-assigned client_id
+    RelayPeer(String),
+}
+
+impl Default for PeerSource {
+    fn default() -> Self {
+        Self::LanPeer
+    }
+}
+
 /// A LAN user (friend/contact)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Fellow {
@@ -31,6 +46,9 @@ pub struct Fellow {
     /// UDP port (default 2425, for multi-instance testing)
     #[serde(default = "default_fellow_port")]
     pub port: u16,
+    /// Transport source — LAN or Relay
+    #[serde(default)]
+    pub source: PeerSource,
 }
 
 fn default_fellow_port() -> u16 { 2425 }
@@ -50,6 +68,7 @@ impl Fellow {
             group_name: String::new(),
             signature: String::new(),
             port: 2425,
+            source: PeerSource::default(),
         }
     }
 

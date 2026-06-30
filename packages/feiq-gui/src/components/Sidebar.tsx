@@ -2,7 +2,7 @@ import { useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { useContactStore } from "../stores/contactStore";
 import { useMessageStore } from "../stores/messageStore";
-import { Users, Wifi, WifiOff, Plus } from "lucide-react";
+import { Users, Wifi, WifiOff, Plus, Cloud } from "lucide-react";
 
 export function Sidebar() {
   const contacts = useContactStore((s) => s.contacts);
@@ -118,7 +118,16 @@ export function Sidebar() {
                   <div className="text-sm font-medium text-gray-800 truncate">
                     {displayName}
                   </div>
-                  <div className="text-xs text-gray-400 truncate">{fellow.ip}</div>
+                  <div className="text-xs text-gray-400 truncate flex items-center gap-1">
+                    {fellow.source && typeof fellow.source === "object" && "RelayPeer" in fellow.source ? (
+                      <>
+                        <Cloud className="w-3 h-3 text-blue-400 flex-shrink-0" />
+                        <span>Relay</span>
+                      </>
+                    ) : (
+                      fellow.ip
+                    )}
+                  </div>
                 </div>
 
                 {/* Unread badge */}

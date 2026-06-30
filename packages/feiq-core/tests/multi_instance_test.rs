@@ -2,7 +2,7 @@
 //! Tests the full protocol stack end-to-end without GUI.
 
 use feiq_core::engine::engine::{build_ans_entry, build_br_entry, build_knock, build_text_message};
-use feiq_core::network::manager::NetworkEvent;
+use feiq_core::network::NetworkEvent;
 use feiq_core::protocol::constants::*;
 use feiq_core::protocol::parser::ProtocolChain;
 use feiq_core::protocol::serializer::parse_raw;

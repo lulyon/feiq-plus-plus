@@ -7,22 +7,8 @@ use crate::protocol::constants::IPMSG_PORT;
 use crate::protocol::parser::ProtocolChain;
 use crate::protocol::serializer::parse_raw;
 use crate::protocol::types::Post;
+use super::NetworkEvent;
 use tokio::sync::mpsc;
-
-/// Events from the network layer to the engine
-#[derive(Debug)]
-pub enum NetworkEvent {
-    /// Raw parsed Post (for content processing)
-    Message(Post),
-    /// A new user came online (BR_ENTRY handled)
-    FellowOnline(Post),
-    /// A user went offline (BR_EXIT handled)
-    FellowOffline(Post),
-    /// Self online notification response (ANSENTRY handled)
-    FellowAnsEntry(Post),
-    /// Error in network processing
-    Error(String),
-}
 
 /// NetworkManager owns the UDP socket and protocol chain,
 /// continuously receiving and dispatching packets.

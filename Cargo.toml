@@ -2,5 +2,6 @@
 members = [
     "packages/feiq-core",
     "packages/feiq-app",
+    "packages/feiq-relay",
 ]
 resolver = "2"
