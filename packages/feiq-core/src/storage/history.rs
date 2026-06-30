@@ -127,7 +127,7 @@ impl HistoryDb {
         let pattern = format!("%{query}%");
         let mut stmt = self.conn.prepare(
             "SELECT id, contact_ip, contact_name, direction, content_json, created_at
-             FROM messages WHERE content_json LIKE ?1
+             FROM messages WHERE content_json LIKE ?1 OR contact_name LIKE ?1
              ORDER BY created_at DESC LIMIT ?2",
         )?;
 
@@ -199,11 +199,13 @@ impl HistoryDb {
 
     // ─── Groups ───────────────────────────────────────────────
 
-    /// Save a group definition
+    /// Save a group definition (replaces existing group with same name)
     pub fn save_group(&self, name: &str, member_ips: &[String]) -> anyhow::Result<()> {
         let members_json = serde_json::to_string(member_ips)?;
+        // Delete existing group with same name to prevent duplicates
+        self.conn.execute("DELETE FROM groups_info WHERE group_name = ?1", params![name])?;
         self.conn.execute(
-            "INSERT OR REPLACE INTO groups_info (group_name, member_ips, created_at)
+            "INSERT INTO groups_info (group_name, member_ips, created_at)
              VALUES (?1, ?2, ?3)",
             params![name, members_json, Utc::now().timestamp_millis()],
         )?;

@@ -421,9 +421,12 @@ send_file(ip, file_path)          → create_file_content → build_file_message
 
 | 决策 | 结论 |
 |------|------|
-| 截图 Windows 方案 | 双通道：系统工具优先（screencapture/ms-screenclip/maim），失败则 dialog 兜底。不捆绑第三方工具 |
+| 截图 Windows 方案 | 双通道：系统工具优先（screencapture/ms-screenclip/maim），失败则 dialog 兜底。引入 `arboard` crate 读剪贴板 |
 | 加密密钥持久化 | 当前阶段临时密钥（前向安全），未来加 `settings.persist_keypair` 选项给 relay 长期离线场景 |
-| Canvas 标注库 | 原始 Canvas API 零依赖起步，需要时再升级 fabric.js |
+| Canvas 标注库 | 原始 Canvas API 零依赖起步，需要时再升级 fabric.js；导出用 `@tauri-apps/plugin-fs` 前端包 |
+| 群聊方案 | 纯 P2P 无服务器：`send_text_to_group` 遍历成员逐人发送，消息前缀 `[群名]`，前端用 `group:群名` 作为 store key |
+| 文件夹传输 | **推迟**——原 feiq 也未实现（"Mac飞秋还不支持接收目录"），留给后续版本 |
+| 4 个严重 bug | ✅ 已修复：crypto nonce 重用、别名覆盖、群组重复插入、搜索缺少 contact_name |
 
 ## 跨 Agent 审计发现的问题
 

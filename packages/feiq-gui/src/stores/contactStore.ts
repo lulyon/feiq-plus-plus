@@ -32,7 +32,14 @@ export const useContactStore = create<ContactStore>((set) => ({
       const idx = state.contacts.findIndex((c) => c.ip === fellow.ip);
       const contacts = [...state.contacts];
       if (idx >= 0) {
-        contacts[idx] = { ...contacts[idx], ...fellow };
+        // Preserve user-set alias/signature/group_name from network overwrites
+        contacts[idx] = {
+          ...contacts[idx],
+          ...fellow,
+          alias: contacts[idx].alias || fellow.alias,
+          signature: contacts[idx].signature || fellow.signature,
+          group_name: contacts[idx].group_name || fellow.group_name,
+        };
       } else {
         contacts.push(fellow);
       }

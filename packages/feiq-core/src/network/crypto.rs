@@ -85,13 +85,6 @@ pub fn create_decryptor(shared_secret: &[u8]) -> FeiqDecryptor {
 
 /// Encrypt plaintext with AES-256-GCM
 pub fn encrypt(plaintext: &[u8], enc: &mut FeiqEncryptor) -> Result<Vec<u8>, ring::error::Unspecified> {
-    let unbound = UnboundKey::new(&AES_256_GCM, &enc.key_bytes)?;
-    let nonce_seq = std::mem::replace(&mut enc.nonce_seq, CounterNonceSequence::new());
-    let mut key = SealingKey::new(unbound, nonce_seq);
-    // Hmm, we consumed nonce_seq. We need to get it back...
-    // Actually, SealingKey::new takes ownership. Let me re-think.
-
-    // Simpler approach: just track the counter manually
     let nonce_bytes = enc.nonce_seq.0;
     enc.nonce_seq.advance()?; // advance for next call
     let nonce = Nonce::assume_unique_for_key(nonce_bytes);
