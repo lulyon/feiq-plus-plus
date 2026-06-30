@@ -139,6 +139,11 @@ impl Engine {
             self.start_relay().await?;
         }
 
+        // Load persisted contact meta (alias, signature, group_name)
+        if let Err(e) = self.load_contact_meta() {
+            tracing::warn!("Failed to load contact meta from DB: {e}");
+        }
+
         tracing::info!(
             "Engine started: name={}, mode={mode:?}, version={}",
             self.config.name,
@@ -460,6 +465,82 @@ impl Engine {
         match self.history {
             Some(ref history) => history.lock().unwrap().get_messages(contact_ip, offset, limit),
             None => Ok(Vec::new()),
+        }
+    }
+
+    /// Set a contact's alias, persisting to DB and updating contact book.
+    /// Sends a ContactUpdate event so the frontend refreshes.
+    pub fn set_contact_alias(&self, ip: &str, alias: &str) -> anyhow::Result<()> {
+        // Persist to DB
+        if let Some(ref history) = self.history {
+            history.lock().unwrap().set_contact_alias(ip, alias)?;
+        }
+
+        // Update contact book in-memory
+        let mut book = self.contacts.lock().unwrap();
+        if let Some(mut fellow) = book.find_by_ip(ip) {
+            fellow.alias = alias.to_string();
+            book.upsert(fellow.clone());
+            // Drop the lock before sending event
+            drop(book);
+            let _ = self.event_tx.send(FrontendEvent::ContactUpdate { fellow });
+        }
+        Ok(())
+    }
+
+    /// Set a contact's group name (persisted to DB).
+    pub fn set_contact_group(&self, ip: &str, group_name: &str) -> anyhow::Result<()> {
+        if let Some(ref history) = self.history {
+            history.lock().unwrap().set_contact_group(ip, group_name)?;
+        }
+        Ok(())
+    }
+
+    /// Load all contact meta from DB (alias, signature, group_name) and
+    /// apply to the in-memory contact book. Does not trigger events —
+    /// intended for restoration at startup.
+    pub fn load_contact_meta(&self) -> anyhow::Result<()> {
+        if let Some(ref history) = self.history {
+            let meta_map = history.lock().unwrap().load_all_contact_meta()?;
+            if meta_map.is_empty() {
+                return Ok(());
+            }
+            let mut book = self.contacts.lock().unwrap();
+            for (ip, (alias, signature, group_name)) in meta_map {
+                if let Some(mut fellow) = book.find_by_ip(&ip) {
+                    fellow.alias = alias;
+                    fellow.signature = signature;
+                    fellow.group_name = group_name;
+                    book.upsert(fellow);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Export all chat history as a JSON string
+    pub fn export_history(&self) -> anyhow::Result<String> {
+        match self.history {
+            Some(ref history) => {
+                let value = history.lock().unwrap().export_all()?;
+                Ok(value.to_string())
+            }
+            None => anyhow::bail!("History database not available"),
+        }
+    }
+
+    /// Import messages from a JSON string. Returns the count of imported messages.
+    pub fn import_history(&self, json: &str) -> anyhow::Result<usize> {
+        match self.history {
+            Some(ref history) => {
+                let value: serde_json::Value = serde_json::from_str(json)?;
+                let messages = value["messages"]
+                    .as_array()
+                    .ok_or_else(|| anyhow::anyhow!("Invalid JSON: missing 'messages' array"))?;
+                let count = history.lock().unwrap().import_messages(messages)?;
+                Ok(count)
+            }
+            None => anyhow::bail!("History database not available"),
         }
     }
 

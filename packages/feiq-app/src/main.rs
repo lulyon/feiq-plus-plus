@@ -77,6 +77,10 @@ fn main() {
             commands::get_emoji_list,
             commands::send_knock,
             commands::send_text,
+            commands::set_alias,
+            commands::set_contact_group,
+            commands::export_history,
+            commands::import_history,
         ])
         .run(tauri::generate_context!())
         .expect("error while running feiq++");

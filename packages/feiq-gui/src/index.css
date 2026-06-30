@@ -1,22 +1,44 @@
 @import "tailwindcss";
 
-:root {
+@theme {
+  --color-bg: #f0f2f5;
+  --color-surface: #ffffff;
+  --color-surface-alt: #f9fafb;
+  --color-border: #e5e7eb;
+  --color-text: #1f2937;
+  --color-text-muted: #9ca3af;
   --color-primary: #3b82f6;
+  --color-primary-hover: #2563eb;
   --color-online: #22c55e;
   --color-offline: #9ca3af;
-  --color-away: #f59e0b;
-  --color-bg: #f0f2f5;
-  --color-sidebar: #ffffff;
-  --color-chat-bg: #ffffff;
   --color-bubble-sent: #3b82f6;
+  --color-bubble-sent-text: #ffffff;
   --color-bubble-recv: #e5e7eb;
+  --color-bubble-recv-text: #1f2937;
+  --color-overlay: rgba(0, 0, 0, 0.3);
+}
+
+.theme-dark {
+  --color-bg: #111827;
+  --color-surface: #1f2937;
+  --color-surface-alt: #111827;
+  --color-border: #374151;
+  --color-text: #f3f4f6;
+  --color-text-muted: #9ca3af;
+  --color-primary: #60a5fa;
+  --color-primary-hover: #3b82f6;
+  --color-online: #34d399;
+  --color-offline: #6b7280;
+  --color-bubble-sent: #3b82f6;
+  --color-bubble-sent-text: #1f2937;
+  --color-bubble-recv: #374151;
+  --color-bubble-recv-text: #f3f4f6;
+  --color-overlay: rgba(0, 0, 0, 0.5);
 }
 
 body {
   margin: 0;
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-  background: var(--color-bg);
-  color: #1f2937;
   overflow: hidden;
 }
 

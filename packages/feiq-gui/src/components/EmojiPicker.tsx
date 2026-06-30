@@ -65,13 +65,13 @@ export function EmojiPicker({ onSelect, onClose }: Props) {
   }, []);
 
   return (
-    <div className="absolute bottom-16 left-4 z-50 bg-white rounded-lg shadow-xl border border-gray-200 p-2 w-80">
+    <div className="absolute bottom-16 left-4 z-50 bg-surface rounded-lg shadow-xl border border-border p-2 w-80">
       <div className="flex items-center justify-between mb-1 px-1">
-        <span className="text-xs text-gray-400">
+        <span className="text-xs text-text-muted">
           {hovered !== null ? emojis[hovered]?.name : "Choose an emoji"}
         </span>
-        <button onClick={onClose} className="p-0.5 hover:bg-gray-100 rounded cursor-pointer">
-          <X className="w-3.5 h-3.5 text-gray-400" />
+        <button onClick={onClose} className="p-0.5 hover:bg-surface-alt rounded cursor-pointer">
+          <X className="w-3.5 h-3.5 text-text-muted" />
         </button>
       </div>
       <div
@@ -84,7 +84,7 @@ export function EmojiPicker({ onSelect, onClose }: Props) {
             onClick={() => onSelect(emoji.code)}
             onMouseEnter={() => setHovered(i)}
             onMouseLeave={() => setHovered(null)}
-            className="w-4.5 h-4.5 flex items-center justify-center hover:bg-blue-50 rounded cursor-pointer
+            className="w-4.5 h-4.5 flex items-center justify-center hover:bg-primary/10 rounded cursor-pointer
                        text-xs p-0 leading-none"
             title={emoji.name}
           >
@@ -99,7 +99,7 @@ export function EmojiPicker({ onSelect, onClose }: Props) {
                 (e.target as HTMLImageElement).style.display = "none";
                 const span = document.createElement("span");
                 span.textContent = emoji.code.substring(0, 3);
-                span.className = "text-[8px] text-gray-500";
+                span.className = "text-[8px] text-text-muted";
                 (e.target as HTMLImageElement).parentElement?.appendChild(span);
               }}
             />

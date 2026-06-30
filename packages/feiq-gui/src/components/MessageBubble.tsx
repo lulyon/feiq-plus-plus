@@ -77,7 +77,7 @@ export function MessageBubble({ message }: { message: Message }) {
     <div className={`flex ${isSent ? "justify-end" : "justify-start"}`}>
       <div className={`max-w-[70%] ${isSent ? "order-1" : ""}`}>
         {!isSent && (
-          <div className="text-xs text-gray-400 mb-0.5 ml-1">
+          <div className="text-xs text-text-muted mb-0.5 ml-1">
             {message.fromName}
           </div>
         )}
@@ -90,8 +90,8 @@ export function MessageBubble({ message }: { message: Message }) {
                 key={i}
                 className={`px-3 py-2 rounded-lg text-sm inline-block mb-1
                   ${isSent
-                    ? "bg-blue-500 text-white rounded-br-sm"
-                    : "bg-gray-100 text-gray-800 rounded-bl-sm"
+                    ? "bg-primary text-white rounded-br-sm"
+                    : "bg-bg text-text rounded-bl-sm"
                   }`}
                 dangerouslySetInnerHTML={{
                   __html: renderText(content.text || ""),
@@ -103,7 +103,7 @@ export function MessageBubble({ message }: { message: Message }) {
             return (
               <div
                 key={i}
-                className="px-3 py-1.5 rounded-lg text-xs text-gray-500 bg-gray-50 italic animate-shake"
+                className="px-3 py-1.5 rounded-lg text-xs text-text-muted bg-surface-alt italic animate-shake"
               >
                 {isSent ? "You sent a window shake" : "Window shake!"}
               </div>
@@ -114,7 +114,7 @@ export function MessageBubble({ message }: { message: Message }) {
               <div
                 key={i}
                 className={`px-3 py-2 rounded-lg text-sm inline-block mb-1 cursor-pointer
-                  ${isSent ? "bg-blue-500 text-white" : "bg-gray-100 text-gray-800 hover:bg-gray-200"}`}
+                  ${isSent ? "bg-primary text-white" : "bg-bg text-text hover:bg-surface-alt"}`}
               >
                 📎 {content.filename || "File"} ({content.size ? formatSize(content.size) : "?"})
               </div>
@@ -123,7 +123,7 @@ export function MessageBubble({ message }: { message: Message }) {
           return null;
         })}
 
-        <div className={`text-xs text-gray-300 mt-0.5 ${isSent ? "text-right mr-1" : "ml-1"}`}>
+        <div className={`text-xs text-text-muted mt-0.5 ${isSent ? "text-right mr-1" : "ml-1"}`}>
           {time}
         </div>
       </div>

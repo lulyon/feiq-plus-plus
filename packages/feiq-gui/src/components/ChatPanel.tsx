@@ -1,4 +1,4 @@
-import { useEffect } from "react";
+import { useEffect, useState, Fragment } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { useContactStore } from "../stores/contactStore";
 import { useMessageStore, type Message, type Content } from "../stores/messageStore";
@@ -16,6 +16,42 @@ interface MessageRecord {
   timestamp: number;
 }
 
+/** Return a human-readable date label for the given timestamp */
+function getDateLabel(timestamp: number): string {
+  const date = new Date(timestamp);
+  const now = new Date();
+  const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  const yesterday = new Date(today);
+  yesterday.setDate(yesterday.getDate() - 1);
+  const msgDate = new Date(date.getFullYear(), date.getMonth(), date.getDate());
+
+  const diffDays = Math.floor(
+    (today.getTime() - msgDate.getTime()) / (1000 * 60 * 60 * 24)
+  );
+
+  if (diffDays === 0) return "Today";
+  if (diffDays === 1) return "Yesterday";
+  if (diffDays < 7) {
+    const days = [
+      "Sunday", "Monday", "Tuesday", "Wednesday",
+      "Thursday", "Friday", "Saturday",
+    ];
+    return days[date.getDay()];
+  }
+  return date.toLocaleDateString();
+}
+
+/** A styled date separator shown between messages on different days */
+function DateSeparator({ label }: { label: string }) {
+  return (
+    <div className="flex items-center gap-3 py-2">
+      <div className="flex-1 h-px bg-border" />
+      <span className="text-xs text-text-muted flex-shrink-0">{label}</span>
+      <div className="flex-1 h-px bg-border" />
+    </div>
+  );
+}
+
 export function ChatPanel() {
   const selectedIp = useContactStore((s) => s.selectedIp);
   const contacts = useContactStore((s) => s.contacts);
@@ -29,6 +65,25 @@ export function ChatPanel() {
     ? fellow.alias || fellow.name || fellow.pc_name || fellow.ip
     : "";
   const messages = selectedIp ? messagesByIp[selectedIp] || [] : [];
+
+  // Alias inline editing state
+  const [editingAlias, setEditingAlias] = useState(false);
+  const [aliasDraft, setAliasDraft] = useState("");
+
+  const handleAliasDoubleClick = () => {
+    setAliasDraft(displayName === fellow?.ip ? "" : displayName);
+    setEditingAlias(true);
+  };
+
+  const handleAliasSave = async () => {
+    if (!selectedIp) return;
+    try {
+      await invoke("set_alias", { ip: selectedIp, alias: aliasDraft });
+    } catch (e) {
+      console.error("set_alias failed:", e);
+    }
+    setEditingAlias(false);
+  };
 
   // Load chat history when switching contacts
   useEffect(() => {
@@ -105,12 +160,12 @@ export function ChatPanel() {
 
   if (!selectedIp || !fellow) {
     return (
-      <div className="flex-1 flex items-center justify-center bg-white">
-        <div className="text-center text-gray-400">
+      <div className="flex-1 flex items-center justify-center bg-surface">
+        <div className="text-center text-text-muted">
           <MessageSquare className="w-16 h-16 mx-auto mb-4 opacity-30" />
           <p className="text-lg">feiq++</p>
           <p className="text-sm mt-1">Select a contact to start chatting</p>
-          <p className="text-xs mt-4 text-gray-300">
+          <p className="text-xs mt-4 text-text-muted">
             LAN instant messaging · IP Messenger compatible
           </p>
         </div>
@@ -119,17 +174,42 @@ export function ChatPanel() {
   }
 
   return (
-    <div className="flex-1 flex flex-col bg-white">
+    <div className="flex-1 flex flex-col bg-surface">
       {/* Chat Header */}
-      <div className="px-4 py-3 border-b border-gray-200 flex items-center gap-3 bg-gray-50">
+      <div className="px-4 py-3 border-b border-border flex items-center gap-3 bg-surface-alt">
         <span
           className={`w-2.5 h-2.5 rounded-full ${
-            fellow.online ? "bg-green-500" : "bg-gray-300"
+            fellow.online ? "bg-online" : "bg-offline"
           }`}
         />
-        <div>
-          <div className="text-sm font-semibold text-gray-800">{displayName}</div>
-          <div className="text-xs text-gray-400">
+        <div className="flex-1 min-w-0">
+          {editingAlias ? (
+            <input
+              type="text"
+              value={aliasDraft}
+              onChange={(e) => setAliasDraft(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") handleAliasSave();
+                if (e.key === "Escape") setEditingAlias(false);
+              }}
+              onBlur={() => setEditingAlias(false)}
+              className="text-sm font-semibold w-full px-1 py-0.5 border border-border rounded
+                         focus:outline-none focus:border-primary bg-surface"
+              autoFocus
+            />
+          ) : (
+            <div
+              className="text-sm font-semibold text-text cursor-pointer"
+              onDoubleClick={handleAliasDoubleClick}
+              title="Double-click to edit alias"
+            >
+              {displayName}
+            </div>
+          )}
+          {fellow.signature && !editingAlias && (
+            <div className="text-xs text-text-muted truncate">{fellow.signature}</div>
+          )}
+          <div className="text-xs text-text-muted">
             {fellow.online ? "Online" : "Offline"} · {fellow.ip}
           </div>
         </div>
@@ -138,17 +218,23 @@ export function ChatPanel() {
       {/* Messages */}
       <div className="flex-1 overflow-y-auto px-4 py-3 space-y-2">
         {messages.length === 0 ? (
-          <div className="text-center text-gray-400 text-sm mt-8">
+          <div className="text-center text-text-muted text-sm mt-8">
             No messages yet. Say hello!
           </div>
-        ) : (
-          messages.map((msg, i) => (
-            <MessageBubble
-              key={`${msg.timestamp}-${i}`}
-              message={msg}
-            />
-          ))
-        )}
+        ) : (() => {
+          let lastDate: string | null = null;
+          return messages.map((msg, i) => {
+            const msgDate = getDateLabel(msg.timestamp);
+            const showSeparator = msgDate !== lastDate;
+            lastDate = msgDate;
+            return (
+              <Fragment key={`${msg.timestamp}-${i}`}>
+                {showSeparator && <DateSeparator label={msgDate} />}
+                <MessageBubble message={msg} />
+              </Fragment>
+            );
+          });
+        })()}
       </div>
 
       {/* Input Area */}

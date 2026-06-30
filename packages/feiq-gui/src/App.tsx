@@ -43,8 +43,26 @@ export default function App() {
     };
   }, []);
 
+  // Apply theme class to document
+  useEffect(() => {
+    invoke("get_settings").then((config: any) => {
+      const theme = config.theme || "auto";
+      if (theme === "auto") {
+        const mq = window.matchMedia("(prefers-color-scheme: dark)");
+        document.documentElement.classList.toggle("theme-dark", mq.matches);
+        mq.addEventListener("change", (e) => {
+          document.documentElement.classList.toggle("theme-dark", e.matches);
+        });
+      } else if (theme === "dark") {
+        document.documentElement.classList.add("theme-dark");
+      } else {
+        document.documentElement.classList.remove("theme-dark");
+      }
+    });
+  }, []);
+
   return (
-    <div className="flex h-screen w-screen bg-gray-100">
+    <div className="flex h-screen w-screen bg-bg">
       <Sidebar />
       <ChatPanel />
     </div>

@@ -60,7 +60,12 @@ pub struct AppConfig {
     /// Relay room name
     #[serde(default = "default_relay_room")]
     pub relay_room: String,
+    /// Theme: "auto", "light", or "dark"
+    #[serde(default = "default_theme")]
+    pub theme: String,
 }
+
+fn default_theme() -> String { "auto".to_string() }
 
 fn default_port() -> u16 { 2425 }
 fn default_name() -> String { "feiq_user".to_string() }
@@ -83,6 +88,7 @@ impl Default for AppConfig {
             mode: ConnectionMode::default(),
             relay_server_url: String::new(),
             relay_room: default_relay_room(),
+            theme: default_theme(),
         }
     }
 }
@@ -135,6 +141,9 @@ impl AppConfig {
                     "network/relay_room" | "relay_room" => {
                         config.relay_room = value.to_string();
                     }
+                    "app/theme" | "theme" => {
+                        config.theme = value.to_string();
+                    }
                     _ => {}
                 }
             }
@@ -164,6 +173,7 @@ impl AppConfig {
             content.push_str(&format!("relay_server_url = {}\n", self.relay_server_url));
         }
         content.push_str(&format!("relay_room = {}\n", self.relay_room));
+        content.push_str(&format!("theme = {}\n", self.theme));
         content.push_str("\n[rank_user]\n");
         content.push_str(&format!("enable = {}\n", if self.rank_user_enable { "1" } else { "0" }));
         std::fs::write(path, content)?;

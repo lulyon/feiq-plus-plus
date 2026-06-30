@@ -136,3 +136,41 @@ pub async fn send_text(state: State<'_, AppState>, ip: String, text: String) -> 
     engine.send_text_to(&ip, port, &text).await.map_err(|e| e.to_string())
 }
 
+// ─── Alias & Contact Meta ─────────────────────────────────────
+
+#[tauri::command]
+pub async fn set_alias(state: State<'_, AppState>, ip: String, alias: String) -> Result<(), String> {
+    let engine = state.engine.lock().await;
+    engine
+        .set_contact_alias(&ip, &alias)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn set_contact_group(
+    state: State<'_, AppState>,
+    ip: String,
+    group_name: String,
+) -> Result<(), String> {
+    let engine = state.engine.lock().await;
+    engine
+        .set_contact_group(&ip, &group_name)
+        .map_err(|e| e.to_string())
+}
+
+// ─── History Export / Import ──────────────────────────────────
+
+#[tauri::command]
+pub async fn export_history(state: State<'_, AppState>, path: String) -> Result<(), String> {
+    let engine = state.engine.lock().await;
+    let json = engine.export_history().map_err(|e| e.to_string())?;
+    std::fs::write(&path, &json).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn import_history(state: State<'_, AppState>, path: String) -> Result<usize, String> {
+    let engine = state.engine.lock().await;
+    let json = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
+    engine.import_history(&json).map_err(|e| e.to_string())
+}
+

@@ -1,9 +1,10 @@
 //! SQLite chat history storage with pagination and search.
 //! Stores all sent/received messages, grouped by contact IP.
 
-use crate::protocol::types::{Content, Fellow, FileContent};
+use crate::protocol::types::Content;
 use chrono::Utc;
 use rusqlite::{params, Connection};
+use std::collections::HashMap;
 use std::path::Path;
 
 /// A stored message record
@@ -65,6 +66,17 @@ impl HistoryDb {
                 );",
             )?;
         }
+
+        // Always ensure contact_meta table exists (for existing DBs without it)
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS contact_meta (
+                ip TEXT PRIMARY KEY,
+                alias TEXT NOT NULL DEFAULT '',
+                signature TEXT NOT NULL DEFAULT '',
+                group_name TEXT NOT NULL DEFAULT ''
+            )",
+            [],
+        )?;
 
         Ok(Self { conn })
     }
@@ -231,6 +243,142 @@ impl HistoryDb {
         }
         Ok(result)
     }
+
+    // ─── Contact Meta (alias, signature, group) ───────────────
+
+    /// Get contact meta for an IP: (alias, signature, group_name)
+    pub fn get_contact_meta(&self, ip: &str) -> anyhow::Result<Option<(String, String, String)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT alias, signature, group_name FROM contact_meta WHERE ip = ?1",
+        )?;
+        let mut rows = stmt.query_map(params![ip], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        match rows.next() {
+            Some(Ok(meta)) => Ok(Some(meta)),
+            _ => Ok(None),
+        }
+    }
+
+    /// Set (or update) the alias for a contact IP
+    pub fn set_contact_alias(&self, ip: &str, alias: &str) -> anyhow::Result<()> {
+        self.conn.execute(
+            "INSERT INTO contact_meta (ip, alias, signature, group_name)
+             VALUES (?1, ?2, '', '')
+             ON CONFLICT(ip) DO UPDATE SET alias = excluded.alias",
+            params![ip, alias],
+        )?;
+        Ok(())
+    }
+
+    /// Set (or update) the group name for a contact IP
+    pub fn set_contact_group(&self, ip: &str, group_name: &str) -> anyhow::Result<()> {
+        self.conn.execute(
+            "INSERT INTO contact_meta (ip, alias, signature, group_name)
+             VALUES (?1, '', '', ?2)
+             ON CONFLICT(ip) DO UPDATE SET group_name = excluded.group_name",
+            params![ip, group_name],
+        )?;
+        Ok(())
+    }
+
+    /// Load all contact meta as a map: IP -> (alias, signature, group_name)
+    pub fn load_all_contact_meta(&self) -> anyhow::Result<HashMap<String, (String, String, String)>> {
+        let mut stmt =
+            self.conn
+                .prepare("SELECT ip, alias, signature, group_name FROM contact_meta")?;
+
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?;
+
+        let mut result = HashMap::new();
+        for row in rows {
+            let (ip, alias, signature, group_name) = row?;
+            result.insert(ip, (alias, signature, group_name));
+        }
+        Ok(result)
+    }
+
+    // ─── Export / Import ────────────────────────────────────────
+
+    /// Export all messages as a JSON structure
+    pub fn export_all(&self) -> anyhow::Result<serde_json::Value> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, contact_ip, contact_name, direction, content_json, created_at
+             FROM messages ORDER BY created_at",
+        )?;
+
+        let rows = stmt.query_map([], |row| {
+            Ok(serde_json::json!({
+                "id": row.get::<_, i64>(0)?,
+                "contact_ip": row.get::<_, String>(1)?,
+                "contact_name": row.get::<_, String>(2)?,
+                "direction": row.get::<_, i32>(3)?,
+                "content_json": row.get::<_, String>(4)?,
+                "created_at": row.get::<_, i64>(5)?,
+            }))
+        })?;
+
+        let mut messages = Vec::new();
+        for row in rows {
+            messages.push(row?);
+        }
+
+        Ok(serde_json::json!({
+            "version": 1,
+            "exported_at": chrono::Utc::now().to_rfc3339(),
+            "messages": messages,
+        }))
+    }
+
+    /// Import messages from a JSON array, skipping duplicates.
+    /// Duplicates are identified by matching (created_at, contact_ip, content_json).
+    pub fn import_messages(&self, messages: &[serde_json::Value]) -> anyhow::Result<usize> {
+        let mut count = 0;
+        for msg in messages {
+            let contact_ip = msg["contact_ip"].as_str().unwrap_or("");
+            let content_json = msg["content_json"].as_str().unwrap_or("");
+            let created_at = msg["created_at"].as_i64().unwrap_or(0);
+            let contact_name = msg["contact_name"].as_str().unwrap_or("");
+            let direction = msg["direction"].as_i64().unwrap_or(0) as i32;
+
+            if contact_ip.is_empty() {
+                continue;
+            }
+
+            // Check for duplicate by created_at + contact_ip + content_json
+            let exists: bool = self
+                .conn
+                .query_row(
+                    "SELECT COUNT(*) FROM messages
+                     WHERE created_at = ?1 AND contact_ip = ?2 AND content_json = ?3",
+                    params![created_at, contact_ip, content_json],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap_or(0)
+                > 0;
+
+            if !exists {
+                self.conn.execute(
+                    "INSERT INTO messages (contact_ip, contact_name, direction, content_json, created_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![contact_ip, contact_name, direction, content_json, created_at],
+                )?;
+                count += 1;
+            }
+        }
+        Ok(count)
+    }
 }
 
 #[cfg(test)]
@@ -260,6 +408,8 @@ mod tests {
         // Search
         let results = db.search_messages("Hello", 10).unwrap();
         assert!(!results.is_empty());
+
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
@@ -276,6 +426,8 @@ mod tests {
         // Should be empty now
         let empty = db.drain_pending("10.0.0.1").unwrap();
         assert!(empty.is_empty());
+
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
@@ -294,6 +446,109 @@ mod tests {
         assert_eq!(groups[0].0, "Team");
 
         // Cleanup
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_contact_meta_crud() {
+        let path = format!("/tmp/test_feix_meta_{}.sqlite3", std::process::id());
+        let db = HistoryDb::open(Path::new(&path)).unwrap();
+
+        // Initially no meta
+        let meta = db.get_contact_meta("10.0.0.1").unwrap();
+        assert!(meta.is_none());
+
+        // Set alias
+        db.set_contact_alias("10.0.0.1", "Alice").unwrap();
+        let meta = db.get_contact_meta("10.0.0.1").unwrap().unwrap();
+        assert_eq!(meta.0, "Alice");
+        assert_eq!(meta.1, ""); // signature
+        assert_eq!(meta.2, ""); // group_name
+
+        // Update alias
+        db.set_contact_alias("10.0.0.1", "Alice2").unwrap();
+        let meta = db.get_contact_meta("10.0.0.1").unwrap().unwrap();
+        assert_eq!(meta.0, "Alice2");
+
+        // Set group
+        db.set_contact_group("10.0.0.1", "Dev Team").unwrap();
+        let meta = db.get_contact_meta("10.0.0.1").unwrap().unwrap();
+        assert_eq!(meta.2, "Dev Team");
+        assert_eq!(meta.0, "Alice2"); // alias unchanged
+
+        // Set another contact
+        db.set_contact_alias("10.0.0.2", "Bob").unwrap();
+
+        // Load all
+        let all = db.load_all_contact_meta().unwrap();
+        assert!(all.contains_key("10.0.0.1"));
+        assert!(all.contains_key("10.0.0.2"));
+        assert_eq!(all.get("10.0.0.1").unwrap().0, "Alice2");
+        assert_eq!(all.get("10.0.0.1").unwrap().2, "Dev Team");
+        assert_eq!(all.get("10.0.0.2").unwrap().0, "Bob");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_export_import_roundtrip() {
+        let path = format!("/tmp/test_feix_exp_{}.sqlite3", std::process::id());
+        let db = HistoryDb::open(Path::new(&path)).unwrap();
+
+        // Add some messages
+        let content_a = vec![Content::Text {
+            text: "Hello".into(),
+            format: String::new(),
+        }];
+        db.save_message("10.0.0.1", "Alice", 0, &content_a).unwrap();
+
+        let content_b = vec![Content::Text {
+            text: "World".into(),
+            format: String::new(),
+        }];
+        db.save_message("10.0.0.1", "Alice", 1, &content_b).unwrap();
+
+        // Export
+        let exported = db.export_all().unwrap();
+        assert_eq!(exported["version"], 1);
+        let messages = exported["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 2);
+
+        // Import to a fresh DB
+        let path2 = format!("/tmp/test_feix_exp2_{}.sqlite3", std::process::id());
+        let db2 = HistoryDb::open(Path::new(&path2)).unwrap();
+
+        let count = db2.import_messages(messages).unwrap();
+        assert_eq!(count, 2);
+
+        // Verify imported messages
+        let imported = db2.get_messages("10.0.0.1", 0, 10).unwrap();
+        assert_eq!(imported.len(), 2);
+
+        // Import again — duplicates should be skipped
+        let count2 = db2.import_messages(messages).unwrap();
+        assert_eq!(count2, 0);
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&path2);
+    }
+
+    #[test]
+    fn test_import_skips_invalid() {
+        let path = format!("/tmp/test_feix_imp_inv_{}.sqlite3", std::process::id());
+        let db = HistoryDb::open(Path::new(&path)).unwrap();
+
+        // Empty contact_ip should be skipped
+        let msgs = vec![serde_json::json!({
+            "contact_ip": "",
+            "content_json": "[]",
+            "created_at": 1000,
+            "contact_name": "",
+            "direction": 0,
+        })];
+        let count = db.import_messages(&msgs).unwrap();
+        assert_eq!(count, 0);
+
         let _ = std::fs::remove_file(&path);
     }
 }
