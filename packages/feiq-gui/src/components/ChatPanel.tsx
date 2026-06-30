@@ -559,7 +559,7 @@ function GroupChatPanel({ group }: { group: Group }) {
             fromName: r.contact_name,
             contents: parseContentJson(r.content_json),
             timestamp: r.timestamp,
-            direction: (r.direction === 0 ? "sent" : "received") as const,
+            direction: (r.direction === 0 ? "sent" : "received") as "sent" | "received",
           }));
         prependMessages(groupKey, msgs);
       })

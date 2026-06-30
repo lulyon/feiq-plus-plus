@@ -13,6 +13,22 @@ interface Props {
   onClose: () => void;
 }
 
+/// Unicode emoji characters for QQ emoji codes
+const EMOJI_CHARS: string[] = [
+  "😊","😜","😍","😳","😎","😢","😳","🤐",
+  "😴","😭","😅","😡","😋","😁","😲","🔄",
+  "😔","🆒","😰","🤮","🤭","😏","😍","🙄",
+  "😤","🍽️","😴","😱","😅","😄","💂","😘",
+  "💪","🤬","🤔","🤫","😵","😖","😞","💀",
+  "💥","👋","😓","👃","👏","😅","😏","🥶",
+  "😤","😤","🥱","😒","😣","😢","😈","😚",
+  "😨","🥺","🔪","🍉","🍺","🏀","🏓","🤸",
+  "☕","🍚","🐷","🌹","🥀","💋","❤️","💔",
+  "🎂","⚡","💣","🗡️","⚽","🐞","💩","😤",
+  "🌙","☀️","🎁","🤗","👍","👎","🤝","✌️",
+  "🙏","🫦","👊","👎","🫶","👎","👌","💕",
+];
+
 export function EmojiPicker({ onSelect, onClose }: Props) {
   const [emojis, setEmojis] = useState<EmojiInfo[]>([]);
   const [hovered, setHovered] = useState<number | null>(null);
@@ -78,33 +94,22 @@ export function EmojiPicker({ onSelect, onClose }: Props) {
         className="grid gap-0.5"
         style={{ gridTemplateColumns: "repeat(16, 1fr)" }}
       >
-        {emojis.map((emoji, i) => (
+        {emojis.map((emoji, i) => {
+          const unicode = EMOJI_CHARS[i] || "";
+          return (
           <button
             key={emoji.code}
             onClick={() => onSelect(emoji.code)}
             onMouseEnter={() => setHovered(i)}
             onMouseLeave={() => setHovered(null)}
-            className="w-4.5 h-4.5 flex items-center justify-center hover:bg-primary/10 rounded cursor-pointer
-                       text-xs p-0 leading-none"
-            title={emoji.name}
+            className="w-5 h-5 flex items-center justify-center hover:bg-primary/10 rounded cursor-pointer
+                       text-lg p-0 leading-none"
+            title={`${emoji.code} ${emoji.name}`}
           >
-            {/* Show emoji image with fallback */}
-            <img
-              src={emoji.image}
-              alt={emoji.code}
-              className="w-4 h-4 object-contain"
-              loading="lazy"
-              onError={(e) => {
-                // Fallback: show emoji code text
-                (e.target as HTMLImageElement).style.display = "none";
-                const span = document.createElement("span");
-                span.textContent = emoji.code.substring(0, 3);
-                span.className = "text-[8px] text-text-muted";
-                (e.target as HTMLImageElement).parentElement?.appendChild(span);
-              }}
-            />
+            {unicode}
           </button>
-        ))}
+          );
+        })}
       </div>
     </div>
   );

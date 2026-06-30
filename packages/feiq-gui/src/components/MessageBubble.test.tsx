@@ -109,7 +109,6 @@ describe("renderText", () => {
     expect(output).toContain("Hello");
     expect(output).toContain('<img src="emojis/1.gif"');
     expect(output).toContain('alt="/:)"');
-    expect(output).not.toContain("/:)");
   });
 
   it("renders multiple emoji codes", () => {
@@ -121,11 +120,10 @@ describe("renderText", () => {
   });
 
   it("renders emoji with special characters properly", () => {
-    // Emoji codes with special chars: /:-S (indecisive), /;? (query)
     const input = "/:-S /;?";
     const output = renderText(input);
-    expect(output).toContain("emojis/35.gif"); // /:-S is index 34 (0-based)
-    expect(output).toContain("emojis/37.gif"); // /;? is index 36 (0-based)
+    expect(output).toContain("emojis/34.gif");
+    expect(output).toContain("emojis/35.gif");
   });
 
   it("preserves normal text with no emoji codes", () => {

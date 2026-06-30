@@ -258,19 +258,75 @@ pub enum FileTaskType {
     Download,
 }
 
-/// File transfer state
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// File transfer state.
+///
+/// Custom Serialize: all variants serialise as strings (e.g. "error", "not_start").
+/// Custom Deserialize: accepts both the new string form and the old serde externally-tagged
+/// object form ({"error": "msg"}) for backward compatibility.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FileTaskState {
-    #[serde(rename = "not_start")]
     NotStart,
-    #[serde(rename = "running")]
     Running,
-    #[serde(rename = "finish")]
     Finish,
-    #[serde(rename = "error")]
     Error(String),
-    #[serde(rename = "canceled")]
     Canceled,
+}
+
+impl Serialize for FileTaskState {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let s = match self {
+            FileTaskState::NotStart => "not_start",
+            FileTaskState::Running => "running",
+            FileTaskState::Finish => "finish",
+            FileTaskState::Error(_) => "error",
+            FileTaskState::Canceled => "canceled",
+        };
+        serializer.serialize_str(s)
+    }
+}
+
+impl<'de> Deserialize<'de> for FileTaskState {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct FtsVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for FtsVisitor {
+            type Value = FileTaskState;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str(r#"a string like "not_start", "running", "finish", "error", "canceled""#)
+            }
+
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<FileTaskState, E> {
+                match v {
+                    "not_start" => Ok(FileTaskState::NotStart),
+                    "running" => Ok(FileTaskState::Running),
+                    "finish" => Ok(FileTaskState::Finish),
+                    "error" => Ok(FileTaskState::Error(String::new())),
+                    "canceled" => Ok(FileTaskState::Canceled),
+                    _ => Err(E::custom(format!("unknown FileTaskState: {}", v))),
+                }
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<FileTaskState, A::Error> {
+                let mut error_msg: Option<String> = None;
+                while let Some(key) = map.next_key::<String>()? {
+                    if key == "error" {
+                        error_msg = Some(map.next_value()?);
+                    } else {
+                        let _: serde::de::IgnoredAny = map.next_value()?;
+                    }
+                }
+                Ok(FileTaskState::Error(error_msg.unwrap_or_default()))
+            }
+        }
+        deserializer.deserialize_any(FtsVisitor)
+    }
 }
 
 /// A file transfer task
@@ -392,5 +448,50 @@ mod tests {
         assert_eq!(fellow.public_key.len(), 32);
         assert_eq!(fellow.public_key[0], 1);
         assert_eq!(fellow.public_key[31], 32);
+    }
+
+    // --- FileTaskState Serialization Tests ---
+
+    #[test]
+    fn test_file_task_state_error_serializes_as_string() {
+        let state = FileTaskState::Error("disk full".into());
+        let json = serde_json::to_string(&state).unwrap();
+        assert_eq!(json, r#""error""#);
+    }
+
+    #[test]
+    fn test_file_task_state_all_variants_serialize_as_strings() {
+        use FileTaskState::*;
+        let cases = [(NotStart, "not_start"), (Running, "running"), (Finish, "finish"), (Error("x".into()), "error"), (Canceled, "canceled")];
+        for (state, expected) in cases {
+            assert_eq!(serde_json::to_string(&state).unwrap(), format!("\"{}\"", expected));
+        }
+    }
+
+    #[test]
+    fn test_file_task_state_round_trip_all_variants() {
+        use FileTaskState::*;
+        let cases = [("not_start", NotStart), ("running", Running), ("finish", Finish), ("error", Error(String::new())), ("canceled", Canceled)];
+        for (j, exp) in &cases {
+            let quoted = format!("\"{}\"", j);
+            let d: FileTaskState = serde_json::from_str(&quoted).unwrap();
+            assert_eq!(d, *exp);
+            assert_eq!(serde_json::to_string(&d).unwrap(), quoted);
+        }
+    }
+
+    #[test]
+    fn test_file_task_state_deserialize_old_object_format() {
+        assert_eq!(
+            serde_json::from_str::<FileTaskState>(r#"{"error": "something went wrong"}"#).unwrap(),
+            FileTaskState::Error("something went wrong".into())
+        );
+    }
+
+    #[test]
+    fn test_file_task_state_string_deserialize() {
+        for (j, exp) in [("not_start", FileTaskState::NotStart), ("running", FileTaskState::Running), ("finish", FileTaskState::Finish), ("error", FileTaskState::Error(String::new())), ("canceled", FileTaskState::Canceled)] {
+            assert_eq!(serde_json::from_str::<FileTaskState>(&format!("\"{}\"", j)).unwrap(), exp);
+        }
     }
 }

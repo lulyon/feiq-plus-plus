@@ -22,7 +22,39 @@ const EMOJI_CODES: string[] = [
   "/:sayok", "/:love",
 ];
 
-/** Render text with emoji codes replaced by <img> tags */
+/// Emoji names (same as Rust emoji.rs)
+const EMOJI_NAMES: string[] = [
+  "微笑", "撇嘴", "色", "发呆", "得意", "流泪", "害羞", "闭嘴",
+  "困", "大哭", "尴尬", "发怒", "调皮", "龇牙", "惊讶", "转圈",
+  "难过", "酷", "冷汗", "抓狂", "吐", "偷笑", "可爱", "白眼",
+  "傲慢", "饥饿", "困", "惊恐", "冷汗", "憨笑", "大兵", "飞吻",
+  "奋斗", "咒骂", "疑问", "嘘……", "晕", "折磨", "衰", "骷髅",
+  "敲打", "再见", "擦汗", "抠鼻", "鼓掌", "糗大了", "坏笑", "发抖",
+  "左哼哼", "右哼哼", "哈欠", "鄙视", "委屈", "快哭了", "阴险", "亲亲",
+  "吓", "可怜", "菜刀", "西瓜", "啤酒", "篮球", "乒乓", "跳",
+  "咖啡", "吃饭", "猪头", "玫瑰", "枯萎", "示爱", "爱心", "心碎",
+  "蛋糕", "闪电", "炸弹", "匕首", "足球", "瓢虫", "大便", "怄火",
+  "月亮", "太阳", "礼物", "拥抱", "点赞", "弱", "握手", "胜利",
+  "抱拳", "勾引", "拳头", "差劲", "爱你", "no", "ok", "爱情",
+];
+
+/// Unicode emoji characters mapped to QQ emoji codes (same order as EMOJI_CODES)
+const EMOJI_CHARS: string[] = [
+  "😊","😜","😍","😳","😎","😢","😳","🤐",
+  "😴","😭","😅","😡","😋","😁","😲","🔄",
+  "😔","🆒","😰","🤮","🤭","😏","😍","🙄",
+  "😤","🍽️","😴","😱","😅","😄","💂","😘",
+  "💪","🤬","🤔","🤫","😵","😖","😞","💀",
+  "💥","👋","😓","👃","👏","😅","😏","🥶",
+  "😤","😤","🥱","😒","😣","😢","😈","😚",
+  "😨","🥺","🔪","🍉","🍺","🏀","🏓","🤸",
+  "☕","🍚","🐷","🌹","🥀","💋","❤️","💔",
+  "🎂","⚡","💣","🗡️","⚽","🐞","💩","😤",
+  "🌙","☀️","🎁","🤗","👍","👎","🤝","✌️",
+  "🙏","🫦","👊","👎","🫶","👎","👌","💕",
+];
+
+/// Escape HTML entities to prevent XSS
 function htmlEscape(text: string): string {
   const replacements: Record<string, string> = {
     '&': '&amp;',
@@ -34,13 +66,42 @@ function htmlEscape(text: string): string {
   return text.replace(/[&<>"']/g, (match) => replacements[match]);
 }
 
+/** Render text with emoji codes using a two-pass approach:
+ *  1. Replace emoji codes with placeholder markers (avoids htmlEscape breaking emoji codes like /<rotate>)
+ *  2. HTML-escape the remaining text
+ *  3. Replace placeholders with emoji display spans */
 function renderText(text: string): string {
-  let result = htmlEscape(text);
-  for (let i = 0; i < EMOJI_CODES.length; i++) {
-    const code = EMOJI_CODES[i];
-    const img = `<img src="emojis/${i + 1}.gif" alt="${code}" class="emoji-inline" style="width:20px;height:20px;vertical-align:middle;display:inline-block" />`;
-    result = result.split(code).join(img);
+  // Sort emoji codes by length descending, so longer codes match first
+  // (e.g. /<rotate> before /:r)
+  const sortedIndices = EMOJI_CODES
+    .map((code, i) => ({ code, i }))
+    .sort((a, b) => b.code.length - a.code.length);
+
+  // Pass 1: Replace emoji codes with safe placeholder markers
+  let result = text;
+  const placeholder = (i: number) => `\x00EMJ${i}\x00`;
+
+  for (const { code, i } of sortedIndices) {
+    if (result.includes(code)) {
+      result = result.split(code).join(placeholder(i));
+    }
   }
+
+  // Pass 2: HTML-escape the remaining text (placeholders are safe ASCII)
+  result = htmlEscape(result);
+
+  // Pass 3: Replace placeholders with emoji display elements
+  for (let i = 0; i < EMOJI_CODES.length; i++) {
+    const ph = placeholder(i);
+    if (result.includes(ph)) {
+      const ch = EMOJI_CHARS[i] || "";
+      const code = EMOJI_CODES[i];
+      const title = `${htmlEscape(code)} ${EMOJI_NAMES[i] || ""}`.trim();
+      const display = `<span title="${title}" class="emoji-inline" style="font-size:20px;line-height:1;vertical-align:middle">${ch}</span>`;
+      result = result.split(ph).join(display);
+    }
+  }
+
   return result;
 }
 
