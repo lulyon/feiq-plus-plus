@@ -132,14 +132,26 @@ send_file(ip, file_path)          → create_file_content → build_file_message
 **改动文件**: `commands.rs`, `main.rs`, `InputArea.tsx`
 
 ```
-方案: Rust std::process::Command (无需额外插件)
-  1. commands.rs: capture_screenshot 命令
-     - macOS: screencapture -i /tmp/feiq_screenshot_xxx.png
-     - Linux: maim -s /tmp/...
-     - Windows: 启动 Win+Shift+S (异步，需配合剪贴板或文件)
-  2. 返回文件路径 → 前端 show 预览 → 作为文件发送
+方案: 双通道 — 系统工具优先，dialog 兜底 (无需额外插件)
+
+  1. commands.rs: capture_screenshot 命令 (两阶段):
+     阶段 A — 尝试系统截图工具:
+       - macOS: screencapture -i /tmp/feiq_screenshot_xxx.png → 等文件落盘
+       - Windows: 尝试 ms-screenclip: URI 触发截图 → 读取剪贴板
+       - Linux: maim -s /tmp/... 或 gnome-screenshot -a
+       → 成功则返回文件路径
+     阶段 B — 降级到文件选择:
+       → 返回特殊标记 "FALLBACK"
+       → 前端调用 @tauri-apps/plugin-dialog open() 让用户手动选文件
+
+  2. 前端处理:
+     - invoke("capture_screenshot") → 如果是 "FALLBACK" → open() dialog
+     - 否则收到文件路径 → 自动预览 → 作为文件发送
+
   3. InputArea: 加截图按钮 (Camera 图标)
   4. 快捷键: tauri-plugin-global-shortcut 注册 CmdOrCtrl+Shift+S
+
+优势: macOS/Linux 体验好，Windows 有兜底，无需捆绑第三方工具
 复杂度: 中，平台差异需分别处理
 ```
 
@@ -148,12 +160,14 @@ send_file(ip, file_path)          → create_file_content → build_file_message
 **改动文件**: `components/ScreenshotAnnotation.tsx` (新), `InputArea.tsx`
 
 ```
-方案: 原始 Canvas API (无额外依赖)
-  工具: 矩形 / 箭头 / 文字 / 自由绘制
+方案: 原始 Canvas API (零依赖)，后续可升级 fabric.js
+  工具: 矩形 / 箭头 / 文字 / 自由绘制 / 颜色选择 / 撤销
   1. 截完图 → 打开全屏 overlay → <canvas> 显示截图
   2. 上层透明 Canvas 用于标注绘制
-  3. 工具栏: 工具切换 + 颜色选择 + 撤销
+  3. 工具栏: 工具切换 + 颜色选择 + 撤销 (Canvas 状态快照栈)
   4. 完成 → canvas.toBlob() → write to tmp → send as file
+  5. 代码量约 200 行 (4 种工具 × ~50 行 each)
+  6. 如果后续需要调整大小/移动/图层 → 引入 fabric.js (按需升级)
 复杂度: 中高，~200 行 Canvas 交互代码
 ```
 
@@ -264,13 +278,26 @@ send_file(ip, file_path)          → create_file_content → build_file_message
 **改动文件**: `engine.rs`, `types.rs`, `parser.rs`, `serializer.rs`, `settings.rs`
 
 ```
-方案: 临时 ECDH 密钥对，通过 ANSENTRY 携带公钥
+方案: 临时 ECDH 密钥对 (当前阶段)，通过 ANSENTRY 携带公钥
+
+密钥策略:
+  - 每次启动生成新的 x25519 keypair (内存中，不写盘)
+  - 重启后 keypair 丢失 → 重新握手，前向安全性
+  - 对等体公钥只存内存 (Fellow.public_key)，离线即清除
+  - LAN 场景双方几乎同时在线 → 临时密钥够用
+  - 未来迭代加 settings.persist_keypair 选项:
+    - 默认 false (临时，前向安全)
+    - 设为 true → 存 ~/.feiq_keypair.bin → 重启后恢复
+    - 给 relay 长期离线场景留后路
+
   1. Fellow 加 public_key: Vec<u8> 字段
-  2. Engine 加 key_map: HashMap<String, CryptoState>
-  3. ANSENTRY/BR_ENTRY extra 字段追加公钥 (NUL + raw bytes)
+  2. Engine 加 key_map: HashMap<String, CryptoState> (纯内存)
+  3. ANSENTRY/BR_ENTRY extra 字段追加公钥 (NUL + raw 32 bytes)
   4. send_text_to: 检测 is_feiq_plus_plus → 查 key_map → encrypt 载荷 → 加 ENCRYPTOPT
   5. handle_network_event Message: 检测 ENCRYPTOPT → decrypt 载荷 → 正常处理
   6. 版本检测: version.contains("feiq_plus_plus")
+  7. settings.rs: 加 persist_keypair: bool (默认 false)，为未来留接口
+
 复杂度: 高，涉及协议变更和密钥状态机
 ```
 
@@ -390,12 +417,21 @@ send_file(ip, file_path)          → create_file_content → build_file_message
 
 ---
 
+## 已确认决策
+
+| 决策 | 结论 |
+|------|------|
+| 截图 Windows 方案 | 双通道：系统工具优先（screencapture/ms-screenclip/maim），失败则 dialog 兜底。不捆绑第三方工具 |
+| 加密密钥持久化 | 当前阶段临时密钥（前向安全），未来加 `settings.persist_keypair` 选项给 relay 长期离线场景 |
+| Canvas 标注库 | 原始 Canvas API 零依赖起步，需要时再升级 fabric.js |
+
 ## 技术验证项
 
 | 项 | 方法 | 状态 |
 |----|------|:---:|
 | Tauri v2 drag-drop API | 查阅 @tauri-apps/api 文档 | 待验证 |
 | screencapture 行为 | macOS 实测 screencapture -i | 待验证 |
+| Windows 剪贴板读取 | Rust 侧读取剪贴板图片数据 | 待验证 |
 | CSS var 替换 Tailwind class | 用手动替换还是 tailwind.config | 待验证 |
 | Tauri TrayIcon::set_icon API | Tauri 2 API 文档 | 待验证 |
 | IPMSG GETDIRFILES 完整协议 | 原 feiq 代码 (`TECHNICAL_DOC.md`) | 已参考 |
