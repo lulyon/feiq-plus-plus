@@ -23,8 +23,19 @@ const EMOJI_CODES: string[] = [
 ];
 
 /** Render text with emoji codes replaced by <img> tags */
+function htmlEscape(text: string): string {
+  const replacements: Record<string, string> = {
+    '&': '&amp;',
+    '<': '&lt;',
+    '>': '&gt;',
+    '"': '&quot;',
+    "'": '&#x27;',
+  };
+  return text.replace(/[&<>"']/g, (match) => replacements[match]);
+}
+
 function renderText(text: string): string {
-  let result = text;
+  let result = htmlEscape(text);
   for (let i = 0; i < EMOJI_CODES.length; i++) {
     const code = EMOJI_CODES[i];
     const img = `<img src="emojis/${i + 1}.gif" alt="${code}" class="emoji-inline" style="width:20px;height:20px;vertical-align:middle;display:inline-block" />`;
@@ -167,6 +178,35 @@ export function MessageBubble({
                     Click to download
                   </span>
                 )}
+              </div>
+            );
+          }
+          if (content.type === "sealed") {
+            return (
+              <div
+                key={i}
+                className={`px-3 py-2 rounded-lg text-sm inline-block mb-1
+                  ${isSent
+                    ? "bg-primary text-white rounded-br-sm"
+                    : "bg-bg text-text rounded-bl-sm"
+                  }`}
+              >
+                <span className="mr-1">🔒</span>
+                <span
+                  dangerouslySetInnerHTML={{
+                    __html: renderText(content.text || ""),
+                  }}
+                />
+              </div>
+            );
+          }
+          if (content.type === "image") {
+            return (
+              <div
+                key={i}
+                className="px-3 py-2 rounded-lg text-xs italic inline-block mb-1 bg-surface-alt text-text-muted"
+              >
+                🖼️ Image
               </div>
             );
           }

@@ -6,10 +6,10 @@ use crate::protocol::types::Fellow;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-/// Thread-safe contact book indexed by IP address
+/// Thread-safe contact book indexed by ip:port
 pub struct ContactBook {
     contacts: Vec<Fellow>,
-    /// IP -> position index for fast lookup
+    /// ip:port -> position index for fast lookup
     index: HashMap<String, usize>,
 }
 
@@ -19,6 +19,11 @@ impl ContactBook {
             contacts: Vec::new(),
             index: HashMap::new(),
         }
+    }
+
+    /// Build index key from ip and port
+    fn key(ip: &str, port: u16) -> String {
+        format!("{}:{}", ip, port)
     }
 
     /// Clone as Arc<Mutex<Self>> for sharing across tasks
@@ -36,9 +41,16 @@ impl ContactBook {
         contacts
     }
 
-    /// Find a contact by IP address
+    /// Find a contact by ip:port (O(1) via index)
+    pub fn find(&self, ip: &str, port: u16) -> Option<Fellow> {
+        self.index
+            .get(&Self::key(ip, port))
+            .map(|&idx| self.contacts[idx].clone())
+    }
+
+    /// Find a contact by IP address (linear scan fallback for DHCP changes / legacy callers)
     pub fn find_by_ip(&self, ip: &str) -> Option<Fellow> {
-        self.index.get(ip).map(|&idx| self.contacts[idx].clone())
+        self.contacts.iter().find(|c| c.ip == ip).cloned()
     }
 
     /// Find a contact by IP or MAC (same identity check)
@@ -54,25 +66,27 @@ impl ContactBook {
 
     /// Insert or update a contact. Returns true if changed/new.
     pub fn upsert(&mut self, fellow: Fellow) -> bool {
-        if let Some(idx) = self.index.get(&fellow.ip) {
+        let k = Self::key(&fellow.ip, fellow.port);
+        if let Some(idx) = self.index.get(&k) {
             let existing = &mut self.contacts[*idx];
             existing.update(&fellow)
         } else {
-            // Also check MAC match (same person, different IP)
+            // Also check MAC match (same person, different ip:port)
             if !fellow.mac.is_empty() {
                 if let Some(pos) = self.contacts.iter().position(|c| c.mac == fellow.mac) {
-                    // Update existing with new IP
-                    let old_ip = self.contacts[pos].ip.clone();
-                    self.index.remove(&old_ip);
-                    self.index.insert(fellow.ip.clone(), pos);
+                    // Update index with new ip:port key
+                    let old_key = Self::key(&self.contacts[pos].ip, self.contacts[pos].port);
+                    self.index.remove(&old_key);
+                    self.index.insert(k, pos);
                     self.contacts[pos].ip = fellow.ip.clone();
+                    self.contacts[pos].port = fellow.port;
                     return self.contacts[pos].update(&fellow);
                 }
             }
 
             // New contact
             let idx = self.contacts.len();
-            self.index.insert(fellow.ip.clone(), idx);
+            self.index.insert(k, idx);
             self.contacts.push(fellow);
             true
         }

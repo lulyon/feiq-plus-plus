@@ -9,6 +9,28 @@ use std::path::PathBuf;
 use tauri::State;
 use tracing;
 
+/// Validate a file path for security (prevent path traversal and access to system files).
+pub fn validate_path(path: &str) -> Result<(), String> {
+    let normalized = path.replace('\\', "/");
+    if normalized.contains("..") {
+        return Err("Path traversal detected: '..' is not allowed".into());
+    }
+    let system_dirs = ["/etc", "/var", "/sys", "/proc", "/dev", "/bin", "/sbin", "/usr", "/boot", "/lib", "/opt", "/root"];
+    for dir in &system_dirs {
+        if normalized == *dir || normalized.starts_with(&format!("{}/", dir)) {
+            return Err(format!("Path points to a system directory: {}", dir));
+        }
+    }
+    let win_lower = normalized.to_lowercase();
+    let win_system_prefixes = ["c:/windows", "c:/program files", "c:/programdata", "c:/system volume information"];
+    for prefix in &win_system_prefixes {
+        if win_lower.starts_with(prefix) {
+            return Err("Path points to a system directory".into());
+        }
+    }
+    Ok(())
+}
+
 // ─── Engine Lifecycle ────────────────────────────────────────
 
 #[tauri::command]
@@ -197,6 +219,7 @@ pub async fn get_groups(
 
 #[tauri::command]
 pub async fn export_history(state: State<'_, AppState>, path: String) -> Result<(), String> {
+    validate_path(&path)?;
     let engine = state.engine.lock().await;
     let json = engine.export_history().map_err(|e| e.to_string())?;
     std::fs::write(&path, &json).map_err(|e| e.to_string())
@@ -204,6 +227,7 @@ pub async fn export_history(state: State<'_, AppState>, path: String) -> Result<
 
 #[tauri::command]
 pub async fn import_history(state: State<'_, AppState>, path: String) -> Result<usize, String> {
+    validate_path(&path)?;
     let engine = state.engine.lock().await;
     let json = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
     engine.import_history(&json).map_err(|e| e.to_string())
@@ -294,6 +318,17 @@ pub async fn download_file(
 
         if snap.task_type != FileTaskType::Download {
             return Err("Not a download task".into());
+        }
+
+        // Check cancel before starting any I/O
+        if task.is_cancel_pending() {
+            task.set_canceled();
+            let _ = engine.event_tx().send(FrontendEvent::FileStateChanged {
+                task_id,
+                state: FileTaskState::Canceled,
+                message: format!("Download canceled for: {}", snap.content.filename),
+            });
+            return Err("Download canceled by user".into());
         }
 
         task.set_running();
@@ -419,4 +454,43 @@ pub async fn reset_unread_count(
     state.unread_count.store(0, Ordering::Relaxed);
     crate::tray::update_tray_badge(&tray_state.tray, &app_handle, 0);
     Ok(())
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_validate_path_rejects_dotdot_traversal() {
+        for path in &["../etc/passwd", "foo/../../etc/passwd", "..", "a/.."] {
+            let result = validate_path(path);
+            assert!(result.is_err(), "Expected '{}' to be rejected", path);
+            assert!(result.unwrap_err().contains(".."), "should mention '..': {}", path);
+        }
+    }
+
+    #[test]
+    fn test_validate_path_rejects_system_paths() {
+        for path in &["/etc/passwd", "/etc/", "/var/log", "/sys/kernel", "/proc/self/environ", "/dev/null", "/bin/sh", "/sbin/init", "/usr/bin"] {
+            let result = validate_path(path);
+            assert!(result.is_err(), "Expected '{}' to be rejected", path);
+        }
+    }
+
+    #[test]
+    fn test_validate_path_rejects_windows_system_paths() {
+        for path in &["c:\\windows\\system32\\cmd.exe", "C:\\Windows\\System32", "c:\\Program Files\\SomeApp", "c:\\ProgramData\\SomeData"] {
+            let result = validate_path(path);
+            assert!(result.is_err(), "Expected '{}' to be rejected", path);
+        }
+    }
+
+    #[test]
+    fn test_validate_path_allows_normal_paths() {
+        for path in &["/tmp/test.txt", "/home/user/documents/report.pdf", "/Users/alice/Desktop", "relative/path/to/file.txt", "plain_filename.txt", "/data/backup.sqlite", "./local_file.csv"] {
+            let result = validate_path(path);
+            assert!(result.is_ok(), "Expected '{}' to be allowed: {:?}", path, result.err());
+        }
+    }
 }

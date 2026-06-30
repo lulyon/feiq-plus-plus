@@ -77,6 +77,7 @@ pub struct Engine {
     history: Option<Arc<std::sync::Mutex<HistoryDb>>>,
     /// Signals periodic broadcast task to stop
     shutdown: Arc<AtomicBool>,
+    started: bool,
     /// Per-peer crypto sessions (IP -> encryptor/decryptor) for ECDH+AES-256-GCM
     crypto_sessions: Arc<Mutex<HashMap<String, (FeiqEncryptor, FeiqDecryptor)>>>,
     /// Our current keypair for BR_ENTRY/ANSENTRY broadcast public key
@@ -123,6 +124,7 @@ impl Engine {
             file_tasks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             history,
             shutdown: Arc::new(AtomicBool::new(false)),
+            started: false,
             crypto_sessions: Arc::new(Mutex::new(HashMap::new())),
             our_keypair: Arc::new(Mutex::new(None)),
         }
@@ -135,9 +137,10 @@ impl Engine {
 
     /// Start the engine: bind UDP, optionally connect relay, broadcast presence.
     pub async fn start(&mut self) -> anyhow::Result<()> {
-        if self.network.is_some() || self.relay_client.is_some() {
+        if self.started {
             anyhow::bail!("Engine already started");
         }
+        self.shutdown.store(false, Ordering::Relaxed);
 
         let mode = self.config.mode.clone();
 
@@ -158,6 +161,7 @@ impl Engine {
             tracing::warn!("Failed to load contact meta from DB: {e}");
         }
 
+        self.started = true;
         tracing::info!(
             "Engine started: name={}, mode={mode:?}, version={}",
             self.config.name,
@@ -425,6 +429,7 @@ impl Engine {
             relay.shutdown();
         }
 
+        self.started = false;
         self.network = None;
         self.relay_client = None;
         tracing::info!("Engine stopped");
@@ -1043,10 +1048,10 @@ fn handle_network_event(
             let port = post.from.port;
             let fellow = post.from;
             let mut book = contacts.lock().unwrap();
-            let is_new = book.find_by_ip(&fellow.ip).is_none();
+            let is_new = book.find(&fellow.ip, fellow.port).is_none();
             let changed = book.upsert(fellow.clone());
 
-            let mut display_fellow = book.find_by_ip(&fellow.ip)
+            let mut display_fellow = book.find(&fellow.ip, fellow.port)
                 .unwrap_or(fellow);
             display_fellow.online = true;
 
@@ -1098,10 +1103,10 @@ fn handle_network_event(
         NetworkEvent::FellowAnsEntry(post) => {
             let fellow = post.from;
             let mut book = contacts.lock().unwrap();
-            let is_new = book.find_by_ip(&fellow.ip).is_none();
+            let is_new = book.find(&fellow.ip, fellow.port).is_none();
             let changed = book.upsert(fellow.clone());
 
-            let mut display_fellow = book.find_by_ip(&fellow.ip)
+            let mut display_fellow = book.find(&fellow.ip, fellow.port)
                 .unwrap_or(fellow);
             display_fellow.online = true;
 
@@ -1526,6 +1531,30 @@ impl Engine {
     }
 }
 
+
+
+impl Drop for Engine {
+    fn drop(&mut self) {
+        if !self.shutdown.load(Ordering::Relaxed) {
+            if let Some(ref network) = self.network {
+                let network = network.clone();
+                let name = self.config.name.clone();
+                let host = self.config.host.clone();
+                let version = self.version.clone();
+                if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                    handle.spawn(async move {
+                        let exit_data = build_br_exit(&name, &host, &version);
+                        let _ = network.broadcast(&exit_data).await;
+                    });
+                }
+            }
+            if let Some(ref relay) = self.relay_client {
+                relay.shutdown();
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1737,4 +1766,39 @@ mod tests {
 
         let _ = std::fs::remove_file(&path);
     }
+
+    // ─── Engine Lifecycle Tests ──────────────────────────────
+
+    #[tokio::test]
+    async fn test_engine_restart() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut config = AppConfig::default();
+        config.mode = ConnectionMode::RelayOnly;
+        config.relay_server_url = String::new();
+        let mut engine = Engine::new(config, tx, None);
+        let result = engine.start().await;
+        assert!(result.is_ok(), "First start failed: {:?}", result.err());
+        engine.stop().await;
+        let result = engine.start().await;
+        assert!(result.is_ok(), "Restart failed: {:?}", result.err());
+        engine.stop().await;
+    }
+
+    #[tokio::test]
+    async fn test_engine_stop_is_idempotent() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut config = AppConfig::default();
+        config.mode = ConnectionMode::RelayOnly;
+        config.relay_server_url = String::new();
+        let mut engine = Engine::new(config, tx, None);
+        engine.stop().await;
+        engine.start().await.unwrap();
+        engine.stop().await;
+        engine.start().await.unwrap();
+        engine.stop().await;
+        engine.stop().await;
+        engine.start().await.unwrap();
+        engine.stop().await;
+    }
 }
+

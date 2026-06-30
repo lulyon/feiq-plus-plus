@@ -143,6 +143,7 @@ impl AppConfig {
                             _ => ConnectionMode::LanOnly,
                         };
                     }
+                    "network/port" | "port" => config.port = value.parse().unwrap_or(2425),
                     "network/relay_server_url" | "relay_server_url" => {
                         config.relay_server_url = value.to_string();
                     }
@@ -176,6 +177,7 @@ impl AppConfig {
         content.push_str(&format!("title = {}\n", self.title));
         content.push_str(&format!("send_by_enter = {}\n", if self.send_by_enter { "1" } else { "0" }));
         content.push_str("\n[network]\n");
+        content.push_str(&format!("port = {}\n", self.port));
         content.push_str(&format!("custom_group = {}\n", self.custom_group));
         let mode_str = match self.mode {
             ConnectionMode::LanOnly => "lan",
