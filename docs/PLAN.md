@@ -314,80 +314,102 @@ feiq-plus-plus/
 
 ## 五、实现阶段
 
-### Phase 1 — MVP: 基础消息 (目标：两台机器互发文本)
+### Phase 1 — MVP: 基础消息 ✅ 已完成
 
-| 模块 | 内容 |
-|------|------|
-| Rust 协议层 | IPMSG 全部常量、Fellow/Content/Post 类型、encoding_rs GBK转换、pack/parse 序列化 |
-| Rust 网络层 | UDP 端口2425、广播支持、MAC地址获取(mac_address crate)、自我消息过滤 |
-| Rust 引擎 | 启停、send_text、send_im_online、联系人自动发现、ansi_entry 应答 |
-| Rust 存储 | QSettings 风格 INI 配置 (用户名/主机名/自定义网段) |
-| Tauri | 脚手架、AppState、start_engine/get_contacts/send_message commands |
-| 前端 | 联系人侧边栏(在线/离线条目)、聊天面板(文本气泡)、消息输入框(Enter发送) |
-| **交付** | 两台机器同一局域网互相发现、收发文本、上线/下线通知 |
+| 模块 | 内容 | 状态 |
+|------|------|:---:|
+| Rust 协议层 | IPMSG 全部常量、Fellow/Content/Post 类型、encoding_rs GBK转换、pack/parse 序列化 | ✅ |
+| Rust 网络层 | UDP 端口2425、广播支持、MAC地址获取(mac_address crate)、自我消息过滤 | ✅ |
+| Rust 引擎 | 启停、send_text、send_im_online、联系人自动发现、ansi_entry 应答 | ✅ |
+| Rust 存储 | QSettings 风格 INI 配置 (用户名/主机名/自定义网段) | ✅ |
+| Tauri | 脚手架、AppState、start_engine/get_contacts/send_message commands | ✅ |
+| 前端 | 联系人侧边栏(在线/离线条目)、聊天面板(文本气泡)、消息输入框(Enter发送) | ✅ |
+| **交付** | 两台机器同一局域网互相发现、收发文本、上线/下线通知 | ✅ |
 
-### Phase 2 — 文件传输 + 表情
+### Phase 2 — 文件传输 + 表情 🟡 60%
 
-| 模块 | 内容 |
-|------|------|
-| Rust | TCP 异步文件传输、FileTask 状态机(NotStart→Running→Finish/Error/Canceled)、进度节流(1%/100KB) |
-| Rust | SendFileContent/RecvFile 协议、download_file、cancel_task |
-| Rust | 96个QQ表情定义、KnockContent、SendKnockContent |
-| 前端 | 文件传输对话框(实时进度条)、文件消息气泡(可点击下载)、拖拽发送文件 |
-| 前端 | 表情选择器(6x16网格)、消息中表情渲染(/:) → GIF)、窗口抖动动画(CSS shake) |
-| **交付** | 文件收发+进度、表情选择+渲染、窗口抖动 |
+| 模块 | 内容 | 状态 |
+|------|------|:---:|
+| Rust | TCP 异步文件传输、FileTask 状态机(NotStart→Running→Finish/Error/Canceled)、进度节流(1%/100KB) | ✅ |
+| Rust | SendFileContent/RecvFile 协议 | ✅ |
+| Rust | 96个QQ表情定义、KnockContent、SendKnockContent | ✅ |
+| Rust | download_file、cancel_task | ❌ |
+| 前端 | 文件传输对话框(实时进度条) | ❌ |
+| 前端 | 文件消息气泡(可点击下载) | ❌ |
+| 前端 | 拖拽发送文件 | ❌ |
+| 前端 | 表情选择器(6x16网格)、消息中表情渲染(/:) → GIF) | ✅ |
+| 前端 | 窗口抖动动画(CSS shake) | ✅ |
+| **交付** | 文件收发+进度、表情选择+渲染、窗口抖动 | 🟡 |
 
-### Phase 3 — 聊天记录 + 截图 + 用户管理
+> **缺失**: Tauri 文件命令未暴露给前端，文件传输 UI 完全空白。Rust 端文件传输已完备，仅需前端对接。
 
-| 模块 | 内容 |
-|------|------|
-| Rust | SQLite 聊天记录(自动保存所有收发消息)、分页查询(get_chat_history)、联系人搜索(名称/IP/拼音) |
-| Rust | 联系人分组存储、备注名、个性签名字段 |
-| Rust | 截图命令(调用平台截图工具: screencapture/maim/Snipping Tool) |
-| 前端 | 无限滚动加载历史消息、消息内搜索、日期分隔线 |
-| 前端 | 截图标注工具(Canvas: 矩形选区/箭头/文字)、截图自动发送 |
-| 前端 | 联系人分组树形视图、备注名编辑、个性签名显示 |
-| **交付** | 完整聊天记录、截图标注发送、联系人分组管理 |
+### Phase 3 — 聊天记录 + 截图 + 用户管理 🟡 25%
 
-### Phase 4 — 群聊 + 文件夹 + 安全
+| 模块 | 内容 | 状态 |
+|------|------|:---:|
+| Rust | SQLite 聊天记录(自动保存所有收发消息) | ✅ |
+| Rust | 分页查询(get_chat_history) | ✅ |
+| Rust | 联系人搜索(名称/IP，无拼音) | 🟡 |
+| Rust | 联系人分组存储、备注名、个性签名字段（数据模型已定义、无 setter/UI） | 🟡 |
+| Rust | 截图命令(调用平台截图工具) | ❌ |
+| 前端 | 无限滚动加载历史消息 | ❌ |
+| 前端 | 消息内搜索 | ❌ |
+| 前端 | 日期分隔线 | ❌ |
+| 前端 | 切换联系人时自动加载最近 100 条历史 | ✅ |
+| 前端 | 截图标注工具(Canvas) | ❌ |
+| 前端 | 联系人分组树形视图 | ❌ |
+| 前端 | 备注名编辑 UI、个性签名显示 | ❌ |
+| **交付** | 完整聊天记录、截图标注发送、联系人分组管理 | 🟡 |
 
-| 模块 | 内容 |
-|------|------|
-| Rust | P2P 群组分发(逐人发送消息/文件)、群组元数据 SQLite 存储(群名/成员列表) |
-| Rust | IPMSG_GETDIRFILES 文件夹传输(递归文件清单 + 长度前缀数据流) |
-| Rust | 离线消息缓存(对方离线时暂存SQLite，上线后自动重发) |
-| Rust | 黑名单过滤、垃圾消息检测 |
-| 前端 | 群组创建对话框、群聊视图(显示发送者名称前缀)、群发消息 |
-| 前端 | 文件夹选择发送、文件夹接收进度(多文件整体进度) |
-| **交付** | 群聊、文件夹传输、离线消息、黑名单 |
+> **已完成**: HistoryDb 集成（自动保存 + 分页查询 + 离线消息），切换联系人加载历史。
+> **缺失**: 截图、标注、分组视图、备注名/签名 UI。
 
-### Phase 4.5 — 🚀 Relay 服务器 (已实现 v0.1.4)
+### Phase 4 — 群聊 + 文件夹 + 离线消息 🟡 20%
 
-| 模块 | 内容 |
-|------|------|
-| Rust relay server | 独立 `feiq-relay` crate。WebSocket 服务器，7 种 JSON 消息类型 (Join/Joined/PeerJoin/PeerLeave/RelayMessage/Ack/Error)。房间模型：客户端加入后仅与同房间 peers 通信 |
-| Rust relay client | `network/relay.rs` (432 行)。WebSocket 客户端 transport，产出与 UDP transport 相同的 NetworkEvent 变体。自动重连 (exponential backoff)。发送前添加 IPMSG_SENDCHECKOPT 标志 |
-| Engine hybrid mode | 同时运行 LAN (UDP) + Relay (WebSocket) transport。`ContactSource::Lan` / `ContactSource::Relay` 区分来源。MAC+name 跨 transport 去重 |
-| Settings | `ConnectionMode` 枚举: LanOnly / RelayOnly / Hybrid。Relay 配置: URL + room name |
-| Frontend UI | SettingsDialog 中连接模式选择器 (三个 radio) + Relay URL 输入框 + 房间名输入框 |
-| 离线消息 | 服务器内存队列，24h TTL，客户端重连后自动推送 |
-| 加密 | ECDH+AES 端到端加密对 relay 透明 — 服务器仅转发加密载荷，不解密 |
-| **交付** | 跨网络通信、混合模式、relay 服务器独立部署 |
+| 模块 | 内容 | 状态 |
+|------|------|:---:|
+| Rust | 离线消息缓存(对方离线时暂存SQLite，上线后自动重发) | ✅ |
+| Rust | 群组元数据 SQLite 存储(群名/成员列表) | ✅ |
+| Rust | P2P 群组分发(逐人发送消息/文件) | ❌ |
+| Rust | IPMSG_GETDIRFILES 文件夹传输(递归文件清单 + 长度前缀数据流) | ❌ |
+| Rust | 黑名单过滤、垃圾消息检测 | ❌ |
+| 前端 | 群组创建对话框 | ❌ |
+| 前端 | 群聊视图(显示发送者名称前缀) | ❌ |
+| 前端 | 群发消息、文件夹选择发送、文件夹接收进度 | ❌ |
+| **交付** | 群聊、文件夹传输、离线消息、黑名单 | 🟡 |
 
-### Phase 5 — 加密 + 文件共享 + 打磨
+> **已完成**: 离线消息队列 + 自动投递、群组 SQLite 存储。
+> **缺失**: 群组分发逻辑、文件夹传输协议、所有前端。
 
-| 模块 | 内容 |
-|------|------|
-| Rust | ECDH (x25519) 密钥交换 + AES-256-GCM 加密 (`ring` crate)。自定义协议扩展：`IPMSG_ENCRYPTOPT` 标记 + 加密载荷 |
-| Rust | 密封消息 (阅后即焚)：`IPMSG_SECRETOPT` + 已读回执 + 前端倒计时自动清除 |
-| Rust | 文件共享服务：主动暴露共享目录，对方可通过 TCP 浏览并下载，可选密码保护 |
-| Rust | 传输速度限制 (token bucket)、断点续传 (offset 恢复) |
-| 前端 | 加密会话标识 (🔒图标)、密封消息倒计时 UI |
-| 前端 | 文件共享浏览对话框、自定义主题 (明/暗 + 多配色) |
-| 前端 | 系统托盘图标 + 未读角标、聊天记录 JSON 导出/导入 |
-| **交付** | 端到端加密、文件共享、暗色主题、全平台发布 |
+### Phase 4.5 — 🚀 Relay 服务器 ✅ 已完成 (v0.1.4)
 
-> **注**: IPMSG v9 老旧加密栈 (RSA + RC2/Blowfish) 作为 P6 可选兼容项，不作为 P5 交付要求。
+| 模块 | 内容 | 状态 |
+|------|------|:---:|
+| Rust relay server | 独立 `feiq-relay` crate。WebSocket 服务器，7 种 JSON 消息类型。房间模型 | ✅ |
+| Rust relay client | `network/relay.rs` (432 行)。自动重连 (exponential backoff) | ✅ |
+| Engine hybrid mode | 同时运行 LAN (UDP) + Relay (WebSocket) transport，跨 transport 去重 | ✅ |
+| Settings | `ConnectionMode` 枚举: LanOnly / RelayOnly / Hybrid | ✅ |
+| Frontend UI | SettingsDialog 中连接模式选择器 + Relay URL 输入框 | ✅ |
+| 离线消息 | 服务器内存队列，24h TTL，客户端重连后自动推送 | ✅ |
+| 加密 | ECDH+AES 端到端加密对 relay 透明 | ✅ |
+| **交付** | 跨网络通信、混合模式、relay 服务器独立部署 | ✅ |
+
+### Phase 5 — 加密 + 文件共享 + 打磨 ❌ 15%
+
+| 模块 | 内容 | 状态 |
+|------|------|:---:|
+| Rust | ECDH (x25519) 密钥交换 + AES-256-GCM 加密 (`ring` crate) | ✅ |
+| Rust | 断点续传 (offset 恢复) | ✅ |
+| Rust | `IPMSG_ENCRYPTOPT` 标记接入消息管线 | ❌ |
+| Rust | 密封消息 (阅后即焚)、文件共享服务、传输速度限制 (token bucket) | ❌ |
+| 前端 | 加密会话标识 (🔒图标)、密封消息倒计时 UI | ❌ |
+| 前端 | 文件共享浏览对话框 | ❌ |
+| 前端 | 自定义主题 (明/暗 + 多配色) | ❌ |
+| 前端 | 系统托盘未读角标、聊天记录 JSON 导出/导入 | ❌ |
+| **交付** | 端到端加密、文件共享、暗色主题、全平台发布 | ❌ |
+
+> **已完成**: crypto.rs 实现的 ECDH+AES 加解密、断点续传。
+> **缺失**: 加密未接入消息管线（`IPMSG_ENCRYPTOPT` 无人设置），所有前端功能。
 
 ---
 
