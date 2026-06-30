@@ -1,9 +1,10 @@
 import { useState, useRef, type KeyboardEvent } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { Send, Smile } from "lucide-react";
+import { Send, Smile, Camera } from "lucide-react";
 import { useMessageStore } from "../stores/messageStore";
 import { useContactStore } from "../stores/contactStore";
 import { EmojiPicker } from "./EmojiPicker";
+import { open as dialogOpen } from "@tauri-apps/plugin-dialog";
 
 export function InputArea({ fellowIp }: { fellowIp: string }) {
   const [text, setText] = useState("");
@@ -49,6 +50,52 @@ export function InputArea({ fellowIp }: { fellowIp: string }) {
     inputRef.current?.focus();
   };
 
+  const handleScreenshot = async () => {
+    try {
+      const result = await invoke<string>("capture_screenshot");
+      if (result === "FALLBACK") {
+        // User canceled or platform not supported — open file dialog
+        const filePath = await dialogOpen({
+          multiple: false,
+          filters: [
+            {
+              name: "Images",
+              extensions: ["png", "jpg", "jpeg", "gif", "bmp"],
+            },
+            { name: "All Files", extensions: ["*"] },
+          ],
+        });
+        if (!filePath) return;
+        const path = Array.isArray(filePath) ? filePath[0] : filePath;
+        // Show the file path in a message (actual file sending to come later)
+        const fellow = contacts.find((c) => c.ip === fellowIp);
+        if (fellow) {
+          addMessage(fellowIp, {
+            fromIp: "self",
+            fromName: "Me",
+            contents: [{ type: "text", text: `[Screenshot/File] ${path}` }],
+            timestamp: Date.now(),
+            direction: "sent",
+          });
+        }
+      } else {
+        // Screenshot captured — show file path
+        const fellow = contacts.find((c) => c.ip === fellowIp);
+        if (fellow) {
+          addMessage(fellowIp, {
+            fromIp: "self",
+            fromName: "Me",
+            contents: [{ type: "text", text: `[Screenshot] ${result}` }],
+            timestamp: Date.now(),
+            direction: "sent",
+          });
+        }
+      }
+    } catch (e) {
+      console.error("Screenshot failed:", e);
+    }
+  };
+
   return (
     <div className="border-t border-border px-4 py-3 bg-surface-alt relative">
       {/* Emoji Picker */}
@@ -57,6 +104,15 @@ export function InputArea({ fellowIp }: { fellowIp: string }) {
       )}
 
       <div className="flex items-end gap-2">
+        {/* Screenshot button */}
+        <button
+          onClick={handleScreenshot}
+          className="flex-shrink-0 w-8 h-8 flex items-center justify-center
+                     rounded-lg hover:bg-surface-alt text-text-muted transition-colors cursor-pointer mb-1"
+          title="Capture screenshot"
+        >
+          <Camera className="w-5 h-5" />
+        </button>
         {/* Emoji button */}
         <button
           onClick={() => setShowEmoji(!showEmoji)}

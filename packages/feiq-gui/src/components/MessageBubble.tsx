@@ -66,19 +66,28 @@ function normalizeContent(raw: Record<string, unknown>): NormalizedContent {
   };
 }
 
-export function MessageBubble({ message }: { message: Message }) {
+export function MessageBubble({
+  message,
+  showFromNameAlways,
+}: {
+  message: Message;
+  showFromNameAlways?: boolean;
+}) {
   const isSent = message.direction === "sent";
   const time = new Date(message.timestamp).toLocaleTimeString([], {
     hour: "2-digit",
     minute: "2-digit",
   });
 
+  const showFromName = showFromNameAlways || !isSent;
+  const fromLabel = isSent ? "Me" : message.fromName;
+
   return (
     <div className={`flex ${isSent ? "justify-end" : "justify-start"}`}>
       <div className={`max-w-[70%] ${isSent ? "order-1" : ""}`}>
-        {!isSent && (
+        {showFromName && (
           <div className="text-xs text-text-muted mb-0.5 ml-1">
-            {message.fromName}
+            {fromLabel}
           </div>
         )}
 

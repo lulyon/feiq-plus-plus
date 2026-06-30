@@ -20,7 +20,7 @@ interface ContactStore {
   selectedIp: string | null;
   setContacts: (contacts: Fellow[]) => void;
   upsertContact: (fellow: Fellow) => void;
-  selectContact: (ip: string) => void;
+  selectContact: (ip: string | null) => void;
 }
 
 export const useContactStore = create<ContactStore>((set) => ({

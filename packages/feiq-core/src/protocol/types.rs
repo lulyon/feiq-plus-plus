@@ -129,6 +129,17 @@ pub struct FileContent {
     /// Packet number this file belongs to
     #[serde(default)]
     pub packet_no: u64,
+    /// Local task ID assigned by the engine for tracking this file transfer
+    #[serde(default)]
+    pub local_task_id: Option<u64>,
+}
+
+/// Parsed GETFILEDATA request from a remote peer
+#[derive(Debug, Clone)]
+pub struct GetFileData {
+    pub packet_no: u64,
+    pub file_id: u64,
+    pub offset: i64,
 }
 
 /// Message content enum
@@ -196,6 +207,8 @@ pub struct Post {
     pub from: Fellow,
     /// Parsed contents
     pub contents: Vec<Content>,
+    /// Parsed GETFILEDATA request (if cmd_id is IPMSG_GETFILEDATA)
+    pub get_file_data: Option<GetFileData>,
 }
 
 impl Post {
@@ -207,6 +220,7 @@ impl Post {
             cmd_id: 0,
             from: Fellow::new(ip),
             contents: Vec::new(),
+            get_file_data: None,
         }
     }
 
@@ -259,4 +273,64 @@ pub struct FileTask {
     pub total: i64,
     #[serde(default)]
     pub cancel_pending: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_file_content_local_task_id_default() {
+        // local_task_id should default to None when deserializing
+        let json = r#"{"file_id": 42, "filename": "test.txt", "size": 1024}"#;
+        let fc: FileContent = serde_json::from_str(json).unwrap();
+        assert_eq!(fc.file_id, 42);
+        assert_eq!(fc.filename, "test.txt");
+        assert_eq!(fc.size, 1024);
+        assert!(fc.local_task_id.is_none());
+    }
+
+    #[test]
+    fn test_file_content_local_task_id_set() {
+        // local_task_id should be deserialized when present
+        let json = r#"{"file_id": 7, "filename": "photo.jpg", "local_task_id": 123}"#;
+        let fc: FileContent = serde_json::from_str(json).unwrap();
+        assert_eq!(fc.local_task_id, Some(123));
+    }
+
+    #[test]
+    fn test_file_content_local_task_id_serialize_roundtrip() {
+        // Roundtrip: serialize then deserialize preserves local_task_id
+        let fc = FileContent {
+            file_id: 1,
+            filename: "doc.pdf".into(),
+            path: String::new(),
+            size: 5000,
+            modify_time: 1000,
+            file_type: 1,
+            packet_no: 0,
+            local_task_id: Some(42),
+        };
+        let json = serde_json::to_string(&fc).unwrap();
+        let fc2: FileContent = serde_json::from_str(&json).unwrap();
+        assert_eq!(fc2.local_task_id, Some(42));
+    }
+
+    #[test]
+    fn test_get_file_data_struct() {
+        let gfd = GetFileData {
+            packet_no: 12345,
+            file_id: 67890,
+            offset: 0,
+        };
+        assert_eq!(gfd.packet_no, 12345);
+        assert_eq!(gfd.file_id, 67890);
+        assert_eq!(gfd.offset, 0);
+    }
+
+    #[test]
+    fn test_post_get_file_data_default() {
+        let post = Post::new("192.168.1.1");
+        assert!(post.get_file_data.is_none());
+    }
 }

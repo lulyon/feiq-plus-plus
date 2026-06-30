@@ -16,10 +16,13 @@ use crate::storage::history::HistoryDb;
 use crate::storage::settings::{AppConfig, ConnectionMode};
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::mpsc;
+
+/// Global atomic counter for generating file task IDs across dispatch tasks.
+static NEXT_FILE_TASK_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Unique packet ID generator
 struct PacketIdGen(u64);
@@ -63,8 +66,8 @@ pub struct Engine {
     packet_id: PacketIdGen,
     file_id: FileIdGen,
     version: String,
-    #[allow(dead_code)]
-    file_tasks: HashMap<u64, Arc<FileTaskHandle>>,
+    /// File transfer tasks (upload + download), keyed by local task ID
+    file_tasks: Arc<std::sync::Mutex<HashMap<u64, Arc<FileTaskHandle>>>>,
     /// Chat history database (SQLite)
     history: Option<Arc<std::sync::Mutex<HistoryDb>>>,
     /// Signals periodic broadcast task to stop
@@ -108,7 +111,7 @@ impl Engine {
             packet_id: PacketIdGen::new(),
             file_id: FileIdGen::new(),
             version,
-            file_tasks: HashMap::new(),
+            file_tasks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             history,
             shutdown: Arc::new(AtomicBool::new(false)),
         }
@@ -198,7 +201,7 @@ impl Engine {
 
         tokio::spawn(async move {
             while let Some(event) = net_rx.recv().await {
-                let reply = handle_network_event(event, &event_tx, &contacts, &config, &history_udp);
+                let reply = handle_network_event(event, &event_tx, &contacts, &config, &history_udp, None);
                 if let Some((ip, port)) = reply {
                     let _ = network_for_dispatch.send_to(&ip, port, &ans_entry_data).await;
                 }
@@ -270,7 +273,7 @@ impl Engine {
 
         tokio::spawn(async move {
             while let Some(event) = relay_rx.recv().await {
-                handle_network_event(event, &event_tx, &contacts, &config, &history_relay);
+                handle_network_event(event, &event_tx, &contacts, &config, &history_relay, None);
                 // No ANSENTRY reply for relay peers — server handles presence
             }
         });
@@ -605,6 +608,54 @@ impl Engine {
             .unwrap()
             .as_millis() as u64
     }
+
+    // ─── Chat History Search ──────────────────────────────────
+
+    /// Search chat history across all contacts by query string.
+    pub fn search_chat_history(&self, query: &str, limit: i64) -> anyhow::Result<Vec<crate::storage::history::MessageRecord>> {
+        match self.history {
+            Some(ref history) => history.lock().unwrap().search_messages(query, limit),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    // ─── File Task Management ─────────────────────────────────
+
+    /// Register a file transfer task and return its local task ID.
+    pub fn register_file_task(&self, task: FileTaskHandle) -> u64 {
+        let task_id = task.snapshot().id;
+        let mut tasks = self.file_tasks.lock().unwrap();
+        tasks.insert(task_id, Arc::new(task));
+        task_id
+    }
+
+    /// Get a file transfer task by local task ID.
+    pub fn get_file_task(&self, task_id: u64) -> Option<Arc<FileTaskHandle>> {
+        self.file_tasks.lock().unwrap().get(&task_id).cloned()
+    }
+
+    /// Cancel a file transfer task by local task ID.
+    pub fn cancel_file_task(&self, task_id: u64) {
+        if let Some(task) = self.file_tasks.lock().unwrap().get(&task_id) {
+            task.request_cancel();
+            task.set_canceled();
+        }
+    }
+
+    /// Getter for history database reference (for handle_network_event parameter).
+    pub fn history(&self) -> Option<&Arc<std::sync::Mutex<HistoryDb>>> {
+        self.history.as_ref()
+    }
+
+    /// Getter for file_tasks Arc (for sharing across dispatch tasks).
+    pub fn file_tasks(&self) -> &Arc<std::sync::Mutex<HashMap<u64, Arc<FileTaskHandle>>>> {
+        &self.file_tasks
+    }
+
+    /// Get the next local task ID (monotonically increasing).
+    fn next_task_id(&mut self) -> u64 {
+        self.file_id.next()
+    }
 }
 
 // ─── Network event handler (runs in tokio task) ──────────────
@@ -623,6 +674,7 @@ fn handle_network_event(
     contacts: &Arc<Mutex<ContactBook>>,
     _config: &AppConfig,
     history: &Option<Arc<std::sync::Mutex<HistoryDb>>>,
+    _file_tasks: Option<&Arc<std::sync::Mutex<HashMap<u64, Arc<FileTaskHandle>>>>>,
 ) -> Option<(String, u16)> {
     // ─── Blacklist check — drop events from blacklisted IPs ──
     let event_ip = match &event {
@@ -630,6 +682,7 @@ fn handle_network_event(
         | NetworkEvent::FellowAnsEntry(post)
         | NetworkEvent::FellowOffline(post)
         | NetworkEvent::Message(post) => Some(&post.from.ip),
+        NetworkEvent::GetFileData { from, .. } => Some(&from.ip),
         NetworkEvent::Error(_) => None,
     };
     if let Some(ip) = event_ip {
@@ -759,12 +812,38 @@ fn handle_network_event(
             if !post.contents.is_empty() {
                 let timestamp = post.when.timestamp_millis();
                 let from_name = post.from.display_name().to_string();
+                let from_ip = post.from.ip.clone();
                 tracing::info!(
                     "Dispatching message from {} (ip={}): {} contents",
                     from_name,
-                    post.from.ip,
+                    from_ip,
                     post.contents.len(),
                 );
+
+                // ─── Process file contents: create FileTaskHandle entries ──
+                if let Some(ref ft) = _file_tasks {
+                    for content in &post.contents {
+                        if let Content::File(fc) = content {
+                            if fc.file_type != IPMSG_FILE_DIR {
+                                let task_id =
+                                    NEXT_FILE_TASK_ID.fetch_add(1, Ordering::Relaxed);
+                                let task = FileTaskHandle::new(
+                                    task_id,
+                                    from_ip.clone(),
+                                    from_name.clone(),
+                                    fc.clone(),
+                                    FileTaskType::Download,
+                                );
+                                ft.lock().unwrap().insert(task_id, Arc::new(task));
+                                let _ = event_tx.send(FrontendEvent::FileStateChanged {
+                                    task_id,
+                                    state: FileTaskState::NotStart,
+                                    message: format!("File received: {}", fc.filename),
+                                });
+                            }
+                        }
+                    }
+                }
 
                 // ─── Save to chat history BEFORE moving contents ──
                 if let Some(ref history) = history {
@@ -789,6 +868,23 @@ fn handle_network_event(
                 let mut book = contacts.lock().unwrap();
                 book.upsert(post.from);
             }
+            None
+        }
+        NetworkEvent::GetFileData {
+            packet_no,
+            file_id,
+            offset,
+            from,
+        } => {
+            // File data request — handled in the engine's event loop
+            // where async TCP accept is available. Here we just log it.
+            tracing::info!(
+                "GetFileData received from {}: packet_no={}, file_id={}, offset={}",
+                from.ip,
+                packet_no,
+                file_id,
+                offset,
+            );
             None
         }
         NetworkEvent::Error(msg) => {
@@ -956,7 +1052,270 @@ pub fn create_file_content(file_path: &str) -> Option<FileContent> {
             IPMSG_FILE_REGULAR
         },
         packet_no: 0,
+        local_task_id: None,
     })
 }
 
 use std::io::Write as IoWrite;
+
+// ─── Group Chat ─────────────────────────────────────────────────
+
+impl Engine {
+    /// Send text to all members of a group (P2P dispatch).
+    /// The message is prefixed with `[group_name]` so each recipient
+    /// knows which group it came from (they forward to all members locally).
+    /// Also saves to local history under the synthetic key `group:{group_name}`.
+    pub async fn send_text_to_group(&self, group_name: &str, text: &str) -> anyhow::Result<()> {
+        let groups = match self.history {
+            Some(ref history) => history.lock().unwrap().get_groups()?,
+            None => anyhow::bail!("History not available"),
+        };
+        let members = groups
+            .into_iter()
+            .find(|(name, _)| name == group_name)
+            .map(|(_, members)| members)
+            .ok_or_else(|| anyhow::anyhow!("Group '{}' not found", group_name))?;
+
+        let prefixed = format!("[{}] {}", group_name, text);
+        for ip in &members {
+            // Use default port 2425 for LAN, or look up the contact's actual port
+            let port = self
+                .contacts
+                .lock()
+                .unwrap()
+                .find_by_ip(ip)
+                .map(|f| f.port)
+                .unwrap_or(2425);
+            if let Err(e) = self.send_text_to(ip, port, &prefixed).await {
+                tracing::warn!("Failed to send to group member {ip}: {e}");
+            }
+        }
+
+        // Also save to local history under group key
+        if let Some(ref history) = self.history {
+            let contents = vec![Content::Text {
+                text: prefixed.clone(),
+                format: String::new(),
+            }];
+            let group_key = format!("group:{}", group_name);
+            let _ = history
+                .lock()
+                .unwrap()
+                .save_message(&group_key, group_name, 0, &contents);
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::settings::AppConfig;
+
+    #[test]
+    fn test_create_group_no_history() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let engine = Engine::new(AppConfig::default(), tx, None);
+        let result = engine.create_group("Test", &["10.0.0.1".into()]);
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().to_string().contains("History"),
+            "Expected error mentioning History"
+        );
+    }
+
+    #[test]
+    fn test_get_groups_no_history() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let engine = Engine::new(AppConfig::default(), tx, None);
+        let groups = engine.get_groups().unwrap();
+        assert!(groups.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_send_text_to_group_no_history() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let engine = Engine::new(AppConfig::default(), tx, None);
+        let result = engine.send_text_to_group("Test", "Hello").await;
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().to_string().contains("History"),
+            "Expected error mentioning History"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_send_text_to_group_with_history() {
+        let path = format!(
+            "/tmp/test_feix_eng_grp_{}.sqlite3",
+            std::process::id()
+        );
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let engine = Engine::new(
+            AppConfig::default(),
+            tx,
+            Some(std::path::PathBuf::from(&path)),
+        );
+
+        // Create a group
+        engine
+            .create_group("Team", &["10.0.0.1".into(), "10.0.0.2".into()])
+            .unwrap();
+
+        // send_text_to_group should work even without active network transport
+        let result = engine.send_text_to_group("Team", "Hello world").await;
+        assert!(
+            result.is_ok(),
+            "send_text_to_group failed: {:?}",
+            result.err()
+        );
+
+        // Verify history was saved under group:Team key
+        let msgs = engine.get_chat_history("group:Team", 0, 10).unwrap();
+        assert!(
+            !msgs.is_empty(),
+            "No messages found under group:Team key"
+        );
+        assert_eq!(msgs.len(), 1);
+
+        // Verify message content includes the group prefix
+        assert!(
+            msgs[0].content_json.contains("[Team] Hello world"),
+            "Message content missing group prefix: {}",
+            msgs[0].content_json
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn test_send_text_to_group_nonexistent() {
+        let path = format!(
+            "/tmp/test_feix_eng_grp_nx_{}.sqlite3",
+            std::process::id()
+        );
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let engine = Engine::new(
+            AppConfig::default(),
+            tx,
+            Some(std::path::PathBuf::from(&path)),
+        );
+
+        let result = engine.send_text_to_group("Nonexistent", "Hello").await;
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().to_string().contains("not found"),
+            "Expected 'not found' error"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ─── File Task Management Tests ────────────────────────
+
+    #[test]
+    fn test_register_file_task() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let engine = Engine::new(AppConfig::default(), tx, None);
+
+        let content = FileContent {
+            file_id: 1,
+            filename: "test.txt".into(),
+            path: "/tmp/test.txt".into(),
+            size: 1024,
+            modify_time: 1000,
+            file_type: IPMSG_FILE_REGULAR,
+            packet_no: 0,
+            local_task_id: None,
+        };
+        let task = FileTaskHandle::new(42, "10.0.0.1".into(), "Alice".into(), content, FileTaskType::Upload);
+
+        let task_id = engine.register_file_task(task);
+        assert_eq!(task_id, 42);
+
+        let retrieved = engine.get_file_task(42);
+        assert!(retrieved.is_some());
+        let snap = retrieved.unwrap().snapshot();
+        assert_eq!(snap.id, 42);
+        assert_eq!(snap.fellow_ip, "10.0.0.1");
+        assert_eq!(snap.task_type, FileTaskType::Upload);
+    }
+
+    #[test]
+    fn test_get_file_task_not_found() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let engine = Engine::new(AppConfig::default(), tx, None);
+
+        let retrieved = engine.get_file_task(999);
+        assert!(retrieved.is_none());
+    }
+
+    #[test]
+    fn test_cancel_file_task() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let engine = Engine::new(AppConfig::default(), tx, None);
+
+        let content = FileContent {
+            file_id: 1,
+            filename: "test.txt".into(),
+            path: "/tmp/test.txt".into(),
+            size: 1024,
+            modify_time: 1000,
+            file_type: IPMSG_FILE_REGULAR,
+            packet_no: 0,
+            local_task_id: None,
+        };
+        let task = FileTaskHandle::new(7, "10.0.0.2".into(), "Bob".into(), content, FileTaskType::Download);
+        engine.register_file_task(task);
+
+        engine.cancel_file_task(7);
+
+        let retrieved = engine.get_file_task(7).unwrap();
+        let snap = retrieved.snapshot();
+        assert_eq!(snap.state, FileTaskState::Canceled);
+    }
+
+    #[test]
+    fn test_search_chat_history_no_db() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let engine = Engine::new(AppConfig::default(), tx, None);
+
+        let results = engine.search_chat_history("hello", 10).unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_search_chat_history_with_db() {
+        use crate::storage::history::HistoryDb;
+        let path = format!(
+            "/tmp/test_feix_eng_search_{}.sqlite3",
+            std::process::id()
+        );
+
+        // Create history DB and insert some data
+        {
+            let db = HistoryDb::open(std::path::Path::new(&path)).unwrap();
+            let contents = vec![Content::Text {
+                text: "Hello world!".into(),
+                format: String::new(),
+            }];
+            db.save_message("10.0.0.1", "Alice", 0, &contents).unwrap();
+        }
+
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let engine = Engine::new(
+            AppConfig::default(),
+            tx,
+            Some(std::path::PathBuf::from(&path)),
+        );
+
+        let results = engine.search_chat_history("Hello", 10).unwrap();
+        assert!(!results.is_empty(), "Should find messages with 'Hello'");
+        assert!(results[0].content_json.contains("Hello"));
+
+        let no_results = engine.search_chat_history("NonExistent", 10).unwrap();
+        assert!(no_results.is_empty());
+
+        let _ = std::fs::remove_file(&path);
+    }
+}

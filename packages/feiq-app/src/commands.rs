@@ -101,6 +101,18 @@ pub async fn get_chat_history(
         .map_err(|e| e.to_string())
 }
 
+#[tauri::command]
+pub async fn search_chat_history(
+    state: State<'_, AppState>,
+    query: String,
+    limit: i64,
+) -> Result<Vec<MessageRecord>, String> {
+    let engine = state.engine.lock().await;
+    engine
+        .search_chat_history(&query, limit)
+        .map_err(|e| e.to_string())
+}
+
 // ─── Emoji ────────────────────────────────────────────────────
 
 #[tauri::command]
@@ -216,6 +228,52 @@ pub async fn remove_from_blacklist(state: State<'_, AppState>, ip: String) -> Re
 pub async fn get_blacklist(state: State<'_, AppState>) -> Result<Vec<String>, String> {
     let engine = state.engine.lock().await;
     Ok(engine.get_blacklist())
+}
+
+// ─── Group Chat ──────────────────────────────────────────────────
+
+#[tauri::command]
+pub async fn send_group_text(
+    state: State<'_, AppState>,
+    group_name: String,
+    text: String,
+) -> Result<(), String> {
+    let engine = state.engine.lock().await;
+    tracing::info!("send_group_text to group={group_name}, text={text}");
+    engine
+        .send_text_to_group(&group_name, &text)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+// ─── Screenshot (macOS) ─────────────────────────────────────────
+
+#[tauri::command]
+pub async fn capture_screenshot() -> Result<String, String> {
+    let path = format!(
+        "/tmp/feiq_screenshot_{}.png",
+        std::process::id()
+    );
+    let path_clone = path.clone();
+
+    #[cfg(target_os = "macos")]
+    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
+        let _output = std::process::Command::new("screencapture")
+            .args(["-i", &path_clone])
+            .output()?;
+        if std::path::Path::new(&path_clone).exists() {
+            Ok(path_clone)
+        } else {
+            Ok("FALLBACK".to_string()) // User canceled
+        }
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+
+    #[cfg(not(target_os = "macos"))]
+    let result: anyhow::Result<String> = Ok("FALLBACK".to_string());
+
+    result.map_err(|e| e.to_string())
 }
 
 // ─── Unread Badge ─────────────────────────────────────────────

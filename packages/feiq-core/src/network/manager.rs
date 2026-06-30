@@ -3,19 +3,18 @@
 
 use crate::network::tcp::{FileServer, FileTransfer};
 use crate::network::udp::UdpTransport;
-use crate::protocol::constants::IPMSG_PORT;
+use crate::protocol::constants::{IPMSG_ANSENTRY, IPMSG_BR_ENTRY, IPMSG_BR_EXIT, IPMSG_RELEASEFILES};
 use crate::protocol::parser::ProtocolChain;
 use crate::protocol::serializer::parse_raw;
-use crate::protocol::types::Post;
 use super::NetworkEvent;
+use std::sync::Arc;
 use tokio::sync::mpsc;
 
 /// NetworkManager owns the UDP socket and protocol chain,
 /// continuously receiving and dispatching packets.
 pub struct NetworkManager {
     udp: UdpTransport,
-    #[allow(dead_code)]
-    tcp_server: FileServer,
+    tcp_server: Arc<FileServer>,
     protocol_chain: ProtocolChain,
     self_mac: String,
     self_name: String,
@@ -31,7 +30,7 @@ impl NetworkManager {
         port: u16,
     ) -> anyhow::Result<Self> {
         let udp = UdpTransport::bind(port).await?;
-        let tcp_server = FileServer::bind(port).await?;
+        let tcp_server = Arc::new(FileServer::bind(port).await?);
         let self_mac = udp.mac().to_string();
         let protocol_chain = crate::protocol::parser::build_default_chain();
 
@@ -90,6 +89,31 @@ impl NetworkManager {
         Ok((FileTransfer::from_stream(stream), ip))
     }
 
+    /// Start a background task that accepts incoming TCP file transfer connections.
+    /// This ensures the server is listening when a remote peer connects after sending
+    /// GETFILEDATA. The accepted connections must be matched with pending file requests
+    /// in the engine layer.
+    pub fn start_accept_loop(self: &Arc<Self>) {
+        let this = self.clone();
+        tokio::spawn(async move {
+            loop {
+                match this.tcp_server.accept().await {
+                    Ok((stream, ip)) => {
+                        tracing::debug!("TCP server (background) accepted connection from {ip}");
+                        // Drop immediately — the engine opens a separate accept
+                        // when processing GetFileData. This loop ensures the kernel
+                        // TCP backlog doesn't fill up.
+                        drop(stream);
+                    }
+                    Err(e) => {
+                        tracing::error!("TCP server accept loop error: {e}");
+                        break;
+                    }
+                }
+            }
+        });
+    }
+
     /// Main receive loop. Runs forever, dispatching parsed packets.
     pub async fn run(&self) -> anyhow::Result<()> {
         loop {
@@ -117,14 +141,31 @@ impl NetworkManager {
         // Run through protocol chain to parse contents
         self.protocol_chain.process(&mut post);
 
-        // Dispatch based on what was parsed
+        // ─── Check for GETFILEDATA (file data request) ────────
+        if let Some(gfd) = post.get_file_data.take() {
+            let _ = self.event_tx.send(NetworkEvent::GetFileData {
+                packet_no: gfd.packet_no,
+                file_id: gfd.file_id,
+                offset: gfd.offset,
+                from: post.from,
+            });
+            return;
+        }
+
+        // ─── Check for RELEASEFILES ───────────────────────────
+        if is_cmd_set(post.cmd_id, IPMSG_RELEASEFILES) {
+            // TODO: handle file release (clean up pending tasks)
+            return;
+        }
+
+        // ─── Dispatch based on parsed contents ────────────────
         if post.contents.is_empty() {
             // System message: online/offline/ansentry
-            if is_cmd_set(post.cmd_id, crate::protocol::constants::IPMSG_BR_ENTRY) {
+            if is_cmd_set(post.cmd_id, IPMSG_BR_ENTRY) {
                 let _ = self.event_tx.send(NetworkEvent::FellowOnline(post));
-            } else if is_cmd_set(post.cmd_id, crate::protocol::constants::IPMSG_BR_EXIT) {
+            } else if is_cmd_set(post.cmd_id, IPMSG_BR_EXIT) {
                 let _ = self.event_tx.send(NetworkEvent::FellowOffline(post));
-            } else if is_cmd_set(post.cmd_id, crate::protocol::constants::IPMSG_ANSENTRY) {
+            } else if is_cmd_set(post.cmd_id, IPMSG_ANSENTRY) {
                 let _ = self.event_tx.send(NetworkEvent::FellowAnsEntry(post));
             }
             // Other empty-content posts are ignored

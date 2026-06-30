@@ -305,6 +305,7 @@ fn parse_file_task(data: &[u8]) -> Option<FileContent> {
         modify_time,
         file_type,
         packet_no: 0, // set by caller
+        local_task_id: None,
     })
 }
 
@@ -351,6 +352,42 @@ impl RecvProtocol for RecvReadMessage {
     }
 }
 
+// ─── RecvGetFileData: handles IPMSG_GETFILEDATA (file data request) ──
+
+pub struct RecvGetFileData;
+
+impl RecvProtocol for RecvGetFileData {
+    fn name(&self) -> &str {
+        "RecvGetFileData"
+    }
+
+    fn read(&self, post: &mut Post, _chain: &ProtocolChain) -> bool {
+        if !is_cmd_set(post.cmd_id, IPMSG_GETFILEDATA) {
+            return false;
+        }
+
+        // Format: packetNo:fileId:offset:
+        let extra_str = String::from_utf8_lossy(&post.extra);
+        let parts: Vec<&str> = extra_str.trim_end_matches(':').split(':').collect();
+
+        if parts.len() >= 3 {
+            if let (Ok(packet_no), Ok(file_id), Ok(offset)) = (
+                parts[0].parse::<u64>(),
+                parts[1].parse::<u64>(),
+                parts[2].parse::<i64>(),
+            ) {
+                post.get_file_data = Some(GetFileData {
+                    packet_no,
+                    file_id,
+                    offset,
+                });
+            }
+        }
+
+        true // stop chain
+    }
+}
+
 // ─── EndRecv: terminal handler, triggers event if contents exist ──
 
 pub struct EndRecv;
@@ -383,6 +420,7 @@ pub fn build_default_chain() -> ProtocolChain {
     chain.add_handler(Box::new(RecvImage));
     chain.add_handler(Box::new(RecvKnock));
     chain.add_handler(Box::new(RecvFile));
+    chain.add_handler(Box::new(RecvGetFileData));
     chain.add_handler(Box::new(EndRecv));
 
     chain
@@ -425,6 +463,54 @@ mod tests {
             Content::Text { text, .. } => assert_eq!(text, "你好世界"),
             _ => panic!("Expected Text content"),
         }
+    }
+
+    #[test]
+    fn test_chain_get_file_data() {
+        let chain = build_default_chain();
+        let mut post = Post::new("192.168.1.100");
+        post.cmd_id = IPMSG_GETFILEDATA;
+        // Format: packetNo:fileId:offset:\0
+        post.extra = b"12345:67890:0:\0".to_vec();
+
+        chain.process(&mut post);
+
+        assert!(post.get_file_data.is_some());
+        let gfd = post.get_file_data.as_ref().unwrap();
+        assert_eq!(gfd.packet_no, 12345);
+        assert_eq!(gfd.file_id, 67890);
+        assert_eq!(gfd.offset, 0);
+    }
+
+    #[test]
+    fn test_chain_get_file_data_non_zero_offset() {
+        let chain = build_default_chain();
+        let mut post = Post::new("10.0.0.1");
+        post.cmd_id = IPMSG_GETFILEDATA;
+        // Format: packetNo:fileId:offset:
+        post.extra = b"999:1:65536:\0".to_vec();
+
+        chain.process(&mut post);
+
+        assert!(post.get_file_data.is_some());
+        let gfd = post.get_file_data.as_ref().unwrap();
+        assert_eq!(gfd.packet_no, 999);
+        assert_eq!(gfd.file_id, 1);
+        assert_eq!(gfd.offset, 65536);
+    }
+
+    #[test]
+    fn test_chain_get_file_data_not_matched() {
+        // Regular SENDMSG should NOT set get_file_data
+        let chain = build_default_chain();
+        let mut post = Post::new("192.168.1.100");
+        post.cmd_id = IPMSG_SENDMSG;
+        let gbk_text = b"\xc4\xe3\xba\xc3".to_vec();
+        post.extra = gbk_text;
+
+        chain.process(&mut post);
+
+        assert!(post.get_file_data.is_none());
     }
 
     #[test]

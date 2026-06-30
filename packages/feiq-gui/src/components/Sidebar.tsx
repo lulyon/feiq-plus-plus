@@ -2,7 +2,9 @@ import { useState, useEffect, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { useContactStore } from "../stores/contactStore";
 import { useMessageStore } from "../stores/messageStore";
+import { useGroupStore } from "../stores/groupStore";
 import { Users, Wifi, WifiOff, Plus, Cloud, ChevronRight } from "lucide-react";
+import { CreateGroupDialog } from "./CreateGroupDialog";
 
 /** A single collapsible group section */
 function CollapsibleGroup({
@@ -50,6 +52,12 @@ export function Sidebar() {
   const [editingAliasIp, setEditingAliasIp] = useState<string | null>(null);
   const [editingAliasValue, setEditingAliasValue] = useState("");
   const aliasInputRef = useRef<HTMLInputElement>(null);
+  // Search query
+  // Groups
+  const groups = useGroupStore((s) => s.groups);
+  const selectedGroupName = useGroupStore((s) => s.selectedGroupName);
+  const selectGroup = useGroupStore((s) => s.selectGroup);
+  const [showCreateGroup, setShowCreateGroup] = useState(false);
   // Search query
   const [searchQuery, setSearchQuery] = useState("");
   // Track expanded groups
@@ -211,6 +219,7 @@ export function Sidebar() {
         key={fellow.ip}
         onClick={() => {
           if (isEditing) return;
+          selectGroup(null); // clear group selection
           selectContact(fellow.ip);
           markRead(fellow.ip);
           invoke("reset_unread_count").catch(() => {});
@@ -338,6 +347,74 @@ export function Sidebar() {
             autoFocus
           />
         </div>
+      )}
+
+      {/* Groups Section */}
+      {groups.length > 0 && (
+        <div className="border-t border-border">
+          <CollapsibleGroup
+            name="Groups"
+            count={groups.length}
+            expanded={expandedGroups["__groups__"] !== false}
+            onToggle={() => toggleGroup("__groups__")}
+          >
+            {groups.map((group) => {
+              const isGroupSelected = group.name === selectedGroupName;
+              return (
+                <div
+                  key={group.name}
+                  onClick={() => {
+                    selectContact(null); // clear contact selection
+                    selectGroup(group.name);
+                    // No unread for groups yet — could add later
+                  }}
+                  className={`flex items-center gap-3 px-4 py-2.5 cursor-pointer border-l-3 transition-colors
+                    ${isGroupSelected
+                      ? "bg-primary/10 border-l-primary"
+                      : "border-l-transparent hover:bg-surface-alt"
+                    }`}
+                >
+                  <Users className="w-4 h-4 text-text-muted flex-shrink-0" />
+                  <div className="flex-1 min-w-0">
+                    <div className="text-sm font-medium text-text truncate">
+                      {group.name}
+                    </div>
+                    <div className="text-xs text-text-muted">
+                      {group.memberIps.length} members
+                    </div>
+                  </div>
+                </div>
+              );
+            })}
+            <button
+              onClick={() => setShowCreateGroup(true)}
+              className="flex items-center gap-2 px-4 py-2 w-full text-sm text-text-muted
+                         hover:text-text hover:bg-surface-alt transition-colors cursor-pointer"
+            >
+              <Plus className="w-3.5 h-3.5" />
+              Create Group
+            </button>
+          </CollapsibleGroup>
+        </div>
+      )}
+
+      {/* Quick-create group button when no groups exist */}
+      {groups.length === 0 && (
+        <div className="px-4 py-1 border-t border-border">
+          <button
+            onClick={() => setShowCreateGroup(true)}
+            className="flex items-center gap-2 w-full py-1.5 text-xs text-text-muted
+                       hover:text-text transition-colors cursor-pointer"
+          >
+            <Plus className="w-3 h-3" />
+            Create Group
+          </button>
+        </div>
+      )}
+
+      {/* CreateGroupDialog */}
+      {showCreateGroup && (
+        <CreateGroupDialog onClose={() => setShowCreateGroup(false)} />
       )}
 
       {/* Contact List (grouped tree view) */}

@@ -7,10 +7,26 @@ import { useContactStore } from "./stores/contactStore";
 import type { Fellow } from "./stores/contactStore";
 import { useMessageStore } from "./stores/messageStore";
 import type { Content } from "./stores/messageStore";
+import { useGroupStore } from "./stores/groupStore";
+import type { Group } from "./stores/groupStore";
 
 export default function App() {
   const upsertContact = useContactStore((s) => s.upsertContact);
   const addMessage = useMessageStore((s) => s.addMessage);
+  const setGroups = useGroupStore((s) => s.setGroups);
+
+  // Load groups on startup
+  useEffect(() => {
+    invoke<[string, string[]][]>("get_groups")
+      .then((rawGroups) => {
+        const groups: Group[] = rawGroups.map(([name, memberIps]) => ({
+          name,
+          memberIps,
+        }));
+        setGroups(groups);
+      })
+      .catch((e) => console.error("Failed to load groups:", e));
+  }, []);
 
   useEffect(() => {
     const unlisteners: (() => void)[] = [];

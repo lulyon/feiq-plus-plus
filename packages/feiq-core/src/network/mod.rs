@@ -4,7 +4,7 @@ pub mod manager;
 pub mod crypto;
 pub mod relay;
 
-use crate::protocol::types::Post;
+use crate::protocol::types::{Fellow, Post};
 
 /// Events from the network layer to the engine
 /// (shared across UDP manager, relay client, and future transports)
@@ -18,6 +18,13 @@ pub enum NetworkEvent {
     FellowOffline(Post),
     /// Self online notification response (ANSENTRY handled)
     FellowAnsEntry(Post),
+    /// Remote peer requests file data (IPMSG_GETFILEDATA)
+    GetFileData {
+        packet_no: u64,
+        file_id: u64,
+        offset: i64,
+        from: Fellow,
+    },
     /// Error in network processing
     Error(String),
 }
