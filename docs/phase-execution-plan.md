@@ -425,16 +425,48 @@ send_file(ip, file_path)          → create_file_content → build_file_message
 | 加密密钥持久化 | 当前阶段临时密钥（前向安全），未来加 `settings.persist_keypair` 选项给 relay 长期离线场景 |
 | Canvas 标注库 | 原始 Canvas API 零依赖起步，需要时再升级 fabric.js |
 
+## 跨 Agent 审计发现的问题
+
+### 🔴 严重问题（需在实现前修复）
+
+| # | 问题 | 位置 | 影响 |
+|---|------|------|------|
+| 1 | **crypto.rs nonce 重用 bug**——`encrypt()` 每次调用都通过 `std::mem::replace` 将 nonce 计数器重置为零 | `crypto.rs:89` | AES-GCM 安全性完全失效；必须在加密管线实现前修复 |
+| 2 | **前端 `upsertContact` 别名覆盖**——`{ ...contacts[idx], ...fellow }` 在网络更新时用空字符串覆盖用户设置的别名 | `contactStore.ts:38` | 用户设置的别名在网络事件进入时静默丢失 |
+| 3 | **HistoryDb `INSERT OR REPLACE` 群组重复**——`group_name` 不是 UNIQUE，保存同名群组会创建重复行 | `history.rs:206` | 群组 CRUD 损坏；需要在 `group_name` 上添加 UNIQUE 约束或先 DELETE |
+| 4 | **`search_messages` 不搜索联系人姓名**——仅匹配 `content_json`，不包含 `contact_name` | `history.rs:130` | 搜索 "Alice" 只会找到消息文本中包含 "Alice" 的结果，找不到来自 Alice 的消息 |
+
+### 🟡 中等问题
+
+| # | 问题 | 位置 | 影响 |
+|---|------|------|------|
+| 5 | **`drain_pending().unwrap_or_default()` 静默丢弃数据库错误**——离线消息可能永远丢失 | `engine.rs:506` | SELECT 成功但 DELETE 失败会导致下次重复投递；两种失败都无日志 |
+| 6 | **`MessageRecord` 去重使用时间戳**——快速连续消息可能具有相同时间戳 | `messageStore.ts:57` | 应该使用 `id`（SQLite 主键）而非 `timestamp` 进行去重 |
+| 7 | **加密公钥追加到 ANSENTRY 会损坏名称解析**——接收端 `decode_gbk` 尝试将原始密钥字节当作 GBK 解码 | `parser.rs:84,105` | feiq++ 互操作名称损坏；需要在解码前先剥离尾部密钥字节 |
+
+### 🟢 确认可行 / 无阻塞
+
+| # | 发现 | 详情 |
+|---|------|------|
+| 8 | **Tauri v2 托盘/停靠栏 API 已确认**——`set_badge_count`、`set_tooltip`、`TrayIcon::set_icon` 全部可用 | 0 个新依赖 |
+| 9 | **`screencapture -i` 已验证**——阻塞式，按 ESC 退出码 0 但无文件；需要文件存在性检查 | 无需 `tauri-plugin-shell` |
+| 10 | **Tauri v2 拖放 API 已确认**——`getCurrentWebview().onDragDropEvent()`；默认开启 | 需在 `App.tsx` 注册（全局），非 InputArea |
+| 11 | **Tailwind v4 `@theme` CSS 变量方法已确认**——9 个现有变量 + 28 个 Tailwind 颜色类 → 约 12 个语义变量 | `index.css` + 所有 7 个组件文件 |
+| 12 | **Canvas 标注可行**——全部 10 个 lucide-react 图标可用；z-50 是代码库约定；需添加 `@tauri-apps/plugin-fs` 前端依赖用于导出 |
+| 13 | **原始 feiq 无真正的群聊**——`feiqengine.cpp` 仅将群组作为 IP 白名单用于跨子网可达性 | 我们需自行设计群组消息分发 |
+| 14 | **原始 feiq 拒绝文件夹传输**——`feiqengine.cpp:759`："Mac飞秋还不支持接收目录" | 我们需完全自行实现 |
+| 15 | **`std::sync::Mutex` 从未跨 await 持有**——无死锁风险；锁获取很快（微秒级哈希查找） | 线程安全 ✅ |
+
 ## 技术验证项
 
 | 项 | 方法 | 状态 |
 |----|------|:---:|
-| Tauri v2 drag-drop API | 查阅 @tauri-apps/api 文档 | 待验证 |
-| screencapture 行为 | macOS 实测 screencapture -i | 待验证 |
-| Windows 剪贴板读取 | Rust 侧读取剪贴板图片数据 | 待验证 |
-| CSS var 替换 Tailwind class | 用手动替换还是 tailwind.config | 待验证 |
-| Tauri TrayIcon::set_icon API | Tauri 2 API 文档 | 待验证 |
-| IPMSG GETDIRFILES 完整协议 | 原 feiq 代码 (`TECHNICAL_DOC.md`) | 已参考 |
+| Tauri v2 drag-drop API | 查阅 @tauri-apps/api 文档 | ✅ 已确认 |
+| screencapture 行为 | macOS 实测 screencapture -i | ✅ 已确认 |
+| Windows 剪贴板读取 | `arboard` crate (v3.6.1) | 🟡 需确认引入 arboard |
+| CSS var 替换 Tailwind class | 12 个语义变量替代 28 个颜色类 | ✅ 已确认方案 |
+| Tauri TrayIcon API | `set_badge_count` / `set_tooltip` 全部可用 | ✅ 已确认 |
+| IPMSG GETDIRFILES 协议 | 原 feiq 拒绝文件夹传输，需完全自建 | 🟡 需确认是否实现 |
 | ECDH 密钥格式 (x25519 32 bytes) | ring crate API 已验证 | ✅ |
 | IPMSG_ENCRYPTOPT 与旧客户端兼容 | 仅 feiq++ 之间加密，旧客户端明文 | ✅ |
 
