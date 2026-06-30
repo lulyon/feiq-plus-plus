@@ -63,6 +63,12 @@ pub struct AppConfig {
     /// Theme: "auto", "light", or "dark"
     #[serde(default = "default_theme")]
     pub theme: String,
+    /// Shared directory path for file sharing (Phase 5.3)
+    #[serde(default)]
+    pub shared_dir: String,
+    /// Optional password for accessing the shared directory
+    #[serde(default)]
+    pub shared_dir_password: String,
 }
 
 fn default_theme() -> String { "auto".to_string() }
@@ -89,6 +95,8 @@ impl Default for AppConfig {
             relay_server_url: String::new(),
             relay_room: default_relay_room(),
             theme: default_theme(),
+            shared_dir: String::new(),
+            shared_dir_password: String::new(),
         }
     }
 }
@@ -144,6 +152,12 @@ impl AppConfig {
                     "app/theme" | "theme" => {
                         config.theme = value.to_string();
                     }
+                    "share/shared_dir" | "shared_dir" => {
+                        config.shared_dir = value.to_string();
+                    }
+                    "share/shared_dir_password" | "shared_dir_password" => {
+                        config.shared_dir_password = value.to_string();
+                    }
                     _ => {}
                 }
             }
@@ -174,6 +188,11 @@ impl AppConfig {
         }
         content.push_str(&format!("relay_room = {}\n", self.relay_room));
         content.push_str(&format!("theme = {}\n", self.theme));
+        content.push_str("\n[share]\n");
+        content.push_str(&format!("shared_dir = {}\n", self.shared_dir));
+        if !self.shared_dir_password.is_empty() {
+            content.push_str(&format!("shared_dir_password = {}\n", self.shared_dir_password));
+        }
         content.push_str("\n[rank_user]\n");
         content.push_str(&format!("enable = {}\n", if self.rank_user_enable { "1" } else { "0" }));
         std::fs::write(path, content)?;

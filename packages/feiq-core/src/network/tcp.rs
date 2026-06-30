@@ -4,6 +4,165 @@
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
+use crate::protocol::constants::{IPMSG_FILE_DIR, IPMSG_FILE_REGULAR};
+use crate::protocol::types::FileContent;
+
+/// List files in a directory, returning IPMSG-formatted file entries.
+/// Recursively lists all files under `dir_path`.
+/// File paths are set to the absolute filesystem path for serving.
+/// `base_path` is documented for future relative-path computation.
+pub fn list_directory(dir_path: &str, _base_path: &str) -> Vec<FileContent> {
+    let mut files = Vec::new();
+
+    let dir = match std::fs::read_dir(dir_path) {
+        Ok(dir) => dir,
+        Err(e) => {
+            tracing::warn!("Failed to read directory {}: {}", dir_path, e);
+            return files;
+        }
+    };
+
+    for entry in dir {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+
+        let path = entry.path();
+        let metadata = match std::fs::metadata(&path) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+
+        let filename = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("")
+            .to_string();
+
+        if filename.starts_with('.') {
+            // Skip hidden files
+            continue;
+        }
+
+        let file_type = if metadata.is_dir() {
+            IPMSG_FILE_DIR
+        } else if metadata.is_file() {
+            IPMSG_FILE_REGULAR
+        } else {
+            continue; // Skip symlinks, devices, etc.
+        };
+
+        let file_content = FileContent {
+            file_id: 0, // assigned by caller
+            filename,
+            path: path.to_string_lossy().to_string(), // full path for serving
+            size: metadata.len() as i64,
+            modify_time: metadata
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0),
+            file_type,
+            packet_no: 0,
+            local_task_id: None,
+        };
+
+        // Recursively list subdirectories
+        if metadata.is_dir() {
+            let sub_files = list_directory(&path.to_string_lossy(), _base_path);
+            files.push(file_content);
+            files.extend(sub_files);
+        } else {
+            files.push(file_content);
+        }
+    }
+
+    files
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn create_temp_dir() -> (String, std::path::PathBuf) {
+        let pid = std::process::id();
+        let path = std::path::PathBuf::from(format!(
+            "/tmp/feiq_test_listdir_{}_{}",
+            pid,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        (path.to_string_lossy().to_string(), path)
+    }
+
+    #[test]
+    fn test_list_directory_returns_correct_types() {
+        let (dir_path, path) = create_temp_dir();
+
+        // Create a regular file
+        let file_path = path.join("test.txt");
+        std::fs::write(&file_path, "hello").unwrap();
+
+        // Create a subdirectory
+        let sub_dir = path.join("subdir");
+        std::fs::create_dir(&sub_dir).unwrap();
+
+        let files = list_directory(&dir_path, &dir_path);
+
+        assert!(!files.is_empty(), "Should list at least one entry");
+
+        let txt = files.iter().find(|f| f.filename == "test.txt").unwrap();
+        assert_eq!(txt.file_type, IPMSG_FILE_REGULAR);
+        assert_eq!(txt.size, 5);
+
+        let sub = files.iter().find(|f| f.filename == "subdir").unwrap();
+        assert_eq!(sub.file_type, IPMSG_FILE_DIR);
+
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    #[test]
+    fn test_list_directory_empty_dir() {
+        let (dir_path, path) = create_temp_dir();
+
+        let files = list_directory(&dir_path, &dir_path);
+        assert!(files.is_empty(), "Empty directory should return no files");
+
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    #[test]
+    fn test_list_directory_nonexistent_path() {
+        let files = list_directory("/tmp/feiq_test_nonexistent_dir_12345", "");
+        assert!(files.is_empty(), "Nonexistent path should return empty vec");
+    }
+
+    #[test]
+    fn test_list_directory_hidden_files_skipped() {
+        let (dir_path, path) = create_temp_dir();
+
+        std::fs::write(path.join("visible.txt"), "data").unwrap();
+        std::fs::write(path.join(".hidden"), "secret").unwrap();
+
+        let files = list_directory(&dir_path, &dir_path);
+        assert!(
+            files.iter().any(|f| f.filename == "visible.txt"),
+            "visible.txt should be listed"
+        );
+        assert!(
+            !files.iter().any(|f| f.filename == ".hidden"),
+            ".hidden should be excluded"
+        );
+
+        let _ = std::fs::remove_dir_all(&path);
+    }
+}
+
 /// Chunk size for file transfer (64KB for modern networks)
 pub const FILE_CHUNK_SIZE: usize = 65536;
 

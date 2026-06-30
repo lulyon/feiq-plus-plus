@@ -1,14 +1,17 @@
 import { useState, useRef, type KeyboardEvent } from "react";
+import { createPortal } from "react-dom";
 import { invoke } from "@tauri-apps/api/core";
 import { Send, Smile, Camera, Paperclip } from "lucide-react";
 import { useMessageStore } from "../stores/messageStore";
 import { useContactStore } from "../stores/contactStore";
 import { EmojiPicker } from "./EmojiPicker";
+import { ScreenshotAnnotation } from "./ScreenshotAnnotation";
 import { open as dialogOpen } from "@tauri-apps/plugin-dialog";
 
 export function InputArea({ fellowIp }: { fellowIp: string }) {
   const [text, setText] = useState("");
   const [showEmoji, setShowEmoji] = useState(false);
+  const [annotatingPath, setAnnotatingPath] = useState<string | null>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const addMessage = useMessageStore((s) => s.addMessage);
   const contacts = useContactStore((s) => s.contacts);
@@ -51,6 +54,7 @@ export function InputArea({ fellowIp }: { fellowIp: string }) {
   };
 
   const handleScreenshot = async () => {
+    if (annotatingPath) return; // already annotating a screenshot
     try {
       const result = await invoke<string>("capture_screenshot");
       if (result === "FALLBACK") {
@@ -69,25 +73,12 @@ export function InputArea({ fellowIp }: { fellowIp: string }) {
         const path = Array.isArray(filePath) ? filePath[0] : filePath;
         const fellow = contacts.find((c) => c.ip === fellowIp);
         if (fellow) {
-          addMessage(fellowIp, {
-            fromIp: "self",
-            fromName: "Me",
-            contents: [{ type: "text", text: `[Screenshot/File] ${path}` }],
-            timestamp: Date.now(),
-            direction: "sent",
-          });
+          invoke("send_file", { ip: fellow.ip, filePath: path })
+            .catch((e) => console.error("send_file failed:", e));
         }
       } else {
-        const fellow = contacts.find((c) => c.ip === fellowIp);
-        if (fellow) {
-          addMessage(fellowIp, {
-            fromIp: "self",
-            fromName: "Me",
-            contents: [{ type: "text", text: `[Screenshot] ${result}` }],
-            timestamp: Date.now(),
-            direction: "sent",
-          });
-        }
+        // Show annotation overlay
+        setAnnotatingPath(result);
       }
     } catch (e) {
       console.error("Screenshot failed:", e);
@@ -123,6 +114,7 @@ export function InputArea({ fellowIp }: { fellowIp: string }) {
   };
 
   return (
+    <>
     <div className="border-t border-border px-4 py-3 bg-surface-alt relative">
       {/* Emoji Picker */}
       {showEmoji && (
@@ -178,5 +170,21 @@ export function InputArea({ fellowIp }: { fellowIp: string }) {
         </button>
       </div>
     </div>
+    {annotatingPath && createPortal(
+      <ScreenshotAnnotation
+        imagePath={annotatingPath}
+        onSave={(path) => {
+          setAnnotatingPath(null);
+          const fellow = contacts.find((c) => c.ip === fellowIp);
+          if (fellow) {
+            invoke("send_file", { ip: fellow.ip, filePath: path })
+              .catch((e) => console.error("send_file failed:", e));
+          }
+        }}
+        onCancel={() => setAnnotatingPath(null)}
+      />,
+      document.body
+    )}
+    </>
   );
 }

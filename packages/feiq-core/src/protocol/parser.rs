@@ -404,7 +404,7 @@ impl RecvProtocol for RecvGetFileData {
     }
 
     fn read(&self, post: &mut Post, _chain: &ProtocolChain) -> bool {
-        if !is_cmd_set(post.cmd_id, IPMSG_GETFILEDATA) {
+        if !is_cmd_set(post.cmd_id, IPMSG_GETFILEDATA) && !is_cmd_set(post.cmd_id, IPMSG_GETDIRFILES) {
             return false;
         }
 
@@ -522,6 +522,23 @@ mod tests {
         assert_eq!(gfd.packet_no, 12345);
         assert_eq!(gfd.file_id, 67890);
         assert_eq!(gfd.offset, 0);
+    }
+
+    #[test]
+    fn test_chain_get_dir_files() {
+        let chain = build_default_chain();
+        let mut post = Post::new("10.0.0.1");
+        post.cmd_id = IPMSG_GETDIRFILES;
+        // Format: packetNo:fileId:offset:
+        post.extra = b"100:0:1:\0".to_vec();
+
+        chain.process(&mut post);
+
+        assert!(post.get_file_data.is_some());
+        let gfd = post.get_file_data.as_ref().unwrap();
+        assert_eq!(gfd.packet_no, 100);
+        assert_eq!(gfd.file_id, 0);
+        assert_eq!(gfd.offset, 1);
     }
 
     #[test]

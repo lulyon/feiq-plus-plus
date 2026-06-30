@@ -14,6 +14,8 @@ interface AppConfig {
   relay_server_url: string;
   relay_room: string;
   theme: string;
+  shared_dir: string;
+  shared_dir_password: string;
 }
 
 interface Props {
@@ -44,6 +46,8 @@ export function SettingsDialog({ onClose }: Props) {
           relay_server_url: "",
           relay_room: "default",
           theme: "auto",
+          shared_dir: "",
+          shared_dir_password: "",
         })
       );
   }, []);
@@ -221,6 +225,34 @@ export function SettingsDialog({ onClose }: Props) {
                 <option value="light">Light</option>
                 <option value="dark">Dark</option>
               </select>
+            </label>
+          </div>
+
+          {/* File Sharing */}
+          <div className="border-t border-border pt-3">
+            <span className="text-sm font-medium text-text-muted block mb-2">File Sharing</span>
+            <label className="block mt-2">
+              <span className="text-sm text-text-muted">Shared Directory</span>
+              <input
+                type="text"
+                value={config.shared_dir}
+                onChange={(e) => update("shared_dir", e.target.value)}
+                className="mt-1 w-full text-sm px-2 py-1.5 border border-border rounded-md focus:outline-none focus:border-primary"
+                placeholder="e.g. /path/to/shared/files"
+              />
+              <span className="text-xs text-text-muted">
+                Peers can browse and download files from this directory
+              </span>
+            </label>
+            <label className="block mt-2">
+              <span className="text-sm text-text-muted">Directory Password (optional)</span>
+              <input
+                type="password"
+                value={config.shared_dir_password}
+                onChange={(e) => update("shared_dir_password", e.target.value)}
+                className="mt-1 w-full text-sm px-2 py-1.5 border border-border rounded-md focus:outline-none focus:border-primary"
+                placeholder="Leave empty for no password"
+              />
             </label>
           </div>
 

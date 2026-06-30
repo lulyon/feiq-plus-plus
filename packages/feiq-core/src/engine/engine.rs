@@ -259,7 +259,47 @@ impl Engine {
                     _ => {}
                 }
 
-                let reply = handle_network_event(
+	                // ─── File share: handle GETDIRFILES (directory listing) ──
+	                let is_get_dir_files = match &event {
+	                    NetworkEvent::GetFileData { offset, file_id, .. } => {
+	                        *offset > 0 && *file_id == 0 && !config.shared_dir.is_empty()
+	                    }
+	                    _ => false,
+	                };
+
+	                if is_get_dir_files {
+	                    if let NetworkEvent::GetFileData {
+	                        packet_no,
+	                        offset: _,
+	                        file_id: _,
+	                        ref from,
+	                    } = &event
+	                    {
+	                        let files =
+	                            crate::network::tcp::list_directory(&config.shared_dir, &config.shared_dir);
+	                        if !files.is_empty() {
+	                            let files: Vec<FileContent> = files
+	                                .into_iter()
+	                                .enumerate()
+	                                .map(|(i, mut f)| {
+	                                    f.file_id = (i + 1) as u64;
+	                                    f
+	                                })
+	                                .collect();
+	                            let data = build_directory_listing(
+	                                *packet_no,
+	                                &self_name,
+	                                &self_host,
+	                                &self_version,
+	                                &files,
+	                            );
+	                            let _ = network_for_dispatch.send_to(&from.ip, from.port, &data).await;
+	                        }
+	                    }
+	                    continue;
+	                }
+
+	                let reply = handle_network_event(
                     event,
                     &event_tx,
                     &contacts,
@@ -933,6 +973,35 @@ impl Engine {
     }
 }
 
+// ─── File Sharing (Phase 5.3) ─────────────────────────────────
+impl Engine {
+    /// Handle a GETDIRFILES request from a peer for directory listing.
+    /// Returns `Some(Vec<FileContent>)` with the directory listing,
+    /// or `None` if no shared directory is configured.
+    pub fn handle_file_share_request(&self, request: &GetFileData) -> Option<Vec<FileContent>> {
+        if request.offset > 0 && request.file_id == 0 {
+            let config = &self.config;
+            if config.shared_dir.is_empty() {
+                tracing::debug!("File share request ignored: no shared directory configured");
+                return None;
+            }
+            let dir_path = &config.shared_dir;
+            let mut files = crate::network::tcp::list_directory(dir_path, dir_path);
+            if files.is_empty() {
+                tracing::debug!("File share request: shared directory is empty");
+                return None;
+            }
+            // Assign file IDs sequentially starting at 1 (0 means root)
+            for (i, f) in files.iter_mut().enumerate() {
+                f.file_id = (i + 1) as u64;
+            }
+            Some(files)
+        } else {
+            None
+        }
+    }
+}
+
 // ─── Network event handler (runs in tokio task) ──────────────
 
 /// Check whether an IP is blacklisted (silently returns false if DB unavailable)
@@ -1315,6 +1384,41 @@ pub fn build_file_message(
     )
     .unwrap();
     body.push(FILELIST_SEPARATOR);
+
+    pack_message(
+        packet_no,
+        name,
+        host,
+        version,
+        IPMSG_SENDMSG | IPMSG_FILEATTACHOPT,
+        &body,
+    )
+}
+
+/// Build a directory listing response (multiple file entries) for IPMSG_GETDIRFILES.
+/// Format (per file): id:filename:size:modifyTime:fileType:\x07
+pub fn build_directory_listing(
+    packet_no: u64,
+    name: &str,
+    host: &str,
+    version: &str,
+    files: &[FileContent],
+) -> Vec<u8> {
+    let mut body = vec![MSG_NULL]; // starts with null byte (no text)
+
+    for content in files {
+        let filename_gbk = encode_gbk(&content.filename.replace(':', "::"));
+
+        write!(&mut body, "{}:", content.file_id).unwrap();
+        body.extend_from_slice(&filename_gbk);
+        write!(
+            &mut body,
+            ":{:X}:{:X}:{:X}:",
+            content.size, content.modify_time, content.file_type
+        )
+        .unwrap();
+        body.push(FILELIST_SEPARATOR);
+    }
 
     pack_message(
         packet_no,
