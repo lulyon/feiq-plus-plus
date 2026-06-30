@@ -477,10 +477,9 @@ impl Engine {
         fellow
     }
 
-    /// Send text message. Routes via relay if peer is from relay, else UDP.
-    /// Automatically encrypts if crypto session exists for the peer.
-    /// Automatically saves to chat history and enqueues offline messages.
-    pub async fn send_text_to(&self, ip: &str, port: u16, text: &str) -> anyhow::Result<()> {
+    /// Internal: send text without saving to individual chat history.
+    /// Used by `send_text_to_group` to avoid double-saving (N+1 copies).
+    async fn send_text_raw(&self, ip: &str, port: u16, text: &str) -> anyhow::Result<()> {
         let text_gbk = encode_gbk(text);
 
         // Try to encrypt if crypto session exists for this peer
@@ -537,22 +536,6 @@ impl Engine {
             tracing::warn!("Engine::send_text_to called but no transport available");
         }
 
-        // ─── Save to chat history ─────────────────────────
-        if let Some(ref history) = self.history {
-            let contact_name = self
-                .contacts.lock().unwrap()
-                .find_by_ip(ip)
-                .map(|f| f.display_name().to_string())
-                .unwrap_or_else(|| ip.to_string());
-            let contents = vec![Content::Text {
-                text: text.to_string(),
-                format: String::new(),
-            }];
-            if let Err(e) = history.lock().unwrap().save_message(ip, &contact_name, 0, &contents) {
-                tracing::warn!("Failed to save sent message to history: {e}");
-            }
-        }
-
         // ─── Enqueue for offline delivery ─────────────────
         if sent_ok {
             let is_offline = self
@@ -578,6 +561,30 @@ impl Engine {
         }
 
         Ok(())
+        }
+
+    /// Send text message. Routes via relay if peer is from relay, else UDP.
+    /// Automatically encrypts if crypto session exists for the peer.
+    /// Automatically saves to chat history and enqueues offline messages.
+    pub async fn send_text_to(&self, ip: &str, port: u16, text: &str) -> anyhow::Result<()> {
+        self.send_text_raw(ip, port, text).await?;
+// ─── Save to chat history ─────────────────────────
+        if let Some(ref history) = self.history {
+            let contact_name = self
+                .contacts.lock().unwrap()
+                .find_by_ip(ip)
+                .map(|f| f.display_name().to_string())
+                .unwrap_or_else(|| ip.to_string());
+            let contents = vec![Content::Text {
+                text: text.to_string(),
+                format: String::new(),
+            }];
+            if let Err(e) = history.lock().unwrap().save_message(ip, &contact_name, 0, &contents) {
+                tracing::warn!("Failed to save sent message to history: {e}");
+            }
+        }
+
+                Ok(())
     }
 
     /// Send a sealed (read-and-destroy) text message with IPMSG_SECRETEXOPT.
@@ -1176,6 +1183,7 @@ fn handle_network_event(
                             true
                         }
                     }
+                    Content::Id { .. } => false, // Don't show read receipts as messages
                     _ => true,
                 }
             });
@@ -1217,25 +1225,58 @@ fn handle_network_event(
                     }
                 }
 
-                // ─── Save to chat history BEFORE moving contents ──
-                if let Some(ref history) = history {
-                    if let Err(e) = history.lock().unwrap().save_message(
-                        &post.from.ip,
-                        &from_name,
-                        1, // direction = received
-                        &post.contents,
-                    ) {
-                        tracing::warn!("Failed to save received message to history: {e}");
+                                // ─── Group routing: check for [groupname] prefix in text ──
+                let group_target = {
+                    let mut result: Option<String> = None;
+                    if let Some(ref h) = history {
+                        for content in &post.contents {
+                            if let Content::Text { text, .. } = content {
+                                if let Some(rest) = text.strip_prefix('[') {
+                                    if let Some(end) = rest.find(']') {
+                                        let gname = &rest[..end];
+                                        if let Ok(groups) = h.lock().unwrap_or_else(|e| e.into_inner()).get_groups() {
+                                            if groups.iter().any(|(n, _)| n == gname) {
+                                                result = Some(gname.to_string());
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
+                    result
+                };
+                if let Some(ref gname) = group_target {
+                    let prefix = format!("[{}]", gname);
+                    for content in &mut post.contents {
+                        if let Content::Text { ref mut text, .. } = content {
+                            if let Some(rest) = text.strip_prefix(&prefix) {
+                                *text = rest.trim().to_string();
+                            }
+                        }
+                    }
+                    let group_key = format!("group:{}", gname);
+                    if let Some(ref history) = history {
+                        if let Err(e) = history.lock().unwrap_or_else(|e| e.into_inner()).save_message(
+                            &group_key, &from_name, 1, &post.contents,
+                        ) { tracing::warn!("Failed to save group message to history: {e}"); }
+                    }
+                    let _ = event_tx.send(FrontendEvent::NewMessage {
+                        from_ip: group_key, from_name,
+                        contents: std::mem::take(&mut post.contents), timestamp,
+                    });
+                } else {
+                    if let Some(ref history) = history {
+                        if let Err(e) = history.lock().unwrap_or_else(|e| e.into_inner()).save_message(
+                            &post.from.ip, &from_name, 1, &post.contents,
+                        ) { tracing::warn!("Failed to save received message to history: {e}"); }
+                    }
+                    let _ = event_tx.send(FrontendEvent::NewMessage {
+                        from_ip: post.from.ip.clone(), from_name: from_name.clone(),
+                        contents: std::mem::take(&mut post.contents), timestamp,
+                    });
                 }
-
-                let _ = event_tx.send(FrontendEvent::NewMessage {
-                    from_ip: post.from.ip.clone(),
-                    from_name: from_name.clone(),
-                    contents: std::mem::take(&mut post.contents),
-                    timestamp,
-                });
-
                 // Update contact book
                 let mut book = contacts.lock().unwrap();
                 book.upsert(post.from);
@@ -1510,7 +1551,7 @@ impl Engine {
                 .find_by_ip(ip)
                 .map(|f| f.port)
                 .unwrap_or(2425);
-            if let Err(e) = self.send_text_to(ip, port, &prefixed).await {
+            if let Err(e) = self.send_text_raw(ip, port, &prefixed).await {
                 tracing::warn!("Failed to send to group member {ip}: {e}");
             }
         }

@@ -554,13 +554,12 @@ function GroupChatPanel({ group }: { group: Group }) {
       .then((records) => {
         if (records.length === 0) return;
         const msgs: Message[] = records
-          .filter((r) => r.direction === 0)
           .map((r) => ({
             fromIp: r.contact_ip,
             fromName: r.contact_name,
             contents: parseContentJson(r.content_json),
             timestamp: r.timestamp,
-            direction: "sent" as const,
+            direction: (r.direction === 0 ? "sent" : "received") as const,
           }));
         prependMessages(groupKey, msgs);
       })
