@@ -1,11 +1,19 @@
 //! Forward engine FrontendEvents to the Tauri window as native events
 
+use crate::state::TrayState;
+use crate::tray;
 use feiq_core::engine::events::FrontendEvent;
-use tauri::{AppHandle, Emitter};
+use std::sync::atomic::Ordering;
+use tauri::{AppHandle, Emitter, Manager};
 
-/// Spawn a task that continuously forwards engine events to the Tauri window
+/// Spawn a task that continuously forwards engine events to the Tauri window.
+/// Also tracks unread message count and updates the tray / macOS dock badge.
 pub fn start_event_forwarder(app_handle: AppHandle, state: &crate::state::AppState) {
     let event_rx = state.event_rx.clone();
+    let unread_count = state.unread_count.clone();
+
+    // Clone the tray icon handle so the spawned task can update badge
+    let tray = app_handle.state::<TrayState>().tray.clone();
 
     tauri::async_runtime::spawn(async move {
         loop {
@@ -16,6 +24,10 @@ pub fn start_event_forwarder(app_handle: AppHandle, state: &crate::state::AppSta
                     let _ = app_handle.emit("contact-update", &fellow);
                 }
                 Some(FrontendEvent::NewMessage { from_ip, from_name, contents, timestamp }) => {
+                    // Update unread count and tray badge
+                    let count = unread_count.fetch_add(1, Ordering::Relaxed) + 1;
+                    tray::update_tray_badge(&tray, &app_handle, count);
+
                     let _ = app_handle.emit("new-message", serde_json::json!({
                         "fromIp": from_ip,
                         "fromName": from_name,

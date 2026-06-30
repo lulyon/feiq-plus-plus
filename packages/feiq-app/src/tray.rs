@@ -2,11 +2,12 @@
 
 use tauri::{
     menu::{Menu, MenuItem},
-    tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
+    tray::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent},
     AppHandle, Manager,
 };
 
-pub fn init_tray(app: &AppHandle) -> anyhow::Result<()> {
+/// Create and show the system tray icon, returning the handle
+pub fn init_tray(app: &AppHandle) -> anyhow::Result<TrayIcon> {
     let show = MenuItem::with_id(app, "show", "Show Window", true, None::<&str>)?;
     let hide = MenuItem::with_id(app, "hide", "Hide Window", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
@@ -14,7 +15,8 @@ pub fn init_tray(app: &AppHandle) -> anyhow::Result<()> {
     let menu = Menu::with_items(app, &[&show, &hide, &quit])?;
 
     let app_handle = app.clone();
-    let _tray = TrayIconBuilder::new()
+    let tray = TrayIconBuilder::new()
+        .tooltip("feiq++")
         .menu(&menu)
         .on_menu_event(move |_tray, event| match event.id.as_ref() {
             "quit" => {
@@ -49,5 +51,24 @@ pub fn init_tray(app: &AppHandle) -> anyhow::Result<()> {
         })
         .build(app)?;
 
-    Ok(())
+    Ok(tray)
+}
+
+/// Update the tray tooltip to reflect unread count, and (on macOS) the dock badge
+pub fn update_tray_badge(tray: &TrayIcon, app_handle: &AppHandle, count: u64) {
+    let tooltip = if count > 0 {
+        format!("feiq++ ({} unread)", count)
+    } else {
+        "feiq++".to_string()
+    };
+    let _ = tray.set_tooltip(Some(&tooltip));
+
+    // macOS dock badge via the main window
+    #[cfg(target_os = "macos")]
+    {
+        let badge_count = if count > 0 { Some(count as i64) } else { None };
+        if let Some(window) = app_handle.get_webview_window("main") {
+            let _ = window.set_badge_count(badge_count);
+        }
+    }
 }

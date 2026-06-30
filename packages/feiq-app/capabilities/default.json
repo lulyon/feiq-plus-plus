@@ -10,6 +10,7 @@
     "dialog:default",
     "notification:default",
     "global-shortcut:default",
-    "fs:default"
+    "fs:default",
+    "core:window:allow-set-badge-count"
   ]
 }

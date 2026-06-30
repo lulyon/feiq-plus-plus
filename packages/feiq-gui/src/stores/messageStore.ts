@@ -27,16 +27,22 @@ interface MessageStore {
   messagesByIp: Record<string, Message[]>;
   unreadByIp: Record<string, number>;
   hasHistory: Record<string, boolean>;
+  loadingHistory: Record<string, boolean>;
+  historyOffset: Record<string, number>;
   addMessage: (ip: string, msg: Message) => void;
   prependMessages: (ip: string, msgs: Message[]) => void;
   markRead: (ip: string) => void;
   setHasHistory: (ip: string, has: boolean) => void;
+  setLoadingHistory: (ip: string, loading: boolean) => void;
+  setHistoryOffset: (ip: string, offset: number) => void;
 }
 
 export const useMessageStore = create<MessageStore>((set) => ({
   messagesByIp: {},
   unreadByIp: {},
   hasHistory: {},
+  loadingHistory: {},
+  historyOffset: {},
   addMessage: (ip, msg) =>
     set((state) => {
       const messages = [...(state.messagesByIp[ip] || []), msg];
@@ -71,5 +77,13 @@ export const useMessageStore = create<MessageStore>((set) => ({
   setHasHistory: (ip, has) =>
     set((state) => ({
       hasHistory: { ...state.hasHistory, [ip]: has },
+    })),
+  setLoadingHistory: (ip, loading) =>
+    set((state) => ({
+      loadingHistory: { ...state.loadingHistory, [ip]: loading },
+    })),
+  setHistoryOffset: (ip, offset) =>
+    set((state) => ({
+      historyOffset: { ...state.historyOffset, [ip]: offset },
     })),
 }));

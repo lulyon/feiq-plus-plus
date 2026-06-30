@@ -1,10 +1,10 @@
-import { useEffect, useState, Fragment } from "react";
+import { useEffect, useState, Fragment, useRef, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { useContactStore } from "../stores/contactStore";
 import { useMessageStore, type Message, type Content } from "../stores/messageStore";
 import { MessageBubble } from "./MessageBubble";
 import { InputArea } from "./InputArea";
-import { MessageSquare } from "lucide-react";
+import { MessageSquare, Loader2 } from "lucide-react";
 
 /** Rust MessageRecord shape from get_chat_history */
 interface MessageRecord {
@@ -59,12 +59,23 @@ export function ChatPanel() {
   const prependMessages = useMessageStore((s) => s.prependMessages);
   const hasHistory = useMessageStore((s) => s.hasHistory);
   const setHasHistory = useMessageStore((s) => s.setHasHistory);
+  const loadingHistory = useMessageStore((s) => s.loadingHistory);
+  const setLoadingHistory = useMessageStore((s) => s.setLoadingHistory);
+  const historyOffset = useMessageStore((s) => s.historyOffset);
+  const setHistoryOffset = useMessageStore((s) => s.setHistoryOffset);
 
   const fellow = contacts.find((c) => c.ip === selectedIp);
   const displayName = fellow
     ? fellow.alias || fellow.name || fellow.pc_name || fellow.ip
     : "";
   const messages = selectedIp ? messagesByIp[selectedIp] || [] : [];
+
+  // Track if there are more history pages to load (per contact)
+  const hasMoreRef = useRef<Record<string, boolean>>({});
+  // Ref for the scroll container
+  const scrollRef = useRef<HTMLDivElement>(null);
+
+  const PAGE_SIZE = 100;
 
   // Alias inline editing state
   const [editingAlias, setEditingAlias] = useState(false);
@@ -85,21 +96,26 @@ export function ChatPanel() {
     setEditingAlias(false);
   };
 
-  // Load chat history when switching contacts
-  useEffect(() => {
+  /** Load the next page of older history, prepend to the store */
+  const loadMoreHistory = useCallback(async () => {
     if (!selectedIp) return;
-    if (hasHistory[selectedIp]) return; // already loaded
+    const offset = historyOffset[selectedIp] || 0;
+    setLoadingHistory(selectedIp, true);
 
-    invoke<MessageRecord[]>("get_chat_history", {
-      ip: selectedIp,
-      offset: 0,
-      limit: 100,
-    })
-      .then((records) => {
-        if (records.length === 0) {
-          setHasHistory(selectedIp, true);
-          return;
-        }
+    try {
+      const records = await invoke<MessageRecord[]>("get_chat_history", {
+        ip: selectedIp,
+        offset,
+        limit: PAGE_SIZE,
+      });
+
+      if (records.length < PAGE_SIZE) {
+        hasMoreRef.current[selectedIp] = false;
+      } else {
+        hasMoreRef.current[selectedIp] = true;
+      }
+
+      if (records.length > 0) {
         const msgs: Message[] = records.map((r) => ({
           fromIp: r.contact_ip,
           fromName: r.contact_name,
@@ -108,9 +124,78 @@ export function ChatPanel() {
           direction: r.direction === 0 ? "sent" : "received",
         }));
         prependMessages(selectedIp, msgs);
+        setHistoryOffset(selectedIp, offset + records.length);
+      }
+
+      // Mark history as fully loaded when fewer results than page size
+      if (records.length < PAGE_SIZE) {
         setHasHistory(selectedIp, true);
+      }
+    } catch (e) {
+      console.error("Failed to load more history:", e);
+    } finally {
+      setLoadingHistory(selectedIp, false);
+    }
+  }, [selectedIp, historyOffset, setLoadingHistory, setHistoryOffset, prependMessages, setHasHistory]);
+
+  /** Scroll handler: detect when user scrolls to top for lazy loading */
+  const handleScroll = useCallback(() => {
+    if (!selectedIp) return;
+    const container = scrollRef.current;
+    if (!container) return;
+
+    const isLoading = loadingHistory[selectedIp];
+    const hasMore = hasMoreRef.current[selectedIp];
+
+    if (container.scrollTop === 0 && !isLoading && hasMore) {
+      const prevScrollHeight = container.scrollHeight;
+      loadMoreHistory().then(() => {
+        requestAnimationFrame(() => {
+          if (scrollRef.current) {
+            scrollRef.current.scrollTop = scrollRef.current.scrollHeight - prevScrollHeight;
+          }
+        });
+      });
+    }
+  }, [selectedIp, loadingHistory, loadMoreHistory]);
+
+  // Load chat history when switching contacts (initial page)
+  useEffect(() => {
+    if (!selectedIp) return;
+
+    // Reset pagination state for this contact on first load
+    if (!hasHistory[selectedIp]) {
+      setHistoryOffset(selectedIp, 0);
+      hasMoreRef.current[selectedIp] = true;
+
+      invoke<MessageRecord[]>("get_chat_history", {
+        ip: selectedIp,
+        offset: 0,
+        limit: PAGE_SIZE,
       })
-      .catch((e) => console.error("Failed to load chat history:", e));
+        .then((records) => {
+          if (records.length < PAGE_SIZE) {
+            hasMoreRef.current[selectedIp] = false;
+          }
+          if (records.length === 0) {
+            setHasHistory(selectedIp, true);
+            return;
+          }
+          const msgs: Message[] = records.map((r) => ({
+            fromIp: r.contact_ip,
+            fromName: r.contact_name,
+            contents: parseContentJson(r.content_json),
+            timestamp: r.timestamp,
+            direction: r.direction === 0 ? "sent" : "received",
+          }));
+          prependMessages(selectedIp, msgs);
+          setHistoryOffset(selectedIp, records.length);
+          if (records.length < PAGE_SIZE) {
+            setHasHistory(selectedIp, true);
+          }
+        })
+        .catch((e) => console.error("Failed to load chat history:", e));
+    }
   }, [selectedIp]);
 
   /** Parse JSON content array from Rust (externally-tagged serde enum) into Content[] */
@@ -173,6 +258,8 @@ export function ChatPanel() {
     );
   }
 
+  const isLoading = selectedIp ? loadingHistory[selectedIp] : false;
+
   return (
     <div className="flex-1 flex flex-col bg-surface">
       {/* Chat Header */}
@@ -215,26 +302,42 @@ export function ChatPanel() {
         </div>
       </div>
 
-      {/* Messages */}
-      <div className="flex-1 overflow-y-auto px-4 py-3 space-y-2">
-        {messages.length === 0 ? (
+      {/* Messages with infinite scroll */}
+      <div
+        ref={scrollRef}
+        onScroll={handleScroll}
+        className="flex-1 overflow-y-auto px-4 py-3"
+      >
+        {/* Loading indicator at top */}
+        {isLoading && (
+          <div className="flex items-center justify-center py-2 text-text-muted text-xs">
+            <Loader2 className="w-3 h-3 mr-1 animate-spin" />
+            Loading older messages...
+          </div>
+        )}
+
+        {messages.length === 0 && !isLoading ? (
           <div className="text-center text-text-muted text-sm mt-8">
             No messages yet. Say hello!
           </div>
-        ) : (() => {
-          let lastDate: string | null = null;
-          return messages.map((msg, i) => {
-            const msgDate = getDateLabel(msg.timestamp);
-            const showSeparator = msgDate !== lastDate;
-            lastDate = msgDate;
-            return (
-              <Fragment key={`${msg.timestamp}-${i}`}>
-                {showSeparator && <DateSeparator label={msgDate} />}
-                <MessageBubble message={msg} />
-              </Fragment>
-            );
-          });
-        })()}
+        ) : (
+          <div className="space-y-2">
+            {(() => {
+              let lastDate: string | null = null;
+              return messages.map((msg, i) => {
+                const msgDate = getDateLabel(msg.timestamp);
+                const showSeparator = msgDate !== lastDate;
+                lastDate = msgDate;
+                return (
+                  <Fragment key={`${msg.timestamp}-${i}`}>
+                    {showSeparator && <DateSeparator label={msgDate} />}
+                    <MessageBubble message={msg} />
+                  </Fragment>
+                );
+              });
+            })()}
+          </div>
+        )}
       </div>
 
       {/* Input Area */}

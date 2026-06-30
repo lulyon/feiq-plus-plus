@@ -496,6 +496,23 @@ impl Engine {
         Ok(())
     }
 
+    /// Create a new group with given name and member IPs, persisted to DB.
+    /// Replaces any existing group with the same name.
+    pub fn create_group(&self, name: &str, member_ips: &[String]) -> anyhow::Result<()> {
+        match self.history {
+            Some(ref history) => history.lock().unwrap().save_group(name, member_ips),
+            None => anyhow::bail!("History database not available"),
+        }
+    }
+
+    /// Get all groups from DB: Vec of (group_name, member_ips)
+    pub fn get_groups(&self) -> anyhow::Result<Vec<(String, Vec<String>)>> {
+        match self.history {
+            Some(ref history) => history.lock().unwrap().get_groups(),
+            None => Ok(Vec::new()),
+        }
+    }
+
     /// Load all contact meta from DB (alias, signature, group_name) and
     /// apply to the in-memory contact book. Does not trigger events —
     /// intended for restoration at startup.
@@ -544,6 +561,42 @@ impl Engine {
         }
     }
 
+    // ─── Blacklist ─────────────────────────────────────────────
+
+    /// Check whether an IP is blacklisted
+    pub fn is_ip_blacklisted(&self, ip: &str) -> bool {
+        match self.history {
+            Some(ref history) => history.lock().unwrap().is_blacklisted(ip).unwrap_or(false),
+            None => false,
+        }
+    }
+
+    /// Add an IP to the blacklist
+    pub fn add_to_blacklist(&self, ip: &str) {
+        if let Some(ref history) = self.history {
+            if let Err(e) = history.lock().unwrap().add_to_blacklist(ip) {
+                tracing::warn!("Failed to add {ip} to blacklist: {e}");
+            }
+        }
+    }
+
+    /// Remove an IP from the blacklist
+    pub fn remove_from_blacklist(&self, ip: &str) {
+        if let Some(ref history) = self.history {
+            if let Err(e) = history.lock().unwrap().remove_from_blacklist(ip) {
+                tracing::warn!("Failed to remove {ip} from blacklist: {e}");
+            }
+        }
+    }
+
+    /// Get all blacklisted IPs
+    pub fn get_blacklist(&self) -> Vec<String> {
+        match self.history {
+            Some(ref history) => history.lock().unwrap().get_blacklist().unwrap_or_default(),
+            None => Vec::new(),
+        }
+    }
+
     /// Generate next packet ID
     fn packet_id(&self) -> u64 {
         // Simple: use timestamp millis as ID
@@ -556,6 +609,14 @@ impl Engine {
 
 // ─── Network event handler (runs in tokio task) ──────────────
 
+/// Check whether an IP is blacklisted (silently returns false if DB unavailable)
+fn is_ip_blacklisted(ip: &str, history: &Option<Arc<std::sync::Mutex<HistoryDb>>>) -> bool {
+    match history {
+        Some(ref h) => h.lock().unwrap().is_blacklisted(ip).unwrap_or(false),
+        None => false,
+    }
+}
+
 fn handle_network_event(
     event: NetworkEvent,
     event_tx: &mpsc::UnboundedSender<FrontendEvent>,
@@ -563,6 +624,21 @@ fn handle_network_event(
     _config: &AppConfig,
     history: &Option<Arc<std::sync::Mutex<HistoryDb>>>,
 ) -> Option<(String, u16)> {
+    // ─── Blacklist check — drop events from blacklisted IPs ──
+    let event_ip = match &event {
+        NetworkEvent::FellowOnline(post)
+        | NetworkEvent::FellowAnsEntry(post)
+        | NetworkEvent::FellowOffline(post)
+        | NetworkEvent::Message(post) => Some(&post.from.ip),
+        NetworkEvent::Error(_) => None,
+    };
+    if let Some(ip) = event_ip {
+        if is_ip_blacklisted(ip, history) {
+            tracing::debug!("Dropping event from blacklisted IP: {ip}");
+            return None;
+        }
+    }
+
     match event {
         NetworkEvent::FellowOnline(post) => {
             let ip = post.from.ip.clone();

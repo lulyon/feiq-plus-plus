@@ -61,6 +61,19 @@ export default function App() {
     });
   }, []);
 
+  // Reset unread count when window gains focus
+  useEffect(() => {
+    let unlistenFocus: () => void;
+    listen("tauri://focus", () => {
+      invoke("reset_unread_count").catch(() => {});
+    }).then((fn) => {
+      unlistenFocus = fn;
+    });
+    return () => {
+      if (unlistenFocus) unlistenFocus();
+    };
+  }, []);
+
   return (
     <div className="flex h-screen w-screen bg-bg">
       <Sidebar />

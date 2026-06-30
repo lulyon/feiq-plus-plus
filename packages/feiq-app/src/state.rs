@@ -4,7 +4,9 @@ use feiq_core::engine::engine::Engine;
 use feiq_core::engine::events::FrontendEvent;
 use feiq_core::storage::settings::AppConfig;
 use std::path::PathBuf;
+use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
+use tauri::tray::TrayIcon;
 use tokio::sync::{mpsc, Mutex};
 
 /// Application state managed by Tauri
@@ -14,6 +16,13 @@ pub struct AppState {
     pub event_rx: Arc<Mutex<mpsc::UnboundedReceiver<FrontendEvent>>>,
     pub event_tx: mpsc::UnboundedSender<FrontendEvent>,
     pub running: Arc<Mutex<bool>>,
+    /// Shared unread message counter for tray badge
+    pub unread_count: Arc<AtomicU64>,
+}
+
+/// Managed state holding the system tray icon handle
+pub struct TrayState {
+    pub tray: TrayIcon,
 }
 
 impl AppState {
@@ -27,6 +36,7 @@ impl AppState {
             event_rx: Arc::new(Mutex::new(event_rx)),
             event_tx,
             running: Arc::new(Mutex::new(false)),
+            unread_count: Arc::new(AtomicU64::new(0)),
         }
     }
 }

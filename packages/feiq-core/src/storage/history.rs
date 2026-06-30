@@ -78,6 +78,15 @@ impl HistoryDb {
             [],
         )?;
 
+        // Always ensure blacklist table exists (for existing DBs without it)
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS blacklist (
+                ip TEXT PRIMARY KEY,
+                created_at INTEGER NOT NULL
+            )",
+            [],
+        )?;
+
         Ok(Self { conn })
     }
 
@@ -309,6 +318,49 @@ impl HistoryDb {
         Ok(result)
     }
 
+    // ─── Blacklist ──────────────────────────────────────────────
+
+    /// Check whether an IP is blacklisted
+    pub fn is_blacklisted(&self, ip: &str) -> anyhow::Result<bool> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM blacklist WHERE ip = ?1",
+            params![ip],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
+    /// Add an IP to the blacklist (ignores duplicates)
+    pub fn add_to_blacklist(&self, ip: &str) -> anyhow::Result<()> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO blacklist (ip, created_at) VALUES (?1, ?2)",
+            params![ip, Utc::now().timestamp_millis()],
+        )?;
+        Ok(())
+    }
+
+    /// Remove an IP from the blacklist
+    pub fn remove_from_blacklist(&self, ip: &str) -> anyhow::Result<()> {
+        self.conn.execute(
+            "DELETE FROM blacklist WHERE ip = ?1",
+            params![ip],
+        )?;
+        Ok(())
+    }
+
+    /// Get all blacklisted IPs (ordered by creation time)
+    pub fn get_blacklist(&self) -> anyhow::Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT ip FROM blacklist ORDER BY created_at",
+        )?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        let mut result = Vec::new();
+        for row in rows {
+            result.push(row?);
+        }
+        Ok(result)
+    }
+
     // ─── Export / Import ────────────────────────────────────────
 
     /// Export all messages as a JSON structure
@@ -450,6 +502,38 @@ mod tests {
     }
 
     #[test]
+    fn test_group_rename_no_duplicates() {
+        let path = format!("/tmp/test_feix_grp_ren_{}.sqlite3", std::process::id());
+        let db = HistoryDb::open(Path::new(&path)).unwrap();
+
+        // Initial save
+        db.save_group("Dev Team", &["10.0.0.1".into(), "10.0.0.2".into()])
+            .unwrap();
+
+        // Rename by updating members (same group name, different members)
+        // This should DELETE old entry and INSERT new one
+        db.save_group("Dev Team", &["10.0.0.1".into(), "10.0.0.2".into(), "10.0.0.3".into()])
+            .unwrap();
+
+        let groups = db.get_groups().unwrap();
+        // Should have exactly one entry for "Dev Team"
+        let dev_teams: Vec<_> = groups.iter().filter(|(name, _)| name == "Dev Team").collect();
+        assert_eq!(dev_teams.len(), 1, "Should not have duplicate groups after rename");
+        // Should have 3 members
+        assert_eq!(dev_teams[0].1.len(), 3);
+        assert!(dev_teams[0].1.contains(&"10.0.0.3".to_string()));
+
+        // Save same group again with same data — still only one entry
+        db.save_group("Dev Team", &["10.0.0.1".into(), "10.0.0.2".into(), "10.0.0.3".into()])
+            .unwrap();
+        let groups = db.get_groups().unwrap();
+        let dev_teams: Vec<_> = groups.iter().filter(|(name, _)| name == "Dev Team").collect();
+        assert_eq!(dev_teams.len(), 1, "Re-saving same group should not create duplicates");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
     fn test_contact_meta_crud() {
         let path = format!("/tmp/test_feix_meta_{}.sqlite3", std::process::id());
         let db = HistoryDb::open(Path::new(&path)).unwrap();
@@ -549,6 +633,51 @@ mod tests {
         let count = db.import_messages(&msgs).unwrap();
         assert_eq!(count, 0);
 
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_blacklist_crud() {
+        let path = format!("/tmp/test_feix_bl_{}.sqlite3", std::process::id());
+        let db = HistoryDb::open(Path::new(&path)).unwrap();
+
+        // Initially no IP is blacklisted
+        assert!(!db.is_blacklisted("10.0.0.1").unwrap());
+        assert!(!db.is_blacklisted("10.0.0.2").unwrap());
+
+        // Add to blacklist
+        db.add_to_blacklist("10.0.0.1").unwrap();
+        assert!(db.is_blacklisted("10.0.0.1").unwrap());
+        assert!(!db.is_blacklisted("10.0.0.2").unwrap());
+
+        // Get blacklist returns the single entry
+        let list = db.get_blacklist().unwrap();
+        assert_eq!(list, vec!["10.0.0.1"]);
+
+        // Remove from blacklist
+        db.remove_from_blacklist("10.0.0.1").unwrap();
+        assert!(!db.is_blacklisted("10.0.0.1").unwrap());
+
+        // Add multiple
+        db.add_to_blacklist("10.0.0.1").unwrap();
+        db.add_to_blacklist("10.0.0.2").unwrap();
+        db.add_to_blacklist("10.0.0.3").unwrap();
+        let list = db.get_blacklist().unwrap();
+        assert_eq!(list.len(), 3);
+        // Order should match insertion order
+        assert_eq!(list[0], "10.0.0.1");
+        assert_eq!(list[1], "10.0.0.2");
+        assert_eq!(list[2], "10.0.0.3");
+
+        // Duplicate add is silently ignored
+        db.add_to_blacklist("10.0.0.1").unwrap();
+        let list = db.get_blacklist().unwrap();
+        assert_eq!(list.len(), 3, "Duplicate insert should not add a second entry");
+
+        // Remove non-existent IP does not error
+        db.remove_from_blacklist("999.999.999.999").unwrap();
+
+        // Cleanup
         let _ = std::fs::remove_file(&path);
     }
 }

@@ -158,6 +158,28 @@ pub async fn set_contact_group(
         .map_err(|e| e.to_string())
 }
 
+// ─── Groups ────────────────────────────────────────────────────
+
+#[tauri::command]
+pub async fn create_group(
+    state: State<'_, AppState>,
+    name: String,
+    member_ips: Vec<String>,
+) -> Result<(), String> {
+    let engine = state.engine.lock().await;
+    engine
+        .create_group(&name, &member_ips)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn get_groups(
+    state: State<'_, AppState>,
+) -> Result<Vec<(String, Vec<String>)>, String> {
+    let engine = state.engine.lock().await;
+    engine.get_groups().map_err(|e| e.to_string())
+}
+
 // ─── History Export / Import ──────────────────────────────────
 
 #[tauri::command]
@@ -174,3 +196,38 @@ pub async fn import_history(state: State<'_, AppState>, path: String) -> Result<
     engine.import_history(&json).map_err(|e| e.to_string())
 }
 
+// ─── Blacklist ────────────────────────────────────────────────
+
+#[tauri::command]
+pub async fn add_to_blacklist(state: State<'_, AppState>, ip: String) -> Result<(), String> {
+    let engine = state.engine.lock().await;
+    engine.add_to_blacklist(&ip);
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn remove_from_blacklist(state: State<'_, AppState>, ip: String) -> Result<(), String> {
+    let engine = state.engine.lock().await;
+    engine.remove_from_blacklist(&ip);
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn get_blacklist(state: State<'_, AppState>) -> Result<Vec<String>, String> {
+    let engine = state.engine.lock().await;
+    Ok(engine.get_blacklist())
+}
+
+// ─── Unread Badge ─────────────────────────────────────────────
+
+#[tauri::command]
+pub async fn reset_unread_count(
+    state: State<'_, AppState>,
+    tray_state: State<'_, crate::state::TrayState>,
+    app_handle: tauri::AppHandle,
+) -> Result<(), String> {
+    use std::sync::atomic::Ordering;
+    state.unread_count.store(0, Ordering::Relaxed);
+    crate::tray::update_tray_badge(&tray_state.tray, &app_handle, 0);
+    Ok(())
+}

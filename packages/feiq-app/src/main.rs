@@ -57,7 +57,12 @@ fn main() {
         .manage(app_state)
         .setup(|app| {
             let handle = app.handle().clone();
-            let _ = tray::init_tray(&handle);
+
+            // Init tray and store in managed state
+            let tray_icon = tray::init_tray(&handle).map_err(|e| {
+                Box::new(std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
+            })?;
+            handle.manage(state::TrayState { tray: tray_icon.clone() });
 
             // Start event forwarding
             let state = handle.state::<AppState>();
@@ -79,8 +84,14 @@ fn main() {
             commands::send_text,
             commands::set_alias,
             commands::set_contact_group,
+            commands::create_group,
+            commands::get_groups,
             commands::export_history,
             commands::import_history,
+            commands::add_to_blacklist,
+            commands::remove_from_blacklist,
+            commands::get_blacklist,
+            commands::reset_unread_count,
         ])
         .run(tauri::generate_context!())
         .expect("error while running feiq++");
