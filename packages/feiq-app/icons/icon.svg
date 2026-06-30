@@ -1,0 +1,98 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" fill="none" viewBox="0 0 1024 1024">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#1A1530"/>
+      <stop offset="50%" stop-color="#100C20"/>
+      <stop offset="100%" stop-color="#0A0818"/>
+    </linearGradient>
+
+    <!-- Shared gradient: all shapes use the same userSpaceOnUse gradient -->
+    <linearGradient id="dove" x1="100" y1="200" x2="750" y2="700" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#A78BFA"/>
+      <stop offset="22%" stop-color="#8B5CF6"/>
+      <stop offset="50%" stop-color="#4F6BF6"/>
+      <stop offset="80%" stop-color="#0EA5E9"/>
+      <stop offset="100%" stop-color="#06B6D4"/>
+    </linearGradient>
+
+    <linearGradient id="doveDeep" x1="100" y1="500" x2="750" y2="720" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#7C3AED"/>
+      <stop offset="50%" stop-color="#4361EE"/>
+      <stop offset="100%" stop-color="#0891B2"/>
+    </linearGradient>
+
+    <radialGradient id="glow" cx="490" cy="490" r="320" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#8B5CF6" stop-opacity="0.08"/>
+      <stop offset="60%" stop-color="#4F6BF6" stop-opacity="0.03"/>
+      <stop offset="100%" stop-color="#8B5CF6" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+
+  <!-- Background rounded rectangle -->
+  <rect width="1024" height="1024" rx="225" fill="url(#bg)"/>
+
+  <!-- Ambient glow -->
+  <circle cx="500" cy="500" r="320" fill="url(#glow)"/>
+
+  <!-- === DOVE === -->
+  <g transform="translate(80, 115)">
+    <!-- Tail fan -->
+    <polygon points="340,390 140,330 100,430 170,510"
+             fill="url(#dove)"/>
+
+    <!-- Lower wing (depth layer) -->
+    <polygon points="520,475 300,610 330,600 430,485"
+             fill="url(#doveDeep)"/>
+
+    <!-- Body: tilted ellipse -->
+    <ellipse cx="485" cy="425" rx="140" ry="62"
+             transform="rotate(-12 485 425)"
+             fill="url(#dove)"/>
+
+    <!-- Upper wing: bold geometric sweep -->
+    <polygon points="510,385 230,180 260,200 400,395"
+             fill="url(#dove)"/>
+
+    <!-- Upper wing fold accent -->
+    <polygon points="510,385 230,180 320,310"
+             fill="#DDD6FE" opacity="0.1"/>
+
+    <!-- Head -->
+    <circle cx="635" cy="380" r="36" fill="url(#dove)"/>
+
+    <!-- Beak -->
+    <polygon points="666,366 748,340 662,394"
+             fill="url(#dove)"/>
+
+    <!-- Neck blend -->
+    <ellipse cx="600" cy="393" rx="32" ry="24"
+             transform="rotate(-25 600 393)"
+             fill="url(#dove)"/>
+
+    <!-- Wing crease -->
+    <line x1="310" y1="295" x2="255" y2="235"
+          stroke="#0A0818" stroke-width="4" stroke-linecap="round" opacity="0.2"/>
+
+    <!-- Tail feather lines -->
+    <line x1="195" y1="385" x2="140" y2="425"
+          stroke="#0A0818" stroke-width="3" stroke-linecap="round" opacity="0.18"/>
+    <line x1="205" y1="450" x2="150" y2="440"
+          stroke="#0A0818" stroke-width="3" stroke-linecap="round" opacity="0.16"/>
+
+    <!-- Eye -->
+    <circle cx="650" cy="373" r="9" fill="#0A0818" opacity="0.65"/>
+    <circle cx="647" cy="371" r="3.5" fill="#EDE6FF" opacity="0.4"/>
+  </g>
+
+  <!-- === ++ MARKS === -->
+  <g transform="translate(600, 650)" opacity="0.3">
+    <path d="M-2.5,-8 L2.5,-8 L2.5,-2.5 L8,-2.5 L8,2.5 L2.5,2.5
+             L2.5,8 L-2.5,8 L-2.5,2.5 L-8,2.5 L-8,-2.5 L-2.5,-2.5 Z"
+          fill="#EDE6FF"/>
+  </g>
+  <g transform="translate(668, 675)" opacity="0.18">
+    <path d="M-2,-6 L2,-6 L2,-2 L6,-2 L6,2 L2,2
+             L2,6 L-2,6 L-2,2 L-6,2 L-6,-2 L-2,-2 Z"
+          fill="#EDE6FF"/>
+  </g>
+</svg>
