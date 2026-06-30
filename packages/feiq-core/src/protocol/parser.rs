@@ -70,6 +70,24 @@ impl RecvProtocol for DebugHandler {
     }
 }
 
+/// Extract feiq++ public key from extra data and strip it.
+/// Format: [GBK name bytes] [NUL] [32-byte pub key]
+fn extract_peer_public_key(post: &mut Post) {
+    if !post.from.version.starts_with("feiq_plus_plus") {
+        return;
+    }
+    if post.extra.len() < 33 {
+        return;
+    }
+    if let Some(nul_pos) = post.extra.iter().position(|&b| b == 0) {
+        if post.extra.len() >= nul_pos + 1 + 32 {
+            let key_start = nul_pos + 1;
+            post.from.public_key = post.extra[key_start..key_start + 32].to_vec();
+            post.extra.truncate(nul_pos); // Remove NUL and pub key, keep name only
+        }
+    }
+}
+
 // ─── RecvAnsEntry: handles IPMSG_ANSENTRY ────────────────────
 
 pub struct RecvAnsEntry;
@@ -81,6 +99,9 @@ impl RecvProtocol for RecvAnsEntry {
 
     fn read(&self, post: &mut Post, _chain: &ProtocolChain) -> bool {
         if is_cmd_set(post.cmd_id, IPMSG_ANSENTRY) {
+            // Extract public key if feiq++ peer
+            extract_peer_public_key(post);
+
             let name = decode_gbk(&post.extra);
             if !name.is_empty() {
                 post.from.name = name;
@@ -102,6 +123,9 @@ impl RecvProtocol for RecvBrEntry {
 
     fn read(&self, post: &mut Post, _chain: &ProtocolChain) -> bool {
         if is_cmd_set(post.cmd_id, IPMSG_BR_ENTRY) {
+            // Extract public key if feiq++ peer
+            extract_peer_public_key(post);
+
             let name = decode_gbk(&post.extra);
             if !name.is_empty() {
                 post.from.name = name;
@@ -172,7 +196,25 @@ impl RecvProtocol for RecvReadCheck {
         "RecvReadCheck"
     }
 
-    fn read(&self, _post: &mut Post, _chain: &ProtocolChain) -> bool {
+    fn read(&self, post: &mut Post, _chain: &ProtocolChain) -> bool {
+        if is_cmd_set(post.cmd_id, IPMSG_SENDMSG) && is_opt_set(post.cmd_id, IPMSG_SECRETEXOPT) {
+            // Sealed message (read-and-destroy): parse text as sealed content
+            let null_pos = post.extra.iter().position(|&b| b == 0);
+            let text_bytes = match null_pos {
+                Some(0) => return false, // starts with null = no text
+                Some(pos) => &post.extra[..pos],
+                None => &post.extra[..],
+            };
+            if !text_bytes.is_empty() {
+                let raw_text = decode_gbk(text_bytes);
+                post.contents.push(Content::Sealed {
+                    text: raw_text,
+                    format: String::new(),
+                    ttl_seconds: 60,
+                });
+            }
+            return true; // sealed content handled, stop chain
+        }
         false
     }
 }
@@ -523,5 +565,69 @@ mod tests {
 
         assert_eq!(post.contents.len(), 1);
         assert!(post.contents[0].is_knock());
+    }
+
+    #[test]
+    fn test_br_entry_with_pubkey() {
+        let chain = build_default_chain();
+        let mut post = Post::new("10.0.0.1");
+        post.cmd_id = IPMSG_BR_ENTRY;
+        post.from.version = "feiq_plus_plus#128#MAC#0#0#0#1#9".into();
+        let gbk_name = b"\x41\x6c\x69\x63\x65".to_vec();
+        let mut extra = gbk_name.clone();
+        extra.push(0x00);
+        extra.extend_from_slice(&[1u8; 32]);
+        post.extra = extra;
+        chain.process(&mut post);
+        assert_eq!(post.from.name, "Alice");
+        assert_eq!(post.from.public_key.len(), 32);
+        assert_eq!(post.from.public_key, vec![1u8; 32]);
+    }
+
+    #[test]
+    fn test_ans_entry_with_pubkey() {
+        let chain = build_default_chain();
+        let mut post = Post::new("10.0.0.2");
+        post.cmd_id = IPMSG_ANSENTRY;
+        post.from.version = "feiq_plus_plus#128#MAC#0#0#0#1#9".into();
+        let gbk_name = b"\x44\x61\x76\x65".to_vec();
+        let mut extra = gbk_name.clone();
+        extra.push(0x00);
+        extra.extend_from_slice(&[3u8; 32]);
+        post.extra = extra;
+        chain.process(&mut post);
+        assert_eq!(post.from.name, "Dave");
+        assert_eq!(post.from.public_key.len(), 32);
+        assert_eq!(post.from.public_key[0], 3);
+    }
+
+    #[test]
+    fn test_sealed_message() {
+        let chain = build_default_chain();
+        let mut post = Post::new("10.0.0.1");
+        post.cmd_id = IPMSG_SENDMSG | IPMSG_READCHECKOPT | IPMSG_SECRETOPT | IPMSG_SENDCHECKOPT;
+        let gbk_text = b"\x62\x75\x72\x6e\x20\x61\x66\x74\x65\x72\x20\x72\x65\x61\x64\x69\x6e\x67".to_vec();
+        post.extra = gbk_text;
+        chain.process(&mut post);
+        assert_eq!(post.contents.len(), 1);
+        match &post.contents[0] {
+            Content::Sealed { text, .. } => assert_eq!(text, "burn after reading"),
+            other => panic!("Expected Sealed content, got: {:?}", other.content_type()),
+        }
+    }
+
+    #[test]
+    fn test_normal_message_with_readcheck_not_sealed() {
+        let chain = build_default_chain();
+        let mut post = Post::new("10.0.0.1");
+        post.cmd_id = IPMSG_SENDMSG | IPMSG_READCHECKOPT | IPMSG_SENDCHECKOPT;
+        let gbk_text = b"\x48\x65\x6c\x6c\x6f".to_vec();
+        post.extra = gbk_text;
+        chain.process(&mut post);
+        assert_eq!(post.contents.len(), 1);
+        match &post.contents[0] {
+            Content::Text { text, .. } => assert_eq!(text, "Hello"),
+            other => panic!("Expected Text content, got: {:?}", other.content_type()),
+        }
     }
 }

@@ -1,7 +1,8 @@
 //! Tauri IPC commands — called from frontend to interact with the engine
 
 use crate::state::AppState;
-use feiq_core::protocol::types::Fellow;
+use feiq_core::engine::events::FrontendEvent;
+use feiq_core::protocol::types::{FileTaskState, FileTaskType, Fellow};
 use feiq_core::storage::history::MessageRecord;
 use feiq_core::storage::settings::AppConfig;
 use std::path::PathBuf;
@@ -274,6 +275,136 @@ pub async fn capture_screenshot() -> Result<String, String> {
     let result: anyhow::Result<String> = Ok("FALLBACK".to_string());
 
     result.map_err(|e| e.to_string())
+}
+
+// ─── File Transfer ────────────────────────────────────────────
+
+#[tauri::command]
+pub async fn download_file(
+    state: State<'_, AppState>,
+    task_id: u64,
+    save_path: String,
+) -> Result<(), String> {
+    // Phase 1: gather task info while holding engine lock
+    let (task, task_info, event_tx, network) = {
+        let engine = state.engine.lock().await;
+
+        let task = engine.get_file_task(task_id).ok_or("Task not found")?;
+        let snap = task.snapshot();
+
+        if snap.task_type != FileTaskType::Download {
+            return Err("Not a download task".into());
+        }
+
+        task.set_running();
+        let _ = engine.event_tx().send(FrontendEvent::FileStateChanged {
+            task_id,
+            state: FileTaskState::Running,
+            message: format!("Downloading: {}", snap.content.filename),
+        });
+
+        let task_info = (
+            snap.fellow_ip.clone(),
+            snap.content.packet_no,
+            snap.content.file_id,
+            snap.content.size,
+            snap.content.filename.clone(),
+        );
+        let event_tx = engine.event_tx().clone();
+        let network = engine
+            .network()
+            .ok_or("Network not available")?
+            .clone();
+
+        (task, task_info, event_tx, network)
+    };
+
+    let (peer_ip, packet_no, file_id, total, filename) = task_info;
+    let peer_port = 2425;
+
+    // Phase 2: TCP transfer (engine lock released)
+    let mut ft = network
+        .connect_for_file(&peer_ip, peer_port)
+        .await
+        .map_err(|e| {
+            task.set_error(e.to_string());
+            let _ = event_tx.send(FrontendEvent::FileStateChanged {
+                task_id,
+                state: FileTaskState::Error(e.to_string()),
+                message: format!("Connection failed: {}", e),
+            });
+            e.to_string()
+        })?;
+
+    // Send GETFILEDATA request over TCP
+    let request = format!("{}:{}:0:", packet_no, file_id);
+    ft.send(request.as_bytes()).await.map_err(|e| {
+        task.set_error(e.to_string());
+        let _ = event_tx.send(FrontendEvent::FileStateChanged {
+            task_id,
+            state: FileTaskState::Error(e.to_string()),
+            message: format!("Send GETFILEDATA failed: {}", e),
+        });
+        e.to_string()
+    })?;
+
+    // Receive file with progress callbacks
+    let recv_result = {
+        let task_clone = task.clone();
+        let tx_clone = event_tx.clone();
+        ft.recv_file(&save_path, total, move |progress, total_size| {
+            let should_notify = task_clone.update_progress(progress);
+            if should_notify {
+                let _ = tx_clone.send(FrontendEvent::FileProgress {
+                    task_id,
+                    progress,
+                    total: total_size,
+                });
+            }
+        })
+        .await
+    };
+
+    match recv_result {
+        Ok(_) => {
+            task.set_finish();
+            let _ = event_tx.send(FrontendEvent::FileStateChanged {
+                task_id,
+                state: FileTaskState::Finish,
+                message: format!("Downloaded: {}", filename),
+            });
+            Ok(())
+        }
+        Err(e) => {
+            task.set_error(e.to_string());
+            let _ = event_tx.send(FrontendEvent::FileStateChanged {
+                task_id,
+                state: FileTaskState::Error(e.to_string()),
+                message: format!("Download failed: {}", e),
+            });
+            Err(e.to_string())
+        }
+    }
+}
+
+#[tauri::command]
+pub async fn cancel_file_task(state: State<'_, AppState>, task_id: u64) -> Result<(), String> {
+    let engine = state.engine.lock().await;
+    engine.cancel_file_task(task_id);
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn send_file(
+    state: State<'_, AppState>,
+    ip: String,
+    file_path: String,
+) -> Result<u64, String> {
+    let engine = state.engine.lock().await;
+    engine
+        .send_file_to(&ip, &file_path)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 // ─── Unread Badge ─────────────────────────────────────────────

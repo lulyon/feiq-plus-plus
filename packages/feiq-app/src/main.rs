@@ -95,6 +95,9 @@ fn main() {
             commands::remove_from_blacklist,
             commands::get_blacklist,
             commands::reset_unread_count,
+            commands::download_file,
+            commands::cancel_file_task,
+            commands::send_file,
         ])
         .run(tauri::generate_context!())
         .expect("error while running feiq++");

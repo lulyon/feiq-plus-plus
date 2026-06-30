@@ -9,6 +9,8 @@ export interface Content {
   format?: string;
   filename?: string;
   size?: number;
+  /** Local task ID assigned by engine for file transfers */
+  localTaskId?: number;
   knock?: unknown;
   file?: Record<string, unknown>;
   image?: Record<string, unknown>;

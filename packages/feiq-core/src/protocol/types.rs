@@ -49,6 +49,9 @@ pub struct Fellow {
     /// Transport source — LAN or Relay
     #[serde(default)]
     pub source: PeerSource,
+    /// Peer's x25519 public key (32 bytes) for ECDH key exchange (feiq++ only)
+    #[serde(default)]
+    pub public_key: Vec<u8>,
 }
 
 fn default_fellow_port() -> u16 { 2425 }
@@ -69,6 +72,7 @@ impl Fellow {
             signature: String::new(),
             port: 2425,
             source: PeerSource::default(),
+            public_key: Vec::new(),
         }
     }
 
@@ -166,6 +170,14 @@ pub enum Content {
         /// Reference packet ID (for read receipts)
         id: u64,
     },
+    #[serde(rename = "sealed")]
+    Sealed {
+        text: String,
+        #[serde(default)]
+        format: String,
+        #[serde(default)]
+        ttl_seconds: u32,
+    },
 }
 
 impl Content {
@@ -176,6 +188,7 @@ impl Content {
             Content::File(_) => "file",
             Content::Image { .. } => "image",
             Content::Id { .. } => "id",
+            Content::Sealed { .. } => "sealed",
         }
     }
 
@@ -332,5 +345,52 @@ mod tests {
     fn test_post_get_file_data_default() {
         let post = Post::new("192.168.1.1");
         assert!(post.get_file_data.is_none());
+    }
+
+    #[test]
+    fn test_content_sealed_roundtrip() {
+        let sealed = Content::Sealed {
+            text: "burn after reading".into(),
+            format: String::new(),
+            ttl_seconds: 60,
+        };
+        let json = serde_json::to_string(&sealed).unwrap();
+        let deserialized: Content = serde_json::from_str(&json).unwrap();
+        match deserialized {
+            Content::Sealed { text, ttl_seconds, .. } => {
+                assert_eq!(text, "burn after reading");
+                assert_eq!(ttl_seconds, 60);
+            }
+            _ => panic!("Expected Sealed content"),
+        }
+    }
+
+    #[test]
+    fn test_content_sealed_default_ttl() {
+        let json = r#"{"type": "sealed", "text": "self-destruct"}"#;
+        let deserialized: Content = serde_json::from_str(json).unwrap();
+        match deserialized {
+            Content::Sealed { text, ttl_seconds, .. } => {
+                assert_eq!(text, "self-destruct");
+                assert_eq!(ttl_seconds, 0);
+            }
+            _ => panic!("Expected Sealed content"),
+        }
+    }
+
+    #[test]
+    fn test_fellow_public_key_default() {
+        let json = r#"{"ip": "10.0.0.1", "name": "Alice"}"#;
+        let fellow: Fellow = serde_json::from_str(json).unwrap();
+        assert!(fellow.public_key.is_empty());
+    }
+
+    #[test]
+    fn test_fellow_public_key_deserialize() {
+        let json = r#"{"ip": "10.0.0.1", "name": "Alice", "public_key": [1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32]}"#;
+        let fellow: Fellow = serde_json::from_str(json).unwrap();
+        assert_eq!(fellow.public_key.len(), 32);
+        assert_eq!(fellow.public_key[0], 1);
+        assert_eq!(fellow.public_key[31], 32);
     }
 }

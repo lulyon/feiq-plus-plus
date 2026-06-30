@@ -1,4 +1,6 @@
 import type { Message } from "../stores/messageStore";
+import { invoke } from "@tauri-apps/api/core";
+import { save } from "@tauri-apps/plugin-dialog";
 
 /// Emoji codes mapping (same as Rust emoji.rs)
 const EMOJI_CODES: string[] = [
@@ -38,6 +40,7 @@ interface NormalizedContent {
   format?: string;
   filename?: string;
   size?: number;
+  localTaskId?: number;
 }
 
 /** Normalize Content from either externally-tagged (Rust serde) or internally-tagged (frontend) format */
@@ -54,6 +57,7 @@ function normalizeContent(raw: Record<string, unknown>): NormalizedContent {
       type: "file",
       filename: String(inner.filename || ""),
       size: Number(inner.size || 0),
+      localTaskId: inner.local_task_id !== undefined ? Number(inner.local_task_id) : undefined,
     };
   }
   if (raw.image !== undefined) return { type: "image" };
@@ -64,6 +68,27 @@ function normalizeContent(raw: Record<string, unknown>): NormalizedContent {
     filename: String(raw.filename || ""),
     size: Number(raw.size || 0),
   };
+}
+
+/** Handle click on a received file bubble: open save dialog and download */
+async function handleFileClick(content: NormalizedContent) {
+  if (!content.localTaskId) {
+    console.warn("File click: no localTaskId, cannot download");
+    return;
+  }
+  try {
+    const savePath = await save({
+      defaultPath: content.filename || "download",
+      filters: [{ name: "All Files", extensions: ["*"] }],
+    });
+    if (!savePath) return; // User canceled
+    await invoke("download_file", {
+      taskId: content.localTaskId,
+      savePath,
+    });
+  } catch (e) {
+    console.error("File download failed:", e);
+  }
 }
 
 export function MessageBubble({
@@ -122,10 +147,26 @@ export function MessageBubble({
             return (
               <div
                 key={i}
-                className={`px-3 py-2 rounded-lg text-sm inline-block mb-1 cursor-pointer
-                  ${isSent ? "bg-primary text-white" : "bg-bg text-text hover:bg-surface-alt"}`}
+                onClick={() => {
+                  if (!isSent && content.localTaskId) {
+                    handleFileClick(content);
+                  }
+                }}
+                className={`px-3 py-2 rounded-lg text-sm inline-block mb-1
+                  ${isSent
+                    ? "bg-primary text-white"
+                    : "bg-bg text-text hover:bg-surface-alt cursor-pointer group"
+                  }`}
+                title={!isSent && content.localTaskId ? "Click to download" : undefined}
               >
-                📎 {content.filename || "File"} ({content.size ? formatSize(content.size) : "?"})
+                <span className="group-hover:underline">
+                  📎 {content.filename || "File"} ({content.size ? formatSize(content.size) : "?"})
+                </span>
+                {!isSent && content.localTaskId && (
+                  <span className="ml-2 text-xs opacity-0 group-hover:opacity-60 transition-opacity">
+                    Click to download
+                  </span>
+                )}
               </div>
             );
           }

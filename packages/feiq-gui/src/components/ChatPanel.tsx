@@ -5,6 +5,7 @@ import { useGroupStore } from "../stores/groupStore";
 import { useMessageStore, type Message, type Content } from "../stores/messageStore";
 import { MessageBubble } from "./MessageBubble";
 import { InputArea } from "./InputArea";
+import { FileTransferPanel } from "./FileTransferPanel";
 import { Search, X, Send, MessageSquare, Users, Loader2 } from "lucide-react";
 import type { Group } from "../stores/groupStore";
 
@@ -477,6 +478,9 @@ export function ChatPanel() {
           })}
         </div>
       )}
+
+      {/* Active file transfers */}
+      <FileTransferPanel />
 
       {/* Messages with infinite scroll */}
       <div

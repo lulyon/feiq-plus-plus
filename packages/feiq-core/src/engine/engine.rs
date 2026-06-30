@@ -5,6 +5,10 @@
 use crate::engine::events::FrontendEvent;
 use crate::engine::tasks::FileTaskHandle;
 use crate::model::contacts::ContactBook;
+use crate::network::crypto::{
+    compute_shared_secret, create_decryptor, create_encryptor, decrypt, encrypt, generate_keypair,
+    FeiqDecryptor, FeiqEncryptor, is_feiq_plus_plus,
+};
 use crate::network::manager::NetworkManager;
 use crate::network::relay::RelayClient;
 use crate::network::NetworkEvent;
@@ -14,6 +18,7 @@ use crate::protocol::serializer::*;
 use crate::protocol::types::*;
 use crate::storage::history::HistoryDb;
 use crate::storage::settings::{AppConfig, ConnectionMode};
+use ring::agreement::EphemeralPrivateKey;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -72,6 +77,10 @@ pub struct Engine {
     history: Option<Arc<std::sync::Mutex<HistoryDb>>>,
     /// Signals periodic broadcast task to stop
     shutdown: Arc<AtomicBool>,
+    /// Per-peer crypto sessions (IP -> encryptor/decryptor) for ECDH+AES-256-GCM
+    crypto_sessions: Arc<Mutex<HashMap<String, (FeiqEncryptor, FeiqDecryptor)>>>,
+    /// Our current keypair for BR_ENTRY/ANSENTRY broadcast public key
+    our_keypair: Arc<Mutex<Option<(EphemeralPrivateKey, Vec<u8>)>>>,
 }
 
 impl Engine {
@@ -114,6 +123,8 @@ impl Engine {
             file_tasks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             history,
             shutdown: Arc::new(AtomicBool::new(false)),
+            crypto_sessions: Arc::new(Mutex::new(HashMap::new())),
+            our_keypair: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -165,8 +176,9 @@ impl Engine {
         // Update version with actual MAC
         self.version = format!("feiq_plus_plus#128#{self_mac}#0#0#0#1#9");
 
-        // Send online broadcast
-        let online_data = build_br_entry(&self.config.name, &self.config.host, &self.version);
+        // Ensure keypair and include public key in BR_ENTRY broadcast
+        let our_pub_key = self.ensure_keypair();
+        let online_data = build_br_entry_ext(&self.config.name, &self.config.host, &self.version, Some(&our_pub_key));
         network.broadcast(&online_data).await?;
 
         if self.config.port != 2425 {
@@ -192,23 +204,83 @@ impl Engine {
         let network_for_dispatch = network.clone();
         let network_for_rebroadcast = network.clone();
 
-        // Event dispatch
-        let ans_entry_data = build_ans_entry(&self.config.name, &self.config.host, &self.version);
+        // Event dispatch with crypto key exchange
         let event_tx = self.event_tx.clone();
         let contacts = self.contacts.clone();
         let config = self.config.clone();
         let history_udp = self.history.clone();
+        let file_tasks_udp = self.file_tasks().clone();
+        let crypto_sessions = self.crypto_sessions.clone();
+        let our_keypair = self.our_keypair.clone();
+        let self_name = self.config.name.clone();
+        let self_host = self.config.host.clone();
+        let self_version = self.version.clone();
 
         tokio::spawn(async move {
             while let Some(event) = net_rx.recv().await {
-                let reply = handle_network_event(event, &event_tx, &contacts, &config, &history_udp, None);
+                // ─── Pre-process crypto (key exchange) before handle_network_event ──
+                let mut ans_pub_key: Option<Vec<u8>> = None;
+
+                match &event {
+                    NetworkEvent::FellowOnline(post) => {
+                        if post.from.version.starts_with("feiq_plus_plus") && !post.from.public_key.is_empty() {
+                            let peer_ip = &post.from.ip;
+                            if !crypto_sessions.lock().unwrap().contains_key(peer_ip) {
+                                if let Ok((our_priv, our_pub)) = generate_keypair() {
+                                    if let Ok(secret) = compute_shared_secret(our_priv, &post.from.public_key) {
+                                        let enc = create_encryptor(&secret);
+                                        let dec = create_decryptor(&secret);
+                                        crypto_sessions.lock().unwrap().insert(peer_ip.clone(), (enc, dec));
+                                        ans_pub_key = Some(our_pub);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    NetworkEvent::FellowAnsEntry(post) => {
+                        if post.from.version.starts_with("feiq_plus_plus") && !post.from.public_key.is_empty() {
+                            let peer_ip = &post.from.ip;
+                            if !crypto_sessions.lock().unwrap().contains_key(peer_ip) {
+                                let mut kp = our_keypair.lock().unwrap();
+                                if let Some((priv_key, _)) = kp.take() {
+                                    if let Ok(secret) = compute_shared_secret(priv_key, &post.from.public_key) {
+                                        if let Ok((new_priv, new_pub)) = generate_keypair() {
+                                            *kp = Some((new_priv, new_pub));
+                                        }
+                                        drop(kp);
+                                        let enc = create_encryptor(&secret);
+                                        let dec = create_decryptor(&secret);
+                                        crypto_sessions.lock().unwrap().insert(peer_ip.clone(), (enc, dec));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+
+                let reply = handle_network_event(
+                    event,
+                    &event_tx,
+                    &contacts,
+                    &config,
+                    &history_udp,
+                    Some(&file_tasks_udp),
+                    Some(&crypto_sessions),
+                );
+
                 if let Some((ip, port)) = reply {
-                    let _ = network_for_dispatch.send_to(&ip, port, &ans_entry_data).await;
+                    let ans_data = if let Some(ref pk) = ans_pub_key {
+                        build_ans_entry_ext(&self_name, &self_host, &self_version, Some(pk))
+                    } else {
+                        build_ans_entry(&self_name, &self_host, &self_version)
+                    };
+                    let _ = network_for_dispatch.send_to(&ip, port, &ans_data).await;
                 }
             }
         });
 
-        // Periodic rebroadcast
+        // Periodic rebroadcast (includes pubkey in BR_ENTRY)
         let network_p = network_for_rebroadcast;
         let name_p = self.config.name.clone();
         let host_p = self.config.host.clone();
@@ -216,6 +288,7 @@ impl Engine {
         let custom_ips_p = self.config.custom_ips.clone();
         let version_p = self.version.clone();
         let shutdown_p = self.shutdown.clone();
+        let our_keypair_rb = self.our_keypair.clone();
 
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_secs(30)).await;
@@ -223,7 +296,11 @@ impl Engine {
                 if shutdown_p.load(Ordering::Relaxed) {
                     break;
                 }
-                let data = build_br_entry(&name_p, &host_p, &version_p);
+                let data = {
+                    let kp = our_keypair_rb.lock().unwrap();
+                    let pub_key = kp.as_ref().map(|(_, pk)| pk.as_slice());
+                    build_br_entry_ext(&name_p, &host_p, &version_p, pub_key)
+                };
                 let _ = network_p.broadcast(&data).await;
                 if port_p != 2425 {
                     let _ = network_p.broadcast_to_port(2425, &data).await;
@@ -270,10 +347,19 @@ impl Engine {
         let contacts = self.contacts.clone();
         let config = self.config.clone();
         let history_relay = self.history.clone();
+        let file_tasks_relay = self.file_tasks().clone();
 
         tokio::spawn(async move {
             while let Some(event) = relay_rx.recv().await {
-                handle_network_event(event, &event_tx, &contacts, &config, &history_relay, None);
+                handle_network_event(
+                    event,
+                    &event_tx,
+                    &contacts,
+                    &config,
+                    &history_relay,
+                    Some(&file_tasks_relay),
+                    None,
+                );
                 // No ANSENTRY reply for relay peers — server handles presence
             }
         });
@@ -347,15 +433,35 @@ impl Engine {
     }
 
     /// Send text message. Routes via relay if peer is from relay, else UDP.
+    /// Automatically encrypts if crypto session exists for the peer.
     /// Automatically saves to chat history and enqueues offline messages.
     pub async fn send_text_to(&self, ip: &str, port: u16, text: &str) -> anyhow::Result<()> {
-        let data = build_text_message(
-            self.packet_id(),
-            &self.config.name,
-            &self.config.host,
-            &self.version,
-            text,
-        );
+        let text_gbk = encode_gbk(text);
+
+        // Try to encrypt if crypto session exists for this peer
+        let data = {
+            let mut sessions = self.crypto_sessions.lock().unwrap();
+            if let Some((ref mut enc, _)) = sessions.get_mut(ip) {
+                let encrypted = encrypt(&text_gbk, enc)
+                    .map_err(|_| anyhow::anyhow!("Encryption failed"))?;
+                pack_message(
+                    self.packet_id(),
+                    &self.config.name,
+                    &self.config.host,
+                    &self.version,
+                    IPMSG_SENDMSG | IPMSG_SENDCHECKOPT | IPMSG_ENCRYPTOPT,
+                    &encrypted,
+                )
+            } else {
+                build_text_message(
+                    self.packet_id(),
+                    &self.config.name,
+                    &self.config.host,
+                    &self.version,
+                    text,
+                )
+            }
+        };
 
         // Check if this peer is a relay peer — extract data before await
         let relay_peer_id = {
@@ -426,6 +532,75 @@ impl Engine {
             }
         }
 
+        Ok(())
+    }
+
+    /// Send a sealed (read-and-destroy) text message with IPMSG_SECRETEXOPT.
+    /// Routes via relay if peer is from relay, else UDP.
+    /// Automatically encrypts if crypto session exists for the peer.
+    pub async fn send_sealed_text_to(&self, ip: &str, port: u16, text: &str, _ttl: u32) -> anyhow::Result<()> {
+        let text_gbk = encode_gbk(text);
+
+        let data = {
+            let mut sessions = self.crypto_sessions.lock().unwrap();
+            if let Some((ref mut enc, _)) = sessions.get_mut(ip) {
+                let encrypted = encrypt(&text_gbk, enc)
+                    .map_err(|_| anyhow::anyhow!("Encryption failed"))?;
+                pack_message(
+                    self.packet_id(),
+                    &self.config.name,
+                    &self.config.host,
+                    &self.version,
+                    IPMSG_SENDMSG | IPMSG_SENDCHECKOPT | IPMSG_SECRETEXOPT | IPMSG_ENCRYPTOPT,
+                    &encrypted,
+                )
+            } else {
+                pack_message(
+                    self.packet_id(),
+                    &self.config.name,
+                    &self.config.host,
+                    &self.version,
+                    IPMSG_SENDMSG | IPMSG_SENDCHECKOPT | IPMSG_SECRETEXOPT,
+                    &text_gbk,
+                )
+            }
+        };
+
+        let relay_peer_id = {
+            self.contacts
+                .lock()
+                .unwrap()
+                .find_by_ip(ip)
+                .and_then(|f| match &f.source {
+                    PeerSource::RelayPeer(id) => Some(id.clone()),
+                    _ => None,
+                })
+        };
+
+        if let Some(peer_id) = relay_peer_id {
+            if let Some(ref relay) = self.relay_client {
+                return relay.send_to(
+                    &peer_id,
+                    IPMSG_SENDMSG | IPMSG_SENDCHECKOPT | IPMSG_SECRETEXOPT,
+                    &data,
+                ).await;
+            }
+        }
+
+        if let Some(ref network) = self.network {
+            network.send_to(ip, port, &data).await?;
+        }
+
+        Ok(())
+    }
+
+    /// Send IPMSG_READMSG notification for a sealed message that was read.
+    /// This notifies the sender that their sealed message was consumed.
+    pub async fn send_readmsg(&self, ip: &str, port: u16, packet_id: &str) -> anyhow::Result<()> {
+        let data = build_readmsg(packet_id, &self.config.name, &self.config.host, &self.version);
+        if let Some(ref network) = self.network {
+            network.send_to(ip, port, &data).await?;
+        }
         Ok(())
     }
 
@@ -652,9 +827,109 @@ impl Engine {
         &self.file_tasks
     }
 
+    /// Get a reference to the network manager (for TCP file transfers).
+    pub fn network(&self) -> Option<&Arc<NetworkManager>> {
+        self.network.as_ref()
+    }
+
+    /// Get a reference to the event sender for emitting frontend events.
+    pub fn event_tx(&self) -> &mpsc::UnboundedSender<FrontendEvent> {
+        &self.event_tx
+    }
+
     /// Get the next local task ID (monotonically increasing).
     fn next_task_id(&mut self) -> u64 {
         self.file_id.next()
+    }
+
+    // ─── Encryption Pipeline (Phase 5.1) ──────────────────────────
+
+    /// Ensure we have a keypair for BR_ENTRY/ANSENTRY broadcasts.
+    /// Returns our current public key (32 bytes).
+    fn ensure_keypair(&self) -> Vec<u8> {
+        let mut kp = self.our_keypair.lock().unwrap();
+        if let Some((_, pub_key)) = kp.as_ref() {
+            return pub_key.clone();
+        }
+        let (priv_key, pub_key) = generate_keypair().unwrap();
+        *kp = Some((priv_key, pub_key.clone()));
+        pub_key
+    }
+}
+
+// ─── File Transfer ─────────────────────────────────────────────
+impl Engine {
+    /// Send a file notification to a peer.
+    /// Creates a FileTaskHandle (Upload type), registers it, and sends
+    /// the file notification message via UDP or relay.
+    /// Returns the local task ID for tracking the transfer.
+    pub async fn send_file_to(&self, ip: &str, file_path: &str) -> anyhow::Result<u64> {
+        let task_id = NEXT_FILE_TASK_ID.fetch_add(1, Ordering::Relaxed);
+        let packet_no = self.packet_id();
+
+        let mut fc = create_file_content(file_path)
+            .ok_or_else(|| anyhow::anyhow!("File not found: {}", file_path))?;
+        fc.file_id = packet_no;
+        fc.packet_no = packet_no;
+        fc.local_task_id = Some(task_id);
+
+        // Look up peer info (port, relay peer ID, display name)
+        let (port, relay_peer_id, fellow_name) = {
+            let contacts = self.contacts.lock().unwrap();
+            let fellow = contacts.find_by_ip(ip);
+            let port = fellow.as_ref().map(|f| f.port).unwrap_or(2425);
+            let relay_peer_id = fellow.as_ref().and_then(|f| match &f.source {
+                PeerSource::RelayPeer(id) => Some(id.clone()),
+                _ => None,
+            });
+            let fellow_name = fellow
+                .map(|f| f.display_name().to_string())
+                .unwrap_or_else(|| ip.to_string());
+            (port, relay_peer_id, fellow_name)
+        };
+
+        // Create and register file task
+        let task = FileTaskHandle::new(
+            task_id,
+            ip.to_string(),
+            fellow_name,
+            fc.clone(),
+            FileTaskType::Upload,
+        );
+        self.register_file_task(task);
+
+        // Build file notification message
+        let data = build_file_message(
+            packet_no,
+            &self.config.name,
+            &self.config.host,
+            &self.version,
+            &fc,
+        );
+
+        // Send via relay or UDP
+        if let Some(peer_id) = relay_peer_id {
+            if let Some(ref relay) = self.relay_client {
+                relay
+                    .send_to(&peer_id, IPMSG_SENDMSG | IPMSG_FILEATTACHOPT, &data)
+                    .await?;
+            } else {
+                anyhow::bail!("Relay not connected");
+            }
+        } else if let Some(ref network) = self.network {
+            network.send_to(ip, port, &data).await?;
+        } else {
+            anyhow::bail!("No transport available");
+        }
+
+        // Emit FileStateChanged event to frontend
+        let _ = self.event_tx.send(FrontendEvent::FileStateChanged {
+            task_id,
+            state: FileTaskState::NotStart,
+            message: format!("Sending file: {}", fc.filename),
+        });
+
+        Ok(task_id)
     }
 }
 
@@ -675,6 +950,7 @@ fn handle_network_event(
     _config: &AppConfig,
     history: &Option<Arc<std::sync::Mutex<HistoryDb>>>,
     _file_tasks: Option<&Arc<std::sync::Mutex<HashMap<u64, Arc<FileTaskHandle>>>>>,
+    crypto_sessions: Option<&Arc<Mutex<HashMap<String, (FeiqEncryptor, FeiqDecryptor)>>>>,
 ) -> Option<(String, u16)> {
     // ─── Blacklist check — drop events from blacklisted IPs ──
     let event_ip = match &event {
@@ -776,6 +1052,27 @@ fn handle_network_event(
             None
         }
         NetworkEvent::Message(mut post) => {
+            // ─── Decrypt if IPMSG_ENCRYPTOPT flag is set ──────────
+            if is_opt_set(post.cmd_id, IPMSG_ENCRYPTOPT) {
+                if let Some(sessions) = crypto_sessions {
+                    let ip = post.from.ip.clone();
+                    if let Some((_, dec)) = sessions.lock().unwrap().get_mut(&ip) {
+                        if let Ok(plaintext) = decrypt(&post.extra, dec) {
+                            post.extra = plaintext;
+                            post.cmd_id &= !IPMSG_ENCRYPTOPT;
+                            post.contents.clear();
+                            let text = decode_gbk(&post.extra);
+                            if !text.is_empty() {
+                                post.contents.push(Content::Text {
+                                    text,
+                                    format: String::new(),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+
             // Filter unsupported content types (mirrors original onMsg)
             let mut reply_text = String::new();
             post.contents.retain(|c| {
@@ -822,11 +1119,12 @@ fn handle_network_event(
 
                 // ─── Process file contents: create FileTaskHandle entries ──
                 if let Some(ref ft) = _file_tasks {
-                    for content in &post.contents {
-                        if let Content::File(fc) = content {
+                    for content in &mut post.contents {
+                        if let Content::File(ref mut fc) = content {
                             if fc.file_type != IPMSG_FILE_DIR {
                                 let task_id =
                                     NEXT_FILE_TASK_ID.fetch_add(1, Ordering::Relaxed);
+                                fc.local_task_id = Some(task_id);
                                 let task = FileTaskHandle::new(
                                     task_id,
                                     from_ip.clone(),
@@ -896,17 +1194,19 @@ fn handle_network_event(
 
 // ─── Protocol message builders ───────────────────────────────
 
-/// Build IPMSG_BR_ENTRY broadcast message
+/// Build IPMSG_BR_ENTRY broadcast message (without public key)
 pub fn build_br_entry(name: &str, host: &str, version: &str) -> Vec<u8> {
-    let name_gbk = encode_gbk(name);
-    pack_message(
-        0, // packet_no = 0 for broadcast
-        name,
-        host,
-        version,
-        IPMSG_BR_ENTRY,
-        &name_gbk,
-    )
+    build_br_entry_ext(name, host, version, None)
+}
+
+/// Build BR_ENTRY with optional pub key appended: [GBK name][NUL][32 pubkey bytes]
+pub(crate) fn build_br_entry_ext(name: &str, host: &str, version: &str, pubkey: Option<&[u8]>) -> Vec<u8> {
+    let mut body = encode_gbk(name);
+    if let Some(pk) = pubkey {
+        body.push(0x00);
+        body.extend_from_slice(pk);
+    }
+    pack_message(0, name, host, version, IPMSG_BR_ENTRY, &body)
 }
 
 /// Build IPMSG_BR_EXIT broadcast message
@@ -922,17 +1222,19 @@ pub fn build_br_exit(name: &str, host: &str, version: &str) -> Vec<u8> {
     )
 }
 
-/// Build IPMSG_ANSENTRY reply
+/// Build IPMSG_ANSENTRY reply (without public key)
 pub fn build_ans_entry(name: &str, host: &str, version: &str) -> Vec<u8> {
-    let name_gbk = encode_gbk(name);
-    pack_message(
-        0,
-        name,
-        host,
-        version,
-        IPMSG_ANSENTRY,
-        &name_gbk,
-    )
+    build_ans_entry_ext(name, host, version, None)
+}
+
+/// Build ANSENTRY with optional pub key appended: [GBK name][NUL][32 pubkey bytes]
+pub(crate) fn build_ans_entry_ext(name: &str, host: &str, version: &str, pubkey: Option<&[u8]>) -> Vec<u8> {
+    let mut body = encode_gbk(name);
+    if let Some(pk) = pubkey {
+        body.push(0x00);
+        body.extend_from_slice(pk);
+    }
+    pack_message(0, name, host, version, IPMSG_ANSENTRY, &body)
 }
 
 /// Build IPMSG_SENDMSG text message
@@ -963,6 +1265,19 @@ pub fn build_recvmsg(packet_no: &str, name: &str, host: &str, version: &str) -> 
         host,
         version,
         IPMSG_RECVMSG,
+        &payload,
+    )
+}
+
+/// Build IPMSG_READMSG (sealed message read notification)
+pub fn build_readmsg(packet_no: &str, name: &str, host: &str, version: &str) -> Vec<u8> {
+    let payload = packet_no.as_bytes().to_vec();
+    pack_message(
+        0,
+        name,
+        host,
+        version,
+        IPMSG_READMSG,
         &payload,
     )
 }

@@ -1,6 +1,6 @@
 import { useState, useRef, type KeyboardEvent } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { Send, Smile, Camera } from "lucide-react";
+import { Send, Smile, Camera, Paperclip } from "lucide-react";
 import { useMessageStore } from "../stores/messageStore";
 import { useContactStore } from "../stores/contactStore";
 import { EmojiPicker } from "./EmojiPicker";
@@ -67,7 +67,6 @@ export function InputArea({ fellowIp }: { fellowIp: string }) {
         });
         if (!filePath) return;
         const path = Array.isArray(filePath) ? filePath[0] : filePath;
-        // Show the file path in a message (actual file sending to come later)
         const fellow = contacts.find((c) => c.ip === fellowIp);
         if (fellow) {
           addMessage(fellowIp, {
@@ -79,7 +78,6 @@ export function InputArea({ fellowIp }: { fellowIp: string }) {
           });
         }
       } else {
-        // Screenshot captured — show file path
         const fellow = contacts.find((c) => c.ip === fellowIp);
         if (fellow) {
           addMessage(fellowIp, {
@@ -93,6 +91,34 @@ export function InputArea({ fellowIp }: { fellowIp: string }) {
       }
     } catch (e) {
       console.error("Screenshot failed:", e);
+    }
+  };
+
+  const handleAttachFile = async () => {
+    try {
+      const selected = await dialogOpen({
+        multiple: true,
+        filters: [{ name: "All Files", extensions: ["*"] }],
+      });
+      if (!selected) return;
+
+      const paths = Array.isArray(selected) ? selected : [selected];
+      const fellow = contacts.find((c) => c.ip === fellowIp);
+      if (!fellow) {
+        console.warn("No contact selected for file send");
+        return;
+      }
+
+      for (const filePath of paths) {
+        if (!filePath) continue;
+        try {
+          await invoke("send_file", { ip: fellow.ip, filePath });
+        } catch (e) {
+          console.error(`send_file failed for ${filePath}:`, e);
+        }
+      }
+    } catch (e) {
+      console.error("File attach dialog failed:", e);
     }
   };
 
@@ -112,6 +138,15 @@ export function InputArea({ fellowIp }: { fellowIp: string }) {
           title="Capture screenshot"
         >
           <Camera className="w-5 h-5" />
+        </button>
+        {/* File attachment button */}
+        <button
+          onClick={handleAttachFile}
+          className="flex-shrink-0 w-8 h-8 flex items-center justify-center
+                     rounded-lg hover:bg-surface-alt text-text-muted transition-colors cursor-pointer mb-1"
+          title="Attach file"
+        >
+          <Paperclip className="w-5 h-5" />
         </button>
         {/* Emoji button */}
         <button
