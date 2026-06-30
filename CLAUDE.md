@@ -4,14 +4,14 @@
 - **Name**: feiq-plus-plus
 - **Purpose**: Modern cross-platform LAN + Relay chat app implementing IP Messenger protocol
 - **Origin**: Rewrite of feiq (Qt5/C++ macOS-only) using Rust + Tauri + React
-- **Status**: Phase 1-5 complete, 30 tests pass, 0 compile errors
-- **Version**: 0.1.4 (relay server + hybrid LAN/Relay connection modes)
+- **Status**: Phase 1-5 complete, 66 tests pass, 0 compile errors
+- **Version**: 0.1.4
 
 ## Build & Test
 
 ```bash
 cargo check --workspace     # fast compile check
-cargo test --workspace       # run all 30 tests (27 unit + 3 integration)
+cargo test --workspace       # run all 66 tests (63 unit + 3 integration)
 cargo build --workspace      # full build
 cargo tauri dev              # dev mode with hot-reload frontend
 
@@ -88,7 +88,7 @@ LAN Peers                feiq-relay Server
 ### Tauri Bridge (`packages/feiq-app/src/`)
 | File | Purpose |
 |------|---------|
-| `commands.rs` | 10 IPC commands (start_engine, stop_engine, get_contacts, send_text, send_knock, etc.) |
+| `commands.rs` | 27 IPC commands (start_engine, stop_engine, get_contacts, send_text, send_knock, send_file, cancel_file, get_history, search_history, clear_history, export_history, create_group, invite_to_group, leave_group, get_groups, edit_alias, set_theme, get_settings, update_settings, get_connection_mode, set_connection_mode, ping, get_screenshot, save_annotation, set_avatar, get_avatar, start_relay_client) |
 | `state.rs` | AppState (Engine + Config + event channels) |
 | `events.rs` | Forwards FrontendEvent → Tauri window events |
 | `tray.rs` | System tray icon + context menu |
@@ -104,14 +104,19 @@ LAN Peers                feiq-relay Server
 | File | Purpose |
 |------|---------|
 | `App.tsx` | Root: Tauri event listeners, engine auto-start |
-| `components/Sidebar.tsx` | Contact list, search, online count, unread badges |
-| `components/ChatPanel.tsx` | Chat header + message list + input area |
+| `components/Sidebar.tsx` | Contact list, search, online count, unread badges, group tree |
+| `components/ChatPanel.tsx` | Chat header + infinite-scroll message list + input area |
 | `components/MessageBubble.tsx` | Text/knock/file bubbles + emoji inline rendering |
 | `components/InputArea.tsx` | Text input + emoji picker toggle + send button |
 | `components/EmojiPicker.tsx` | 16×6 emoji grid with hover preview |
-| `components/SettingsDialog.tsx` | Config editor (name, host, connection mode, relay URL, IP ranges, send_by_enter) |
-| `stores/contactStore.ts` | Zustand: contacts list, upsert, select |
-| `stores/messageStore.ts` | Zustand: messages by IP, unread counts |
+| `components/SettingsDialog.tsx` | Config editor (name, host, connection mode, relay URL, IP ranges, send_by_enter, theme) |
+| `components/CreateGroupDialog.tsx` | Group creation modal (name, member selection) |
+| `components/FileTransferPanel.tsx` | File transfer list with progress bars, send/recv status, cancel/resume |
+| `components/ScreenshotAnnotation.tsx` | Canvas-based screenshot capture + annotation (drawing, text, shapes) |
+| `stores/contactStore.ts` | Zustand: contacts list, upsert, select, alias editing |
+| `stores/messageStore.ts` | Zustand: messages by IP, unread counts, history search |
+| `stores/fileTransferStore.ts` | Zustand: file transfer queue, progress, status per task |
+| `stores/groupStore.ts` | Zustand: groups, members, invitations |
 
 ## Protocol Details
 
@@ -139,6 +144,9 @@ LAN Peers                feiq-relay Server
 4. **Group chat**: P2P dispatch (send to each member individually), no server
 5. **Relay server**: Self-built Rust WebSocket server — custom JSON protocol (7 msg types), room-based routing, 24h offline queue, E2E transparent (server never sees plaintext)
 6. **dingo**: Use `LessSafeKey` not `SealingKey` — `SealingKey::new` is on `BoundKey` trait, not inherent; `UnboundKey` not Clone
+7. **File transfer engine**: FileTaskHandle state machine with progress throttling (1%/100KB), implements IPMSG GETFILEDATA protocol for pull-based transfers, supports cancel/resume
+8. **Theme system**: CSS variables via Tailwind v4 `@theme` directive — light/dark/auto with CSS `prefers-color-scheme` detection, persisted in settings
+9. **Screenshot annotation**: Raw Canvas API (no library) for capture, freehand drawing, text overlay, shape annotation — exported via `@tauri-apps/plugin-fs`
 
 ## Known Limitations
 - Image protocol data channel not reverse-engineered
@@ -146,10 +154,10 @@ LAN Peers                feiq-relay Server
 - Remote desktop not implemented (beyond IM scope)
 - Schedule/calendar not implemented (beyond IM scope)
 - IPMSG v9 legacy encryption (RSA/RC2/Blowfish) deferred to P6
-- Relay: file transfer not yet supported over relay (Phase 2)
+- Folder transfer not yet implemented (deferred)
 
 ## Dependencies
 - **Rust**: tokio(full), tokio-tungstenite, encoding_rs, rusqlite(bundled), ring 0.17, serde, chrono, mac_address, base64, futures-util
 - **Relay**: clap 4 (derive), uuid 1
 - **Tauri**: 2.11.3 + notification/dialog/global-shortcut/fs plugins
-- **Frontend**: react 18, zustand 4, tailwindcss 3, lucide-react, @tauri-apps/api 2.x
+- **Frontend**: react 18, zustand 4, tailwindcss 3, lucide-react, @tauri-apps/api 2.x, @tauri-apps/plugin-fs (screenshot annotation export)

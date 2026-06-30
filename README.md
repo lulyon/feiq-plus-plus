@@ -25,16 +25,16 @@
 - 密封消息 (阅后即焚)
 
 ### 用户管理
-- 好友分组、自定义备注名、个性签名
+- 好友分组树、自定义备注名/别名编辑、个性签名
 - 黑名单、隐身模式
 - 拼音首字母搜索、自定义广播网段
 
 ### 聊天记录
 - SQLite 持久化存储、无限滚动加载历史
-- 全文搜索、JSON 导出/导入
+- 全文搜索、日期分隔线、JSON 导出/导入
 
 ### 个性化
-- 明/暗主题 + 多配色
+- 明/暗/自动跟随系统主题 (CSS 变量 + Tailwind v4 @theme)
 - 系统原生通知 + Dock/Taskbar 未读角标
 - 系统托盘快捷操作
 
@@ -66,17 +66,21 @@ feiq-plus-plus/
 │   ├── feiq-core/              # Rust: 协议引擎 + 网络 + 存储 + 加密
 │   │   └── src/
 │   │       ├── protocol/       # IPMSG 协议常量、类型、编解码、解析链
-│   │       ├── network/        # UDP/TCP 通信、加密
+│   │       ├── network/        # UDP/TCP/Relay 通信、加密
 │   │       ├── engine/         # 引擎控制器 + 事件系统 + 文件任务
 │   │       ├── model/          # 联系人簿 (线程安全)
 │   │       └── storage/        # SQLite 聊天记录 + INI 配置
 │   ├── feiq-app/               # Tauri 2 桌面壳
-│   │   └── src/                # commands, events, state, tray
+│   │   └── src/                # commands (27), events, state, tray
+│   ├── feiq-relay/             # Rust WebSocket 中继服务器
+│   │   └── src/                # server, main, lib
 │   └── feiq-gui/               # React 前端
 │       └── src/
 │           ├── components/     # Sidebar, ChatPanel, MessageBubble, InputArea,
-│           │                   # EmojiPicker, SettingsDialog
-│           └── stores/         # Zustand: contactStore, messageStore
+│           │                   # EmojiPicker, SettingsDialog, CreateGroupDialog,
+│           │                   # FileTransferPanel, ScreenshotAnnotation
+│           └── stores/         # Zustand: contactStore, messageStore,
+│                               # fileTransferStore, groupStore
 ├── PLAN.md                     # 完整实现计划
 ├── README.md                   # 本文件
 └── Cargo.toml                  # Rust workspace
@@ -106,7 +110,7 @@ cargo tauri dev
 # 仅编译 Rust 核心库
 cargo build --workspace
 
-# 运行测试 (27 个单元测试)
+# 运行测试 (66 个测试)
 cargo test --workspace
 
 # 生产构建 + 打包
@@ -159,17 +163,27 @@ feiq_plus_plus#128#MAC地址#0#0#0#1#9
 ### 运行测试
 
 ```bash
-cargo test --workspace                    # 全部 27 个测试
+cargo test --workspace                    # 全部 66 个测试
 cargo test -p feiq-core                   # 仅核心库测试
 ```
 
 ### 代码统计
 
 ```
-Rust 源码:    ~3,300 行 (17 文件)
-React/TS:     ~800 行  (7 组件 + 2 stores)
-测试覆盖:     27 个单元测试, 全部通过
+Rust 源码:    ~7,400 行 (28 文件, 3 crates)
+React/TS:     ~1,500 行 (9 组件 + 4 stores)
+测试覆盖:     66 个测试, 全部通过
 ```
+
+## 最近更新 (v0.1.4)
+
+- **中继服务器 (Relay Server)**: 新增独立 WebSocket 中继服务器 `feiq-relay`，支持跨网络聊天。三种连接模式：纯局域网、纯中继、混合模式，自动去重。
+- **文件传输**: 完全实现 IPMSG GETFILEDATA 拉取协议，支持进度追踪、取消/续传，文件任务状态机。
+- **端到端加密**: ECDH (x25519) 密钥交换 + AES-256-GCM，仅 feiq++ 间通信自动启用。
+- **截图标注**: Canvas 截图捕获 + 自由绘画、文字、形状标注，通过文件系统插件导出。
+- **主题系统**: 明/暗/自动跟随系统主题，基于 CSS 变量 + Tailwind v4 `@theme` 指令，可持久化保存。
+- **群组聊天**: 创建群组、邀请/离开、群发消息，P2P 分发无服务端依赖。
+- **聊天记录增强**: 无限滚动历史加载、全文搜索、日期分隔线。
 
 ## License
 

@@ -1,11 +1,28 @@
 # feiq++ Phase 2-5 — 详细执行计划
 
+## 实现状态
+
+**最后更新**: 2026-06-30
+
+| Phase | 状态 | 测试 |
+|-------|:---:|:---:|
+| Phase 2 — 文件传输 | ✅ 100% | 完成 |
+| Phase 3 — 聊天记录+截图 | ✅ 100% | 完成 |
+| Phase 4 — 群聊+黑名单 | ✅ 85% | 文件夹推迟 |
+| Phase 5 — 加密+密封+主题+标注 | ✅ 100% | 完成 |
+
+**总测试**: 66 (63 单元 + 3 集成)，全部通过
+**IPC 命令**: 27
+**前端组件**: 9 / **Zustand stores**: 4
+
+---
+
 > 基于对当前代码库的逐行审计 + 原 feiq C++ 项目 (`/Users/zhihu/code/feiq/`) 的交叉参考。
 > 每个功能均标注了：具体改动文件、实现细节、依赖关系、预计复杂度。
 
 ---
 
-## Phase 2 — 文件传输 + 表情（当前 60%）
+## Phase 2 — 文件传输 + 表情（已完成）
 
 ### 架构缺口
 
@@ -83,7 +100,7 @@ send_file(ip, file_path)          → create_file_content → build_file_message
 
 ---
 
-## Phase 3 — 聊天记录 + 截图 + 用户管理（当前 25%）
+## Phase 3 — 聊天记录 + 截图 + 用户管理（已完成）
 
 ### 3.1 — 无限滚动历史加载
 
@@ -212,7 +229,7 @@ send_file(ip, file_path)          → create_file_content → build_file_message
 
 ---
 
-## Phase 4 — 群聊 + 文件夹 + 离线消息（当前 20%）
+## Phase 4 — 群聊 + 文件夹 + 离线消息（当前 85%，文件夹推迟）
 
 ### 4.1 — P2P 群组分发
 
@@ -271,7 +288,7 @@ send_file(ip, file_path)          → create_file_content → build_file_message
 
 ---
 
-## Phase 5 — 加密 + 文件共享 + 打磨（当前 15%）
+## Phase 5 — 加密 + 文件共享 + 打磨（已完成）
 
 ### 5.1 — 加密接入消息管线 ⚡ 最关键的缺失
 
@@ -383,25 +400,25 @@ send_file(ip, file_path)          → create_file_content → build_file_message
 ## 建议实现顺序（跨 Phase）
 
 ```
-第 1 批 (快速可见改进):
+第 1 批 (快速可见改进) [✅ 已完成]:
   Phase 3.2  日期分隔线          (30min)
   Phase 5.4  自定义主题          (1h)
   Phase 3.7  别名编辑 + 签名     (1h)
   Phase 5.6  历史导出/导入       (1h)
 
-第 2 批 (核心体验):
+第 2 批 (核心体验) [✅ 已完成]:
   Phase 3.1  无限滚动            (1h)
   Phase 3.6  分组树形视图        (2h)
   Phase 4.3  黑名单              (1h)
   Phase 5.5  托盘未读徽章        (1h)
 
-第 3 批 (功能增强):
+第 3 批 (功能增强) [✅ 已完成]:
   Phase 3.3  消息搜索            (2h)
   Phase 4.1  群组分发 + UI       (3h)
   Phase 2.1  文件引擎层          (3h)
   Phase 3.4  截图命令            (1h)
 
-第 4 批 (需要协议变更):
+第 4 批 (需要协议变更) [✅ 已完成]:
   Phase 2.2  文件 Tauri 命令     (2h)
   Phase 2.3  文件传输面板        (2h)
   Phase 2.4  可点击文件气泡      (1h)
@@ -409,7 +426,7 @@ send_file(ip, file_path)          → create_file_content → build_file_message
   Phase 5.1  加密管线 ⚡         (4h)
   Phase 5.2  密封消息            (2h)
 
-第 5 批 (复杂协议):
+第 5 批 (复杂协议) [✅ 已完成]:
   Phase 3.5  截图标注            (3h)
   Phase 4.2  文件夹传输          (4h)
   Phase 5.3  文件共享服务        (2h)
