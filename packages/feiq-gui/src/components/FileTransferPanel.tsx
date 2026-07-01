@@ -70,7 +70,13 @@ function TransferRow({
 
         {/* Progress bar (hidden for terminal states) */}
         {!isTerminal && (
-          <div className="relative w-full h-1.5 bg-surface-alt rounded-full mt-1 overflow-hidden">
+          <div
+            className="relative w-full h-1.5 bg-surface-alt rounded-full mt-1 overflow-hidden"
+            role="progressbar"
+            aria-valuenow={Math.round(pct)}
+            aria-valuemin={0}
+            aria-valuemax={100}
+          >
             <div
               className="absolute inset-y-0 left-0 bg-primary rounded-full transition-all duration-300"
               style={{ width: `${pct}%` }}

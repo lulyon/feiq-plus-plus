@@ -3,6 +3,7 @@
 
 use crate::protocol::types::*;
 use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Progress notification throttle: at least 100KB or 1% change
 const MIN_PROGRESS_BYTES: i64 = 102_400;
@@ -35,6 +36,7 @@ impl FileTaskHandle {
                 progress: 0,
                 total,
                 cancel_pending: false,
+                terminal_at: None,
             })),
             last_notified_progress: Arc::new(Mutex::new(0)),
         }
@@ -69,38 +71,57 @@ impl FileTaskHandle {
         }
     }
 
+    /// Record current time as the terminal timestamp (for cleanup).
+    fn set_terminal_at(&self) {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        let mut task = self.inner.lock().unwrap();
+        task.terminal_at = Some(now);
+    }
+
     /// Mark task as finished (no-op if already in a terminal state)
     pub fn set_finish(&self) {
-        let mut task = self.inner.lock().unwrap();
-        if matches!(
-            task.state,
-            FileTaskState::Finish | FileTaskState::Canceled | FileTaskState::Error(_)
-        ) {
-            return;
-        }
-        task.progress = task.total;
-        task.state = FileTaskState::Finish;
+        {
+            let mut task = self.inner.lock().unwrap();
+            if matches!(
+                task.state,
+                FileTaskState::Finish | FileTaskState::Canceled | FileTaskState::Error(_)
+            ) {
+                return;
+            }
+            task.progress = task.total;
+            task.state = FileTaskState::Finish;
+        } // drop lock before calling set_terminal_at
+        self.set_terminal_at();
     }
 
     /// Mark task as error (no-op if already in a terminal state)
     pub fn set_error(&self, msg: String) {
-        let mut task = self.inner.lock().unwrap();
-        if matches!(
-            task.state,
-            FileTaskState::Finish | FileTaskState::Canceled | FileTaskState::Error(_)
-        ) {
-            return;
-        }
-        task.state = FileTaskState::Error(msg);
+        {
+            let mut task = self.inner.lock().unwrap();
+            if matches!(
+                task.state,
+                FileTaskState::Finish | FileTaskState::Canceled | FileTaskState::Error(_)
+            ) {
+                return;
+            }
+            task.state = FileTaskState::Error(msg);
+        } // drop lock before calling set_terminal_at
+        self.set_terminal_at();
     }
 
     /// Mark task as canceled (no-op if already in Finish or Error state)
     pub fn set_canceled(&self) {
-        let mut task = self.inner.lock().unwrap();
-        if matches!(task.state, FileTaskState::Finish | FileTaskState::Error(_)) {
-            return;
-        }
-        task.state = FileTaskState::Canceled;
+        {
+            let mut task = self.inner.lock().unwrap();
+            if matches!(task.state, FileTaskState::Finish | FileTaskState::Error(_)) {
+                return;
+            }
+            task.state = FileTaskState::Canceled;
+        } // drop lock before calling set_terminal_at
+        self.set_terminal_at();
     }
 
     /// Request cancellation (async-safe flag)

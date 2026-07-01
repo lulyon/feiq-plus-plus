@@ -133,6 +133,10 @@ function normalizeContent(raw: Record<string, unknown>): NormalizedContent {
     };
   }
   if (raw.image !== undefined) return { type: "image" };
+  if (raw.sealed !== undefined && typeof raw.sealed === "object") {
+    const inner = raw.sealed as Record<string, unknown>;
+    return { type: "sealed", text: String(inner.text || "") };
+  }
   // Internally-tagged (serde): {"type": "file", "file_id": 123, "filename": "...", "local_task_id": 456, ...}
   // Fall through for file/image/sealed and unknown types
   return {
@@ -217,11 +221,20 @@ export function MessageBubble({
             );
           }
           if (content.type === "file") {
+            const canDownload = !isSent && !!content.localTaskId;
             return (
               <div
                 key={i}
+                role={canDownload ? "button" : undefined}
+                tabIndex={canDownload ? 0 : undefined}
                 onClick={() => {
-                  if (!isSent && content.localTaskId) {
+                  if (canDownload) {
+                    handleFileClick(content);
+                  }
+                }}
+                onKeyDown={(e) => {
+                  if (canDownload && (e.key === "Enter" || e.key === " ")) {
+                    e.preventDefault();
                     handleFileClick(content);
                   }
                 }}
@@ -230,7 +243,7 @@ export function MessageBubble({
                     ? "bg-primary text-white"
                     : "bg-bg text-text hover:bg-surface-alt cursor-pointer group"
                   }`}
-                title={!isSent && content.localTaskId ? "Click to download" : undefined}
+                title={canDownload ? "Click to download" : undefined}
               >
                 <span className="group-hover:underline">
                   📎 {content.filename || "File"} ({content.size ? formatSize(content.size) : "?"})

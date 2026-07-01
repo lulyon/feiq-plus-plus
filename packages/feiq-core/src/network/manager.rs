@@ -157,6 +157,17 @@ impl NetworkManager {
         // Run through protocol chain to parse contents
         self.protocol_chain.process(&mut post);
 
+        // ─── Check for RELEASEFILES (must check before GETFILEDATA consumes data) ──
+        if is_cmd_set(post.cmd_id, IPMSG_RELEASEFILES) && post.get_file_data.is_some() {
+            let gfd = post.get_file_data.take().unwrap();
+            let _ = self.event_tx.send(NetworkEvent::ReleaseFiles {
+                packet_no: gfd.packet_no,
+                file_id: gfd.file_id,
+                from: post.from,
+            });
+            return;
+        }
+
         // ─── Check for GETFILEDATA (file data request) ────────
         if (is_cmd_set(post.cmd_id, IPMSG_GETFILEDATA) || is_cmd_set(post.cmd_id, IPMSG_GETDIRFILES))
             && post.get_file_data.is_some()
@@ -166,17 +177,6 @@ impl NetworkManager {
                 packet_no: gfd.packet_no,
                 file_id: gfd.file_id,
                 offset: gfd.offset,
-                from: post.from,
-            });
-            return;
-        }
-
-        // ─── Check for RELEASEFILES ───────────────────────────
-        if is_cmd_set(post.cmd_id, IPMSG_RELEASEFILES) && post.get_file_data.is_some() {
-            let gfd = post.get_file_data.take().unwrap();
-            let _ = self.event_tx.send(NetworkEvent::ReleaseFiles {
-                packet_no: gfd.packet_no,
-                file_id: gfd.file_id,
                 from: post.from,
             });
             return;

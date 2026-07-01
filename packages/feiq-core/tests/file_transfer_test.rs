@@ -108,33 +108,13 @@ impl TestPeer {
 /// Build a file notification with GBK-encoded filename (no UTF8OPT).
 /// Delegates to the production `build_file_message`.
 fn build_file_gbk(peer: &TestPeer, packet_no: u64, content: &FileContent) -> Vec<u8> {
-    build_file_message(packet_no, &peer.name, "test-host", &peer.ver, content)
+    build_file_message(packet_no, &peer.name, "test-host", &peer.ver, content, false)
 }
 
 /// Build a file notification with UTF-8 filename and IPMSG_UTF8OPT.
-/// This mirrors `build_file_message` but skips GBK encoding and sets UTF8OPT.
+/// Delegates to the production `build_file_message` with is_feiq_plus_plus=true.
 fn build_file_utf8(peer: &TestPeer, packet_no: u64, content: &FileContent) -> Vec<u8> {
-    let mut body = vec![MSG_NULL];
-    let filename_safe = content.filename.replace(':', "::");
-    let entry = format!(
-        "{}:{}:{:X}:{:X}:{:X}:",
-        content.file_id,
-        filename_safe,
-        content.size,
-        content.modify_time,
-        content.file_type,
-    );
-    body.extend_from_slice(entry.as_bytes());
-    body.push(FILELIST_SEPARATOR);
-
-    pack_message(
-        packet_no,
-        &peer.name,
-        "test-host",
-        &peer.ver,
-        IPMSG_SENDMSG | IPMSG_FILEATTACHOPT | IPMSG_UTF8OPT,
-        &body,
-    )
+    build_file_message(packet_no, &peer.name, "test-host", &peer.ver, content, true)
 }
 
 // ─── Tests ───────────────────────────────────────────────────────

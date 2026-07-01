@@ -299,6 +299,12 @@ impl RecvProtocol for RecvFile {
         };
 
         if null_pos == 0 || null_pos >= post.extra.len() {
+            tracing::debug!(
+                "RecvFile: malformed FILEATTACHOPT data: null_pos={}, extra_len={}, from={}",
+                null_pos,
+                post.extra.len(),
+                post.from.ip,
+            );
             return false;
         }
 
@@ -322,6 +328,12 @@ impl RecvProtocol for RecvFile {
             let is_utf8 = is_opt_set(post.cmd_id, IPMSG_UTF8OPT);
             if let Some(content) = parse_file_task(task_bytes, is_utf8) {
                 post.contents.push(Content::File(content));
+            } else {
+                tracing::debug!(
+                    "RecvFile: parse_file_task returned None for entry: {:?}, from={}",
+                    task_bytes,
+                    post.from.ip,
+                );
             }
 
             start = end + 1;
@@ -338,6 +350,11 @@ impl RecvProtocol for RecvFile {
 fn parse_file_task(data: &[u8], is_utf8: bool) -> Option<FileContent> {
     let values = split_allow_separator(data, HLIST_ENTRY_SEPARATOR);
     if values.len() < 5 {
+        tracing::debug!(
+            "parse_file_task: malformed entry: expected >=5 colon-separated fields, got {}: data={:?}",
+            values.len(),
+            data,
+        );
         return None;
     }
 

@@ -3,6 +3,7 @@
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::time::{timeout, Duration};
 
 use crate::protocol::constants::{IPMSG_FILE_DIR, IPMSG_FILE_REGULAR};
 use crate::protocol::types::FileContent;
@@ -198,10 +199,12 @@ pub struct FileTransfer {
 }
 
 impl FileTransfer {
-    /// Connect to a remote IPMSG peer for file transfer
+    /// Connect to a remote IPMSG peer for file transfer (30s timeout)
     pub async fn connect(ip: &str, port: u16) -> anyhow::Result<Self> {
         let addr = format!("{ip}:{port}");
-        let stream = TcpStream::connect(&addr).await?;
+        let stream = timeout(Duration::from_secs(30), TcpStream::connect(&addr))
+            .await
+            .map_err(|_| anyhow::anyhow!("TCP connect to {addr} timed out after 30s"))??;
         stream.set_nodelay(true)?;
         Ok(Self { stream })
     }
@@ -219,7 +222,7 @@ impl FileTransfer {
     }
 
     /// Send a file from disk with progress callback.
-    /// Returns total bytes sent.
+    /// Returns total bytes sent. Each read/write has a 300s timeout.
     pub async fn send_file<F>(
         &mut self,
         file_path: &str,
@@ -243,11 +246,15 @@ impl FileTransfer {
 
         while sent < total {
             let to_read = std::cmp::min(FILE_CHUNK_SIZE, (total - sent) as usize);
-            let n = file.read(&mut buf[..to_read]).await?;
+            let n = timeout(Duration::from_secs(300), file.read(&mut buf[..to_read]))
+                .await
+                .map_err(|_| anyhow::anyhow!("send_file: disk read timed out after 300s"))??;
             if n == 0 {
                 break;
             }
-            self.stream.write_all(&buf[..n]).await?;
+            timeout(Duration::from_secs(300), self.stream.write_all(&buf[..n]))
+                .await
+                .map_err(|_| anyhow::anyhow!("send_file: socket write timed out after 300s"))??;
             sent += n as i64;
             progress_cb(sent, total);
         }
@@ -258,6 +265,7 @@ impl FileTransfer {
     /// Receive file data and write to disk with progress callback.
     /// Rejects files larger than MAX_FILE_SIZE to prevent DoS attacks
     /// where a malicious peer declares a fake huge file size.
+    /// Each read/write has a 300s timeout.
     pub async fn recv_file<F>(
         &mut self,
         file_path: &str,
@@ -284,16 +292,27 @@ impl FileTransfer {
 
         while received < total_size {
             let to_read = std::cmp::min(FILE_CHUNK_SIZE, (total_size - received) as usize);
-            let n = self.stream.read(&mut buf[..to_read]).await?;
+            let n = timeout(Duration::from_secs(300), self.stream.read(&mut buf[..to_read]))
+                .await
+                .map_err(|_| anyhow::anyhow!("recv_file: socket read timed out after 300s"))??;
             if n == 0 {
                 break; // EOF
             }
-            file.write_all(&buf[..n]).await?;
+            timeout(Duration::from_secs(300), file.write_all(&buf[..n]))
+                .await
+                .map_err(|_| anyhow::anyhow!("recv_file: disk write timed out after 300s"))??;
             received += n as i64;
             progress_cb(received, total_size);
         }
 
         file.flush().await?;
+
+        if received < total_size {
+            return Err(anyhow::anyhow!(
+                "Incomplete download: received {received} of {total_size} bytes (early EOF)"
+            ));
+        }
+
         Ok(received)
     }
 

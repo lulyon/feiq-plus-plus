@@ -425,12 +425,14 @@ impl Engine {
 	                                    f
 	                                })
 	                                .collect();
+	                            let peer_is_feiq = is_feiq_plus_plus(&from.version);
 	                            let data = build_directory_listing(
 	                                *packet_no,
 	                                &self_name,
 	                                &self_host,
 	                                &self_version,
 	                                &files,
+	                                peer_is_feiq,
 	                            );
 	                            let _ = network_for_dispatch.send_to(&from.ip, from.port, &data).await;
 	                        }
@@ -999,9 +1001,31 @@ impl Engine {
 
     // ─── File Task Management ─────────────────────────────────
 
+    /// Cleanup threshold: terminal tasks older than this many seconds are removed.
+    const CLEANUP_FILE_TASK_AGE_SECS: i64 = 60;
+
+    /// Remove file tasks that have been in a terminal state for more than
+    /// CLEANUP_FILE_TASK_AGE_SECS seconds. Prevents HashMap memory leak.
+    pub fn cleanup_file_tasks(&self) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        let mut tasks = self.file_tasks.lock().unwrap();
+        tasks.retain(|_id, handle| {
+            let snap = handle.snapshot();
+            match snap.terminal_at {
+                Some(ts) if now - ts >= Self::CLEANUP_FILE_TASK_AGE_SECS => false,
+                _ => true,
+            }
+        });
+    }
+
     /// Register a file transfer task and return its local task ID.
+    /// Automatically prunes stale terminal tasks before inserting.
     pub fn register_file_task(&self, task: FileTaskHandle) -> u64 {
         let task_id = task.snapshot().id;
+        self.cleanup_file_tasks();
         let mut tasks = self.file_tasks.lock().unwrap();
         tasks.insert(task_id, Arc::new(task));
         task_id
@@ -1017,6 +1041,12 @@ impl Engine {
         if let Some(task) = self.file_tasks.lock().unwrap().get(&task_id) {
             task.request_cancel();
             task.set_canceled();
+            let snap = task.snapshot();
+            let _ = self.event_tx.send(FrontendEvent::FileStateChanged {
+                task_id,
+                state: FileTaskState::Canceled,
+                message: format!("Canceled: {}", snap.content.filename),
+            });
         }
     }
 
@@ -1076,8 +1106,8 @@ impl Engine {
         fc.packet_no = packet_no;
         fc.local_task_id = Some(task_id);
 
-        // Look up peer info (port, relay peer ID, display name)
-        let (port, relay_peer_id, fellow_name) = {
+        // Look up peer info (port, relay peer ID, display name, version)
+        let (port, relay_peer_id, fellow_name, is_feiq) = {
             let contacts = self.contacts.lock().unwrap();
             let fellow = contacts.find_by_ip(ip);
             let port = fellow.as_ref().map(|f| f.port).unwrap_or(2425);
@@ -1085,10 +1115,14 @@ impl Engine {
                 PeerSource::RelayPeer(id) => Some(id.clone()),
                 _ => None,
             });
+            let is_feiq = fellow
+                .as_ref()
+                .map(|f| is_feiq_plus_plus(&f.version))
+                .unwrap_or(false);
             let fellow_name = fellow
                 .map(|f| f.display_name().to_string())
                 .unwrap_or_else(|| ip.to_string());
-            (port, relay_peer_id, fellow_name)
+            (port, relay_peer_id, fellow_name, is_feiq)
         };
 
         // Create and register file task
@@ -1108,6 +1142,7 @@ impl Engine {
             &self.config.host,
             &self.version,
             &fc,
+            is_feiq,
         );
 
         // Send via relay or UDP
@@ -1370,6 +1405,9 @@ fn handle_network_event(
                             if fc.file_type != IPMSG_FILE_DIR {
                                 let task_id =
                                     NEXT_FILE_TASK_ID.fetch_add(1, Ordering::Relaxed);
+                                // Propagate packet_no from UDP header so the receiver's
+                                // GETFILEDATA request can match the sender's upload task
+                                fc.packet_no = post.packet_no.parse::<u64>().unwrap_or(0);
                                 fc.local_task_id = Some(task_id);
                                 let task = FileTaskHandle::new(
                                     task_id,
@@ -1629,12 +1667,19 @@ pub fn build_file_message(
     host: &str,
     version: &str,
     content: &FileContent,
+    is_feiq_plus_plus: bool,
 ) -> Vec<u8> {
     let mut body = vec![MSG_NULL]; // starts with null byte (no text)
-    let filename_gbk = encode_gbk(&content.filename.replace(':', "::"));
+    let filename_safe = content.filename.replace(':', "::");
+
+    let filename_bytes: Vec<u8> = if is_feiq_plus_plus {
+        filename_safe.into_bytes()
+    } else {
+        encode_gbk(&filename_safe)
+    };
 
     write!(&mut body, "{}:", content.file_id).unwrap();
-    body.extend_from_slice(&filename_gbk);
+    body.extend_from_slice(&filename_bytes);
     write!(
         &mut body,
         ":{:X}:{:X}:{:X}:",
@@ -1643,12 +1688,17 @@ pub fn build_file_message(
     .unwrap();
     body.push(FILELIST_SEPARATOR);
 
+    let mut cmd = IPMSG_SENDMSG | IPMSG_FILEATTACHOPT;
+    if is_feiq_plus_plus {
+        cmd |= IPMSG_UTF8OPT;
+    }
+
     pack_message(
         packet_no,
         name,
         host,
         version,
-        IPMSG_SENDMSG | IPMSG_FILEATTACHOPT,
+        cmd,
         &body,
     )
 }
@@ -1661,14 +1711,21 @@ pub fn build_directory_listing(
     host: &str,
     version: &str,
     files: &[FileContent],
+    is_feiq_plus_plus: bool,
 ) -> Vec<u8> {
     let mut body = vec![MSG_NULL]; // starts with null byte (no text)
 
     for content in files {
-        let filename_gbk = encode_gbk(&content.filename.replace(':', "::"));
+        let filename_safe = content.filename.replace(':', "::");
+
+        let filename_bytes: Vec<u8> = if is_feiq_plus_plus {
+            filename_safe.into_bytes()
+        } else {
+            encode_gbk(&filename_safe)
+        };
 
         write!(&mut body, "{}:", content.file_id).unwrap();
-        body.extend_from_slice(&filename_gbk);
+        body.extend_from_slice(&filename_bytes);
         write!(
             &mut body,
             ":{:X}:{:X}:{:X}:",
@@ -1678,12 +1735,17 @@ pub fn build_directory_listing(
         body.push(FILELIST_SEPARATOR);
     }
 
+    let mut cmd = IPMSG_SENDMSG | IPMSG_FILEATTACHOPT;
+    if is_feiq_plus_plus {
+        cmd |= IPMSG_UTF8OPT;
+    }
+
     pack_message(
         packet_no,
         name,
         host,
         version,
-        IPMSG_SENDMSG | IPMSG_FILEATTACHOPT,
+        cmd,
         &body,
     )
 }

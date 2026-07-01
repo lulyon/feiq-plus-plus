@@ -378,6 +378,10 @@ pub struct FileTask {
     pub total: i64,
     #[serde(default)]
     pub cancel_pending: bool,
+    /// Unix timestamp (epoch seconds) when this task entered a terminal state.
+    /// None means the task is still active. Used for cleanup of old terminal tasks.
+    #[serde(default)]
+    pub terminal_at: Option<i64>,
 }
 
 #[cfg(test)]

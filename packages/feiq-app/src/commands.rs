@@ -339,8 +339,17 @@ pub async fn download_file(
             message: format!("Downloading: {}", snap.content.filename),
         });
 
+        // Look up the contact port while holding the engine lock to avoid
+        // racing with contact updates (e.g. a newly-arrived BR_BROADCAST
+        // that changes the fellow's port between Phase 1 and Phase 2).
+        let peer_port = engine
+            .find_contact(&snap.fellow_ip)
+            .map(|f| f.port)
+            .unwrap_or(2425);
+
         let task_info = (
             snap.fellow_ip.clone(),
+            peer_port,
             snap.content.packet_no,
             snap.content.file_id,
             snap.content.size,
@@ -355,15 +364,18 @@ pub async fn download_file(
         (task, task_info, event_tx, network)
     };
 
-    let (peer_ip, packet_no, file_id, total, filename) = task_info;
-    let peer_port = {
-        // Read the actual port from the contact book (not hardcoded 2425)
-        let engine = state.engine.lock().await;
-        engine
-            .find_contact(&peer_ip)
-            .map(|f| f.port)
-            .unwrap_or(2425)
-    };
+    let (peer_ip, peer_port, packet_no, file_id, total, filename) = task_info;
+
+    // Guard: relay peers use WebSocket, not direct TCP — file transfer not yet supported
+    if peer_ip.starts_with("relay:") {
+        task.set_error("File download not supported for relay peers".into());
+        let _ = event_tx.send(FrontendEvent::FileStateChanged {
+            task_id,
+            state: FileTaskState::Error("File download not supported for relay peers".into()),
+            message: format!("Cannot download from relay peer: {}", filename),
+        });
+        return Err("File download not supported for relay peers. Use direct LAN connection.".into());
+    }
 
     // Phase 2: TCP transfer (engine lock released)
     let mut ft = network
