@@ -58,8 +58,13 @@ export function SettingsDialog({ onClose }: Props) {
 
   const save = async () => {
     if (!config) return;
-    await invoke("update_settings", { config }).catch(console.error);
-    onClose();
+    try {
+      await invoke("update_settings", { config });
+      onClose();
+    } catch (e) {
+      console.error("Failed to save settings:", e);
+      // Don't close dialog on failure — user can retry
+    }
   };
 
   const handleExport = async () => {

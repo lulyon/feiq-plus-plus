@@ -218,33 +218,51 @@ impl HistoryDb {
 
     /// Drain and return all pending messages for a contact (for delivery)
     pub fn drain_pending(&self, contact_ip: &str) -> anyhow::Result<Vec<PendingMessage>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, contact_ip, message_type, payload_json, created_at
-             FROM pending_messages WHERE contact_ip = ?1 ORDER BY created_at",
-        )?;
+        // Wrap SELECT + DELETE in a transaction so a crash between the two
+        // doesn't cause duplicate delivery on next startup.
+        self.conn.execute_batch("BEGIN IMMEDIATE")?;
 
-        let rows = stmt.query_map(params![contact_ip], |row| {
-            Ok(PendingMessage {
-                id: row.get(0)?,
-                contact_ip: row.get(1)?,
-                message_type: row.get(2)?,
-                payload_json: row.get(3)?,
-                created_at: row.get(4)?,
-            })
-        })?;
+        let result = (|| -> anyhow::Result<Vec<PendingMessage>> {
+            let mut stmt = self.conn.prepare(
+                "SELECT id, contact_ip, message_type, payload_json, created_at
+                 FROM pending_messages WHERE contact_ip = ?1 ORDER BY created_at",
+            )?;
 
-        let mut result = Vec::new();
-        for row in rows {
-            result.push(row?);
+            let rows = stmt.query_map(params![contact_ip], |row| {
+                Ok(PendingMessage {
+                    id: row.get(0)?,
+                    contact_ip: row.get(1)?,
+                    message_type: row.get(2)?,
+                    payload_json: row.get(3)?,
+                    created_at: row.get(4)?,
+                })
+            })?;
+
+            let mut result = Vec::new();
+            for row in rows {
+                result.push(row?);
+            }
+
+            // Delete delivered messages (in same transaction)
+            self.conn.execute(
+                "DELETE FROM pending_messages WHERE contact_ip = ?1",
+                params![contact_ip],
+            )?;
+
+            Ok(result)
+        })();
+
+        match result {
+            Ok(data) => {
+                self.conn.execute_batch("COMMIT")?;
+                Ok(data)
+            }
+            Err(e) => {
+                // Rollback on any error to prevent dangling transaction
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(e)
+            }
         }
-
-        // Delete delivered messages
-        self.conn.execute(
-            "DELETE FROM pending_messages WHERE contact_ip = ?1",
-            params![contact_ip],
-        )?;
-
-        Ok(result)
     }
 
     // ─── Groups ───────────────────────────────────────────────

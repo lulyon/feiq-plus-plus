@@ -434,6 +434,8 @@ impl Engine {
         if let Some(ref network) = self.network {
             let exit_data = build_br_exit(&self.config.name, &self.config.host, &self.version);
             let _ = network.broadcast(&exit_data).await;
+            // Signal the UDP receive loop to stop
+            network.shutdown();
         }
         if let Some(ref relay) = self.relay_client {
             relay.shutdown();

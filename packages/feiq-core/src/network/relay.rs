@@ -87,6 +87,10 @@ pub struct RelayClient {
     event_tx: mpsc::UnboundedSender<NetworkEvent>,
     shutdown: Arc<AtomicBool>,
     protocol_chain: ProtocolChain,
+    /// Shared write channel to the active WebSocket's write task.
+    /// Set when connected, cleared on disconnect. Used by send_to/broadcast
+    /// to reuse the persistent connection instead of opening a new one per message.
+    ws_write_tx: Arc<std::sync::Mutex<Option<mpsc::UnboundedSender<String>>>>,
 }
 
 impl RelayClient {
@@ -110,6 +114,7 @@ impl RelayClient {
             event_tx,
             shutdown: Arc::new(AtomicBool::new(false)),
             protocol_chain: crate::protocol::parser::build_default_chain(),
+            ws_write_tx: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -221,14 +226,14 @@ impl RelayClient {
             .send(Message::Text(join_msg.to_string()))
             .await?;
 
-        // Store ws_tx for send_to/broadcast (via a channel)
+        // Channel for outbound messages from send_to/broadcast (engine side)
+        // to the write task (WS side). This avoids opening a new WS connection
+        // per message.
         let (tx, mut rx) = mpsc::unbounded_channel::<String>();
-        // Store the tx end so send_json can use it
         let send_tx = tx.clone();
-        // We need to share send_tx. Thread-local approach: store in a Mutex.
-        // For simplicity, use an Arc<Mutex<Option>> wrapped sender.
-        // But we need to be able to call send_json from &self.
-        // Trade-off: use a dedicated tokio task as WS writer bridge.
+        // Share with send_json() so engine-triggered send_to/broadcast reuse
+        // the persistent WS connection instead of opening a new one.
+        *self.ws_write_tx.lock().unwrap() = Some(tx);
 
         let writer_handle = tokio::spawn(async move {
             loop {
@@ -281,6 +286,9 @@ impl RelayClient {
             }
         }
 
+        // Clear shared write channel on disconnect so send_json returns error
+        // instead of queuing messages that will never be sent.
+        *self.ws_write_tx.lock().unwrap() = None;
         writer_handle.abort();
         Ok(())
     }
@@ -423,13 +431,17 @@ impl RelayClient {
     }
 
     async fn send_json(&self, msg: &serde_json::Value) -> anyhow::Result<()> {
-        // For now, connect+send inline (used by send_to/broadcast from engine).
-        // This reconnects each time — not ideal for perf but correct.
-        // In hybrid mode, engine calls send_to → we connect, send, disconnect.
-        let url = &self.url;
-        let (mut ws, _) = connect_async(url).await?;
-        ws.send(Message::Text(msg.to_string())).await?;
-        ws.close(None).await?;
-        Ok(())
+        // Use the persistent WebSocket connection's write channel instead of
+        // opening a new connection per message (which would require a new Join
+        // handshake and be silently dropped by the server).
+        let tx_guard = self.ws_write_tx.lock().unwrap();
+        match tx_guard.as_ref() {
+            Some(tx) => {
+                tx.send(msg.to_string())
+                    .map_err(|e| anyhow::anyhow!("Relay send channel closed: {e}"))?;
+                Ok(())
+            }
+            None => Err(anyhow::anyhow!("Relay not connected — call run() first")),
+        }
     }
 }

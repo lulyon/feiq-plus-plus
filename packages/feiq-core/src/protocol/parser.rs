@@ -257,10 +257,13 @@ impl RecvProtocol for RecvText {
     }
 }
 
-/// Parse text message with optional {format} suffix
+/// Parse text message with optional {format} suffix.
+/// The format suffix, if present, is at the END of the message (FeiQ convention).
 fn parse_text_content(raw: &str) -> Content {
-    // Check for {format} suffix: text{format}
-    if let Some(begin) = raw.find('{') {
+    // Check for {format} suffix at the END: text{format}
+    // Use rfind to match the LAST '{' to avoid treating user-entered braces
+    // in the middle of the message as format delimiters.
+    if let Some(begin) = raw.rfind('{') {
         if let Some(end) = raw[begin + 1..].find('}') {
             let text = raw[..begin].to_string();
             let format = raw[begin + 1..begin + 1 + end].to_string();

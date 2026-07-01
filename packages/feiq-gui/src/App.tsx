@@ -82,7 +82,7 @@ export default function App() {
         timestamp,
         direction: "received",
       });
-    });
+    }).then((fn) => unlisteners.push(fn));
 
     // File progress events
     listen<{ taskId: number; progress: number; total: number }>(

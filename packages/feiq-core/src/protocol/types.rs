@@ -108,6 +108,42 @@ impl Fellow {
             changed = true;
         }
 
+        // Propagate version (may change on reconnect/reinstall)
+        if !other.version.is_empty() && self.version != other.version {
+            self.version = other.version.clone();
+            changed = true;
+        }
+
+        // Propagate host name
+        if !other.host.is_empty() && self.host != other.host {
+            self.host = other.host.clone();
+            changed = true;
+        }
+
+        // Propagate port (may change on reconnect)
+        if other.port != 0 && self.port != other.port {
+            self.port = other.port;
+            changed = true;
+        }
+
+        // Propagate signature (personal status message)
+        if !other.signature.is_empty() && self.signature != other.signature {
+            self.signature = other.signature.clone();
+            changed = true;
+        }
+
+        // Propagate public_key (ECDH key may change on reconnect since keys are ephemeral)
+        if !other.public_key.is_empty() && self.public_key != other.public_key {
+            self.public_key = other.public_key.clone();
+            changed = true;
+        }
+
+        // Propagate source (may change: LanPeer -> RelayPeer or vice versa on reconnect)
+        if self.source != other.source {
+            self.source = other.source.clone();
+            changed = true;
+        }
+
         changed
     }
 

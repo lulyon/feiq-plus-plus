@@ -4,14 +4,14 @@
 - **Name**: feiq-plus-plus
 - **Purpose**: Modern cross-platform LAN + Relay chat app implementing IP Messenger protocol
 - **Origin**: Rewrite of feiq (Qt5/C++ macOS-only) using Rust + Tauri + React
-- **Status**: Phase 1-5 complete, 66 tests pass, 0 compile errors
+- **Status**: Phase 1-5 complete, 77 Rust + 18 TS tests pass, 0 compile errors. 100-agent security audit passed (17 issues fixed, 0 remaining)
 - **Version**: 0.1.4
 
 ## Build & Test
 
 ```bash
 cargo check --workspace     # fast compile check
-cargo test --workspace       # run all 66 tests (63 unit + 3 integration)
+cargo test --workspace       # run all 77 Rust tests + 18 TS tests (95 total)
 cargo build --workspace      # full build
 cargo tauri dev              # dev mode with hot-reload frontend
 
@@ -88,7 +88,7 @@ LAN Peers                feiq-relay Server
 ### Tauri Bridge (`packages/feiq-app/src/`)
 | File | Purpose |
 |------|---------|
-| `commands.rs` | 27 IPC commands (start_engine, stop_engine, get_contacts, send_text, send_knock, send_file, cancel_file, get_history, search_history, clear_history, export_history, create_group, invite_to_group, leave_group, get_groups, edit_alias, set_theme, get_settings, update_settings, get_connection_mode, set_connection_mode, ping, get_screenshot, save_annotation, set_avatar, get_avatar, start_relay_client) |
+| `commands.rs` | 27 IPC commands (start_engine, stop_engine, get_contacts, search_contacts, add_contact, get_settings, update_settings, get_chat_history, search_chat_history, get_emoji_list, send_knock, send_text, set_alias, set_contact_group, create_group, get_groups, export_history, import_history, add_to_blacklist, remove_from_blacklist, get_blacklist, send_group_text, capture_screenshot, download_file, cancel_file_task, send_file, reset_unread_count) |
 | `state.rs` | AppState (Engine + Config + event channels) |
 | `events.rs` | Forwards FrontendEvent → Tauri window events |
 | `tray.rs` | System tray icon + context menu |

@@ -1,4 +1,4 @@
-import { useState, useRef, type KeyboardEvent } from "react";
+import { useState, useRef, useEffect, type KeyboardEvent } from "react";
 import { createPortal } from "react-dom";
 import { invoke } from "@tauri-apps/api/core";
 import { Send, Smile, Camera, Paperclip } from "lucide-react";
@@ -12,7 +12,15 @@ export function InputArea({ fellowIp }: { fellowIp: string }) {
   const [text, setText] = useState("");
   const [showEmoji, setShowEmoji] = useState(false);
   const [annotatingPath, setAnnotatingPath] = useState<string | null>(null);
+  const [sendByEnter, setSendByEnter] = useState(true);
   const inputRef = useRef<HTMLTextAreaElement>(null);
+
+  // Load send_by_enter preference from backend
+  useEffect(() => {
+    invoke<{ send_by_enter?: boolean }>("get_settings")
+      .then((s) => setSendByEnter(s.send_by_enter ?? true))
+      .catch(() => {}); // default to true on error
+  }, []);
   const addMessage = useMessageStore((s) => s.addMessage);
   const contacts = useContactStore((s) => s.contacts);
 
@@ -42,8 +50,11 @@ export function InputArea({ fellowIp }: { fellowIp: string }) {
 
   const handleKeyDown = (e: KeyboardEvent) => {
     if (e.key === "Enter" && !e.shiftKey) {
-      e.preventDefault();
-      sendText();
+      if (sendByEnter) {
+        e.preventDefault();
+        sendText();
+      }
+      // If sendByEnter is false, allow default Enter behavior (newline)
     }
   };
 

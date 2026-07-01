@@ -7,6 +7,7 @@ use crate::protocol::constants::{IPMSG_ANSENTRY, IPMSG_BR_ENTRY, IPMSG_BR_EXIT, 
 use crate::protocol::parser::ProtocolChain;
 use crate::protocol::serializer::parse_raw;
 use super::NetworkEvent;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
@@ -20,6 +21,7 @@ pub struct NetworkManager {
     self_name: String,
     event_tx: mpsc::UnboundedSender<NetworkEvent>,
     port: u16,
+    shutdown: Arc<AtomicBool>,
 }
 
 impl NetworkManager {
@@ -46,7 +48,13 @@ impl NetworkManager {
             self_name,
             event_tx,
             port,
+            shutdown: Arc::new(AtomicBool::new(false)),
         })
+    }
+
+    /// Signal the receive loop to stop
+    pub fn shutdown(&self) {
+        self.shutdown.store(true, Ordering::Relaxed);
     }
 
     /// Get the detected MAC address
@@ -89,21 +97,23 @@ impl NetworkManager {
         Ok((FileTransfer::from_stream(stream), ip))
     }
 
-    /// Start a background task that accepts incoming TCP file transfer connections.
-    /// This ensures the server is listening when a remote peer connects after sending
-    /// GETFILEDATA. The accepted connections must be matched with pending file requests
-    /// in the engine layer.
-    pub fn start_accept_loop(self: &Arc<Self>) {
+    /// Start a background task that accepts incoming TCP file transfer connections
+    /// and queues them for the engine to claim via `accept_queued_transfer()`.
+    /// This prevents the kernel TCP backlog from filling up when multiple peers
+    /// connect simultaneously, without racing with the engine's accept logic.
+    pub fn start_accept_loop(self: &Arc<Self>) -> mpsc::UnboundedReceiver<(FileTransfer, String)> {
+        let (queue_tx, queue_rx) = mpsc::unbounded_channel();
         let this = self.clone();
         tokio::spawn(async move {
             loop {
                 match this.tcp_server.accept().await {
                     Ok((stream, ip)) => {
                         tracing::debug!("TCP server (background) accepted connection from {ip}");
-                        // Drop immediately — the engine opens a separate accept
-                        // when processing GetFileData. This loop ensures the kernel
-                        // TCP backlog doesn't fill up.
-                        drop(stream);
+                        let ft = FileTransfer::from_stream(stream);
+                        if queue_tx.send((ft, ip)).is_err() {
+                            // Engine dropped receiver, shut down
+                            break;
+                        }
                     }
                     Err(e) => {
                         tracing::error!("TCP server accept loop error: {e}");
@@ -112,11 +122,16 @@ impl NetworkManager {
                 }
             }
         });
+        queue_rx
     }
 
-    /// Main receive loop. Runs forever, dispatching parsed packets.
+    /// Main receive loop. Runs until shutdown is signaled.
     pub async fn run(&self) -> anyhow::Result<()> {
         loop {
+            if self.shutdown.load(Ordering::Relaxed) {
+                tracing::info!("NetworkManager receive loop shutting down");
+                break;
+            }
             match self.udp.recv_from().await {
                 Ok((data, ip, port)) => {
                     tracing::trace!("UDP recv {} bytes from {ip}:{port}", data.len());
@@ -128,6 +143,7 @@ impl NetworkManager {
                 }
             }
         }
+        Ok(())
     }
 
     /// Parse and dispatch a single received packet

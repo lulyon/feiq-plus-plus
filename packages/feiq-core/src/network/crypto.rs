@@ -14,11 +14,21 @@ const NONCE_LEN: usize = 12;
 const TAG_LEN: usize = 16;
 const KEY_LEN: usize = 32;
 
-/// Counter-based nonce sequence for AES-GCM
+/// Counter-based nonce sequence for AES-GCM.
+///
+/// Initialized with a random prefix to prevent nonce reuse when the same
+/// ECDH shared secret is re-derived across reconnections (peer leaves and
+/// re-joins). Without this, a new session with the same shared secret would
+/// restart the counter at zero, reusing nonces and breaking AES-GCM security.
 struct CounterNonceSequence([u8; NONCE_LEN]);
 
 impl CounterNonceSequence {
-    fn new() -> Self { Self([0u8; NONCE_LEN]) }
+    fn new() -> Self {
+        let rng = SystemRandom::new();
+        let mut nonce = [0u8; NONCE_LEN];
+        rng.fill(&mut nonce[..4]).expect("OS RNG should not fail during nonce initialization");
+        Self(nonce)
+    }
 }
 
 impl NonceSequence for CounterNonceSequence {

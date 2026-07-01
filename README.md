@@ -6,37 +6,49 @@
 
 ### 即时通讯
 - 文本消息收发、96 种 QQ 风格表情内联渲染
-- 窗口抖动 (Knock)、正在输入状态提示
+- 窗口抖动 (Knock)
 - 离线消息（上线后自动送达）
 - Enter / Ctrl+Enter 发送切换
 
 ### 文件传输
-- 单文件 + 文件夹传输，支持 4GB+ 大文件
-- 实时进度显示、断点续传
-- 拖拽发送、速度限制
-- 局域网极速 (10~100MB/s)
+- 单文件传输，支持大文件 (>100GB)
+- 实时进度显示、取消/续传
+- 拖拽发送
+- 64KB 分块传输
 
 ### 群组
 - 无服务器 P2P 聊天室，无限创建群组
-- 群发消息、分组群发、群文件共享
+- 群发消息、P2P 群组分发
+
+### 跨网络通信
+- 自建 Rust WebSocket 中继服务器 `feiq-relay`
+- 三种连接模式：纯局域网 / 纯中继 / 混合模式
+- 跨子网自动去重 (MAC 地址索引)
+- 离线消息 24h TTL 服务器端队列
 
 ### 安全
 - feiq++ 间 ECDH (x25519) + AES-256-GCM 端到端加密
 - 密封消息 (阅后即焚)
+- 随机数前缀防重放
 
 ### 用户管理
 - 好友分组树、自定义备注名/别名编辑、个性签名
-- 黑名单、隐身模式
-- 拼音首字母搜索、自定义广播网段
+- 黑名单过滤
+- 名称/IP 搜索、自定义广播网段
 
 ### 聊天记录
 - SQLite 持久化存储、无限滚动加载历史
 - 全文搜索、日期分隔线、JSON 导出/导入
 
 ### 个性化
-- 明/暗/自动跟随系统主题 (CSS 变量 + Tailwind v4 @theme)
+- 明/暗/自动跟随系统主题 (CSS 变量 + Tailwind)
 - 系统原生通知 + Dock/Taskbar 未读角标
 - 系统托盘快捷操作
+
+### 截图与标注
+- 跨平台截图捕获
+- Canvas 标注工具（自由绘制/矩形/箭头/文字）
+- 标注结果通过文件通道发送
 
 ## 平台支持
 
@@ -81,9 +93,13 @@ feiq-plus-plus/
 │           │                   # FileTransferPanel, ScreenshotAnnotation
 │           └── stores/         # Zustand: contactStore, messageStore,
 │                               # fileTransferStore, groupStore
-├── PLAN.md                     # 完整实现计划
-├── README.md                   # 本文件
-└── Cargo.toml                  # Rust workspace
+├── docs/
+│   ├── PLAN.md                  # 完整实现计划
+│   ├── phase-execution-plan.md  # 详细执行方案
+│   ├── relay-server-design.md   # 中继服务器技术方案
+│   └── RELEASE_NOTES_v0.1.0.md  # 发布说明
+├── README.md                    # 本文件
+└── Cargo.toml                   # Rust workspace
 ```
 
 ## 快速开始
@@ -98,7 +114,7 @@ feiq-plus-plus/
 
 ```bash
 # 克隆项目
-git clone <repo-url>
+git clone https://github.com/lulyon/feiq-plus-plus.git
 cd feiq-plus-plus
 
 # 安装前端依赖
@@ -110,8 +126,9 @@ cargo tauri dev
 # 仅编译 Rust 核心库
 cargo build --workspace
 
-# 运行测试 (66 个测试)
+# 运行全部测试 (77 Rust + 18 TypeScript)
 cargo test --workspace
+npm --prefix packages/feiq-gui test
 
 # 生产构建 + 打包
 cargo tauri build
@@ -158,32 +175,34 @@ feiq_plus_plus#128#MAC地址#0#0#0#1#9
 
 ## 开发
 
-详见 [`PLAN.md`](PLAN.md) 获取完整实现计划和技术决策记录。
+详见 [`docs/PLAN.md`](docs/PLAN.md) 获取完整实现计划和技术决策记录。
 
 ### 运行测试
 
 ```bash
-cargo test --workspace                    # 全部 66 个测试
+cargo test --workspace                    # 全部 77 个 Rust 测试
 cargo test -p feiq-core                   # 仅核心库测试
+npm --prefix packages/feiq-gui test       # 前端 18 个 TypeScript 测试
 ```
 
 ### 代码统计
 
 ```
-Rust 源码:    ~7,400 行 (28 文件, 3 crates)
-React/TS:     ~1,500 行 (9 组件 + 4 stores)
-测试覆盖:     66 个测试, 全部通过
+Rust 源码:    ~8,100 行 (34 文件, 3 crates)
+React/TS:     ~3,500 行 (10 组件 + 4 stores)
+测试覆盖:     95 个测试 (77 Rust + 18 TS), 全部通过
 ```
 
 ## 最近更新 (v0.1.4)
 
-- **中继服务器 (Relay Server)**: 新增独立 WebSocket 中继服务器 `feiq-relay`，支持跨网络聊天。三种连接模式：纯局域网、纯中继、混合模式，自动去重。
-- **文件传输**: 完全实现 IPMSG GETFILEDATA 拉取协议，支持进度追踪、取消/续传，文件任务状态机。
-- **端到端加密**: ECDH (x25519) 密钥交换 + AES-256-GCM，仅 feiq++ 间通信自动启用。
-- **截图标注**: Canvas 截图捕获 + 自由绘画、文字、形状标注，通过文件系统插件导出。
-- **主题系统**: 明/暗/自动跟随系统主题，基于 CSS 变量 + Tailwind v4 `@theme` 指令，可持久化保存。
-- **群组聊天**: 创建群组、邀请/离开、群发消息，P2P 分发无服务端依赖。
-- **聊天记录增强**: 无限滚动历史加载、全文搜索、日期分隔线。
+- **审计修复**: 100-agent 全面审计，修复 17 个问题（含 AES-GCM nonce 重用、中继离线消息丢失、引擎停止泄漏等关键问题）
+- **中继服务器 (Relay Server)**: 独立 WebSocket 中继服务器 `feiq-relay`，跨网络通信。三种连接模式：纯局域网、纯中继、混合模式。修复离线消息队列（稳定 peer_key 路由）
+- **端到端加密**: ECDH (x25519) 密钥交换 + AES-256-GCM，随机 nonce 前缀防重放，仅 feiq++ 间通信自动启用
+- **文件传输**: 完整 IPMSG GETFILEDATA 拉取协议，进度追踪、取消/续传，文件大小安全校验
+- **截图标注**: Canvas 截图捕获 + 自由绘画、文字、形状标注
+- **主题系统**: 明/暗/自动主题，CSS 变量 + Tailwind，持久化保存
+- **群组聊天**: 创建群组、群发消息，P2P 分发无服务端依赖
+- **聊天记录增强**: 无限滚动历史加载、全文搜索、日期分隔线、JSON 导出/导入
 
 ## License
 

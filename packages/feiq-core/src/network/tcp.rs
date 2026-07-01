@@ -255,7 +255,9 @@ impl FileTransfer {
         Ok(sent)
     }
 
-    /// Receive file data and write to disk with progress callback
+    /// Receive file data and write to disk with progress callback.
+    /// Rejects files larger than MAX_FILE_SIZE to prevent DoS attacks
+    /// where a malicious peer declares a fake huge file size.
     pub async fn recv_file<F>(
         &mut self,
         file_path: &str,
@@ -265,6 +267,17 @@ impl FileTransfer {
     where
         F: Fn(i64, i64),
     {
+        const MAX_FILE_SIZE: i64 = 100 * 1024 * 1024 * 1024; // 100 GB sanity limit
+
+        if total_size > MAX_FILE_SIZE {
+            return Err(anyhow::anyhow!(
+                "File size {total_size} exceeds maximum {MAX_FILE_SIZE}"
+            ));
+        }
+        if total_size < 0 {
+            return Err(anyhow::anyhow!("Invalid negative file size: {total_size}"));
+        }
+
         let mut file = tokio::fs::File::create(file_path).await?;
         let mut received: i64 = 0;
         let mut buf = vec![0u8; FILE_CHUNK_SIZE];
