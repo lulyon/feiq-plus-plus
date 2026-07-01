@@ -271,36 +271,6 @@ pub async fn send_group_text(
         .map_err(|e| e.to_string())
 }
 
-// ─── Screenshot (macOS) ─────────────────────────────────────────
-
-#[tauri::command]
-pub async fn capture_screenshot() -> Result<String, String> {
-    let path = format!(
-        "/tmp/feiq_screenshot_{}.png",
-        std::process::id()
-    );
-    let path_clone = path.clone();
-
-    #[cfg(target_os = "macos")]
-    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
-        let _output = std::process::Command::new("screencapture")
-            .args(["-i", &path_clone])
-            .output()?;
-        if std::path::Path::new(&path_clone).exists() {
-            Ok(path_clone)
-        } else {
-            Ok("FALLBACK".to_string()) // User canceled
-        }
-    })
-    .await
-    .map_err(|e| e.to_string())?;
-
-    #[cfg(not(target_os = "macos"))]
-    let result: anyhow::Result<String> = Ok("FALLBACK".to_string());
-
-    result.map_err(|e| e.to_string())
-}
-
 // ─── File Transfer ────────────────────────────────────────────
 
 #[tauri::command]

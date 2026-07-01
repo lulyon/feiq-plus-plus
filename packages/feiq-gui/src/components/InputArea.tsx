@@ -1,17 +1,14 @@
 import { useState, useRef, useEffect, type KeyboardEvent } from "react";
-import { createPortal } from "react-dom";
 import { invoke } from "@tauri-apps/api/core";
-import { Send, Smile, Camera, Paperclip } from "lucide-react";
+import { Send, Smile, Paperclip } from "lucide-react";
 import { useMessageStore } from "../stores/messageStore";
 import { useContactStore } from "../stores/contactStore";
 import { EmojiPicker } from "./EmojiPicker";
-import { ScreenshotAnnotation } from "./ScreenshotAnnotation";
 import { open as dialogOpen } from "@tauri-apps/plugin-dialog";
 
 export function InputArea({ fellowIp }: { fellowIp: string }) {
   const [text, setText] = useState("");
   const [showEmoji, setShowEmoji] = useState(false);
-  const [annotatingPath, setAnnotatingPath] = useState<string | null>(null);
   const [sendByEnter, setSendByEnter] = useState(true);
   const inputRef = useRef<HTMLTextAreaElement>(null);
 
@@ -64,38 +61,6 @@ export function InputArea({ fellowIp }: { fellowIp: string }) {
     inputRef.current?.focus();
   };
 
-  const handleScreenshot = async () => {
-    if (annotatingPath) return; // already annotating a screenshot
-    try {
-      const result = await invoke<string>("capture_screenshot");
-      if (result === "FALLBACK") {
-        // User canceled or platform not supported — open file dialog
-        const filePath = await dialogOpen({
-          multiple: false,
-          filters: [
-            {
-              name: "Images",
-              extensions: ["png", "jpg", "jpeg", "gif", "bmp"],
-            },
-            { name: "All Files", extensions: ["*"] },
-          ],
-        });
-        if (!filePath) return;
-        const path = Array.isArray(filePath) ? filePath[0] : filePath;
-        const fellow = contacts.find((c) => c.ip === fellowIp);
-        if (fellow) {
-          invoke("send_file", { ip: fellow.ip, filePath: path })
-            .catch((e) => console.error("send_file failed:", e));
-        }
-      } else {
-        // Show annotation overlay
-        setAnnotatingPath(result);
-      }
-    } catch (e) {
-      console.error("Screenshot failed:", e);
-    }
-  };
-
   const handleAttachFile = async () => {
     try {
       // No filters — show all files. Platform-native dialogs don't
@@ -126,7 +91,6 @@ export function InputArea({ fellowIp }: { fellowIp: string }) {
   };
 
   return (
-    <>
     <div className="border-t border-border px-4 py-3 bg-surface-alt relative">
       {/* Emoji Picker */}
       {showEmoji && (
@@ -134,15 +98,6 @@ export function InputArea({ fellowIp }: { fellowIp: string }) {
       )}
 
       <div className="flex items-end gap-2">
-        {/* Screenshot button */}
-        <button
-          onClick={handleScreenshot}
-          className="flex-shrink-0 w-8 h-8 flex items-center justify-center
-                     rounded-lg hover:bg-surface-alt text-text-muted transition-colors cursor-pointer mb-1"
-          title="Capture screenshot"
-        >
-          <Camera className="w-5 h-5" />
-        </button>
         {/* File attachment button */}
         <button
           onClick={handleAttachFile}
@@ -182,21 +137,5 @@ export function InputArea({ fellowIp }: { fellowIp: string }) {
         </button>
       </div>
     </div>
-    {annotatingPath && createPortal(
-      <ScreenshotAnnotation
-        imagePath={annotatingPath}
-        onSave={(path) => {
-          setAnnotatingPath(null);
-          const fellow = contacts.find((c) => c.ip === fellowIp);
-          if (fellow) {
-            invoke("send_file", { ip: fellow.ip, filePath: path })
-              .catch((e) => console.error("send_file failed:", e));
-          }
-        }}
-        onCancel={() => setAnnotatingPath(null)}
-      />,
-      document.body
-    )}
-    </>
   );
 }

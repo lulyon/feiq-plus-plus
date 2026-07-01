@@ -88,7 +88,6 @@ fn main() {
             commands::create_group,
             commands::get_groups,
             commands::send_group_text,
-            commands::capture_screenshot,
             commands::export_history,
             commands::import_history,
             commands::add_to_blacklist,
