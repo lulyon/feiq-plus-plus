@@ -205,10 +205,13 @@ fn strip_trailing_nulls_vec(mut data: Vec<u8>) -> Vec<u8> {
 
 // ─── Helper: split with escaped separator (::) ───────────────
 
-/// Split bytes by separator, treating double-separator (::) as escaped single
-pub fn split_allow_separator(data: &[u8], sep: u8) -> Vec<String> {
-    let mut values = Vec::new();
-    let mut current = Vec::new();
+/// Split bytes by separator, treating double-separator (::) as escaped single.
+/// Returns raw byte slices — the caller is responsible for charset decoding.
+/// Previously returned `Vec<String>` via `from_utf8_lossy` which corrupted
+/// GBK-encoded filenames by replacing non-UTF-8 bytes with U+FFFD.
+pub fn split_allow_separator(data: &[u8], sep: u8) -> Vec<Vec<u8>> {
+    let mut values: Vec<Vec<u8>> = Vec::new();
+    let mut current: Vec<u8> = Vec::new();
     let mut i = 0;
 
     while i < data.len() {
@@ -218,8 +221,7 @@ pub fn split_allow_separator(data: &[u8], sep: u8) -> Vec<String> {
                 current.push(sep);
                 i += 2;
             } else {
-                values.push(String::from_utf8_lossy(&current).into_owned());
-                current.clear();
+                values.push(std::mem::take(&mut current));
                 i += 1;
             }
         } else {
@@ -229,7 +231,7 @@ pub fn split_allow_separator(data: &[u8], sep: u8) -> Vec<String> {
     }
 
     if !current.is_empty() {
-        values.push(String::from_utf8_lossy(&current).into_owned());
+        values.push(current);
     }
 
     values
@@ -297,12 +299,12 @@ mod tests {
 
     #[test]
     fn test_split_allow_separator_escaped() {
-        // "file1::txt:1024" -> ["file1:txt", "1024"]
+        // "file1::txt:1024" -> [b"file1:txt", b"1024"]
         let data = b"file1::txt:1024".to_vec();
         let values = split_allow_separator(&data, b':');
         assert_eq!(values.len(), 2);
-        assert_eq!(values[0], "file1:txt");
-        assert_eq!(values[1], "1024");
+        assert_eq!(values[0], b"file1:txt");
+        assert_eq!(values[1], b"1024");
     }
 
     #[test]

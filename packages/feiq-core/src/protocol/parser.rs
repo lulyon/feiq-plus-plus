@@ -334,18 +334,25 @@ impl RecvProtocol for RecvFile {
     }
 }
 
-/// Parse a single file task from bytes
+/// Parse a single file task from raw bytes (may be GBK or UTF-8).
 fn parse_file_task(data: &[u8], is_utf8: bool) -> Option<FileContent> {
     let values = split_allow_separator(data, HLIST_ENTRY_SEPARATOR);
     if values.len() < 5 {
         return None;
     }
 
-    let file_id: u64 = values[0].parse().ok()?;
-    let filename = decode_by_utf8opt(values[1].as_bytes(), is_utf8);
-    let size: i64 = i64::from_str_radix(&values[2], 16).ok()?;
-    let modify_time: i64 = i64::from_str_radix(&values[3], 16).ok()?;
-    let file_type: u32 = u32::from_str_radix(&values[4], 16).ok()?;
+    // Parse numeric fields: file_id, size, modify_time, file_type
+    let file_id_str = String::from_utf8_lossy(&values[0]);
+    let file_id: u64 = file_id_str.parse().ok()?;
+    let size_str = String::from_utf8_lossy(&values[2]);
+    let size: i64 = i64::from_str_radix(&size_str, 16).ok()?;
+    let mtime_str = String::from_utf8_lossy(&values[3]);
+    let modify_time: i64 = i64::from_str_radix(&mtime_str, 16).ok()?;
+    let ftype_str = String::from_utf8_lossy(&values[4]);
+    let file_type: u32 = u32::from_str_radix(&ftype_str, 16).ok()?;
+
+    // Decode filename from raw bytes using the correct charset
+    let filename = decode_by_utf8opt(&values[1], is_utf8);
 
     Some(FileContent {
         file_id,
