@@ -397,7 +397,10 @@ impl RelayClient {
 
         post.from.name = from_name.to_string();
         post.from.source = PeerSource::RelayPeer(from_id.to_string());
-        post.cmd_id = cmd;
+        // Note: post.cmd_id is already set correctly:
+        // - from parse_raw() if it succeeded (includes option flags from wire binary)
+        // - from the None branch above if parse_raw() failed (set to relay's `cmd`)
+        // Do NOT overwrite — relay JSON's ipmsg_cmd may lack flags like IPMSG_ENCRYPTOPT
 
         if let Some(ts) = override_timestamp {
             // Timestamp from offline message

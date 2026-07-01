@@ -274,6 +274,7 @@ export function ChatPanel() {
 
       if (records.length > 0) {
         const msgs: Message[] = records.map((r) => ({
+          id: r.id,
           fromIp: r.contact_ip,
           fromName: r.contact_name,
           contents: parseContentJson(r.content_json),
@@ -339,6 +340,7 @@ export function ChatPanel() {
             return;
           }
           const msgs: Message[] = records.map((r) => ({
+            id: r.id,
             fromIp: r.contact_ip,
             fromName: r.contact_name,
             contents: parseContentJson(r.content_json),
@@ -509,7 +511,7 @@ export function ChatPanel() {
                 const showSeparator = msgDate !== lastDate;
                 lastDate = msgDate;
                 return (
-                  <Fragment key={`${msg.timestamp}-${i}`}>
+                  <Fragment key={`msg-${msg.id ?? `${msg.timestamp}-${i}`}`}>
                     {showSeparator && <DateSeparator label={msgDate} />}
                     <MessageBubble message={msg} />
                   </Fragment>
@@ -555,6 +557,7 @@ function GroupChatPanel({ group }: { group: Group }) {
         if (records.length === 0) return;
         const msgs: Message[] = records
           .map((r) => ({
+            id: r.id,
             fromIp: r.contact_ip,
             fromName: r.contact_name,
             contents: parseContentJson(r.content_json),
@@ -657,7 +660,7 @@ function GroupChatPanel({ group }: { group: Group }) {
                 const showSeparator = msgDate !== lastDate;
                 lastDate = msgDate;
                 return (
-                  <Fragment key={`${msg.timestamp}-${i}`}>
+                  <Fragment key={`msg-${msg.id ?? `${msg.timestamp}-${i}`}`}>
                     {showSeparator && <DateSeparator label={msgDate} />}
                     <MessageBubble message={msg} showFromNameAlways />
                   </Fragment>

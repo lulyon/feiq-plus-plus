@@ -12,11 +12,35 @@ import { useFileTransferStore, type FileTransfer } from "./stores/fileTransferSt
 import { useGroupStore } from "./stores/groupStore";
 import type { Group } from "./stores/groupStore";
 
+/// ─── File transfer helpers ────────────────────────────────────
+
+function isTerminalState(state: string): boolean {
+  return state === "finish" || state === "error" || state === "canceled";
+}
+
+/**
+ * Parse the `message` field from a file-state-changed event.
+ * The backend formats it as "Sending file: <filename>" for uploads
+ * and "File received: <filename>" for downloads.
+ */
+function parseFileMessage(
+  message: string,
+): { filename: string; direction: "upload" | "download" } {
+  if (message.startsWith("Sending file: ")) {
+    return { filename: message.slice("Sending file: ".length), direction: "upload" };
+  }
+  if (message.startsWith("File received: ")) {
+    return { filename: message.slice("File received: ".length), direction: "download" };
+  }
+  return { filename: "", direction: "download" };
+}
+
 export default function App() {
   const upsertContact = useContactStore((s) => s.upsertContact);
   const addMessage = useMessageStore((s) => s.addMessage);
   const setGroups = useGroupStore((s) => s.setGroups);
   const upsertTransfer = useFileTransferStore((s) => s.upsertTransfer);
+  const removeTransfer = useFileTransferStore((s) => s.removeTransfer);
   const selectedIp = useContactStore((s) => s.selectedIp);
 
   // ─── Drag-drop overlay state ───────────────────────────────
@@ -65,30 +89,44 @@ export default function App() {
       "file-progress",
       (event) => {
         const { taskId, progress, total } = event.payload;
+        // Read existing transfer to preserve metadata and avoid
+        // overwriting a terminal state with "running" (out-of-order events)
+        const existing = useFileTransferStore.getState().transfers[taskId];
+        if (existing && isTerminalState(existing.state)) return;
         upsertTransfer({
           taskId,
-          filename: "",
+          filename: existing?.filename ?? "",
           size: total,
           progress,
           state: "running",
-          direction: "download",
+          direction: existing?.direction ?? "download",
         });
       },
     ).then((fn) => unlisteners.push(fn));
 
     // File state changed events
-    listen<{ taskId: number; state: string }>(
+    listen<{ taskId: number; state: string; message: string }>(
       "file-state-changed",
       (event) => {
-        const { taskId, state } = event.payload;
+        const { taskId, state, message } = event.payload;
+        const existing = useFileTransferStore.getState().transfers[taskId];
+        const { filename: extractedFilename, direction: extractedDirection } =
+          parseFileMessage(message);
         upsertTransfer({
           taskId,
-          filename: "",
-          size: 0,
-          progress: 0,
+          filename: existing?.filename || extractedFilename,
+          size: existing?.size || 0,
+          progress: state === "finish" ? (existing?.size ?? 1) : (existing?.progress ?? 0),
           state: state as FileTransfer["state"],
-          direction: "download",
+          direction: existing?.direction || extractedDirection,
         });
+
+        // Auto-remove completed/failed/canceled transfers after 5 seconds
+        if (isTerminalState(state)) {
+          setTimeout(() => {
+            removeTransfer(taskId);
+          }, 5000);
+        }
       },
     ).then((fn) => unlisteners.push(fn));
 

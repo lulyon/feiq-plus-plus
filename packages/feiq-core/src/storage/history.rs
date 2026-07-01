@@ -60,10 +60,11 @@ impl HistoryDb {
                 );
                 CREATE TABLE IF NOT EXISTS groups_info (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    group_name TEXT NOT NULL,
+                    group_name TEXT NOT NULL UNIQUE,
                     member_ips TEXT NOT NULL,
                     created_at INTEGER NOT NULL
-                );",
+                );
+                PRAGMA user_version = 1;",
             )?;
         }
 
@@ -86,6 +87,34 @@ impl HistoryDb {
             )",
             [],
         )?;
+
+        // Migration v1: Add UNIQUE constraint on groups_info.group_name
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap_or(0);
+        if version < 1 {
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS groups_info (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    group_name TEXT NOT NULL,
+                    member_ips TEXT NOT NULL,
+                    created_at INTEGER NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS groups_info_v2 (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    group_name TEXT NOT NULL UNIQUE,
+                    member_ips TEXT NOT NULL,
+                    created_at INTEGER NOT NULL
+                );
+                INSERT INTO groups_info_v2 (group_name, member_ips, created_at)
+                    SELECT group_name, member_ips, created_at
+                    FROM groups_info
+                    WHERE id IN (SELECT MAX(id) FROM groups_info GROUP BY group_name);
+                DROP TABLE groups_info;
+                ALTER TABLE groups_info_v2 RENAME TO groups_info;
+                PRAGMA user_version = 1;",
+            )?;
+        }
 
         Ok(Self { conn })
     }
@@ -223,11 +252,10 @@ impl HistoryDb {
     /// Save a group definition (replaces existing group with same name)
     pub fn save_group(&self, name: &str, member_ips: &[String]) -> anyhow::Result<()> {
         let members_json = serde_json::to_string(member_ips)?;
-        // Delete existing group with same name to prevent duplicates
-        self.conn.execute("DELETE FROM groups_info WHERE group_name = ?1", params![name])?;
         self.conn.execute(
             "INSERT INTO groups_info (group_name, member_ips, created_at)
-             VALUES (?1, ?2, ?3)",
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(group_name) DO UPDATE SET member_ips = excluded.member_ips, created_at = excluded.created_at",
             params![name, members_json, Utc::now().timestamp_millis()],
         )?;
         Ok(())

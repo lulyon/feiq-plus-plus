@@ -6,8 +6,8 @@ use crate::engine::events::FrontendEvent;
 use crate::engine::tasks::FileTaskHandle;
 use crate::model::contacts::ContactBook;
 use crate::network::crypto::{
-    compute_shared_secret, create_decryptor, create_encryptor, decrypt, encrypt, generate_keypair,
-    FeiqDecryptor, FeiqEncryptor, is_feiq_plus_plus,
+    compute_shared_secret, compute_shared_secret_from_raw, create_decryptor, create_encryptor,
+    decrypt, encrypt, generate_keypair, FeiqDecryptor, FeiqEncryptor, is_feiq_plus_plus,
 };
 use crate::network::manager::NetworkManager;
 use crate::network::relay::RelayClient;
@@ -18,7 +18,6 @@ use crate::protocol::serializer::*;
 use crate::protocol::types::*;
 use crate::storage::history::HistoryDb;
 use crate::storage::settings::{AppConfig, ConnectionMode};
-use ring::agreement::EphemeralPrivateKey;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -81,7 +80,9 @@ pub struct Engine {
     /// Per-peer crypto sessions (IP -> encryptor/decryptor) for ECDH+AES-256-GCM
     crypto_sessions: Arc<Mutex<HashMap<String, (FeiqEncryptor, FeiqDecryptor)>>>,
     /// Our current keypair for BR_ENTRY/ANSENTRY broadcast public key
-    our_keypair: Arc<Mutex<Option<(EphemeralPrivateKey, Vec<u8>)>>>,
+    /// Stores raw [u8; 32] private key bytes (clonable, for multi-peer ECDH)
+    /// rather than ring::agreement::EphemeralPrivateKey (single-use, not Clone).
+    our_keypair: Arc<Mutex<Option<([u8; 32], Vec<u8>)>>>,
 }
 
 impl Engine {
@@ -181,7 +182,7 @@ impl Engine {
         self.version = format!("feiq_plus_plus#128#{self_mac}#0#0#0#1#9");
 
         // Ensure keypair and include public key in BR_ENTRY broadcast
-        let our_pub_key = self.ensure_keypair();
+        let our_pub_key = self.ensure_keypair()?;
         let online_data = build_br_entry_ext(&self.config.name, &self.config.host, &self.version, Some(&our_pub_key));
         network.broadcast(&online_data).await?;
 
@@ -245,12 +246,13 @@ impl Engine {
                         if post.from.version.starts_with("feiq_plus_plus") && !post.from.public_key.is_empty() {
                             let peer_ip = &post.from.ip;
                             if !crypto_sessions.lock().unwrap().contains_key(peer_ip) {
-                                let mut kp = our_keypair.lock().unwrap();
-                                if let Some((priv_key, _)) = kp.take() {
-                                    if let Ok(secret) = compute_shared_secret(priv_key, &post.from.public_key) {
-                                        if let Ok((new_priv, new_pub)) = generate_keypair() {
-                                            *kp = Some((new_priv, new_pub));
-                                        }
+                                // Read our broadcast private key WITHOUT taking/consuming it.
+                                // We store raw [u8; 32] bytes which are Copy, so we can clone
+                                // the private key and use it for ECDH with MULTIPLE peers
+                                // without rotating the broadcast keypair.
+                                let kp = our_keypair.lock().unwrap();
+                                if let Some((ref priv_key, _)) = *kp {
+                                    if let Ok(secret) = compute_shared_secret_from_raw(priv_key, &post.from.public_key) {
                                         drop(kp);
                                         let enc = create_encryptor(&secret);
                                         let dec = create_decryptor(&secret);
@@ -303,15 +305,21 @@ impl Engine {
 	                    continue;
 	                }
 
-	                let reply = handle_network_event(
+	                let (reply, recv_reply) = handle_network_event(
                     event,
                     &event_tx,
                     &contacts,
                     &config,
+                    &self_version,
                     &history_udp,
                     Some(&file_tasks_udp),
                     Some(&crypto_sessions),
                 );
+
+                // Send RECVMSG before ANSENTRY reply
+                if let Some((recv_ip, recv_port, recv_data)) = recv_reply {
+                    let _ = network_for_dispatch.send_to(&recv_ip, recv_port, &recv_data).await;
+                }
 
                 if let Some((ip, port)) = reply {
                     let ans_data = if let Some(ref pk) = ans_pub_key {
@@ -392,19 +400,21 @@ impl Engine {
         let config = self.config.clone();
         let history_relay = self.history.clone();
         let file_tasks_relay = self.file_tasks().clone();
+        let version_relay = self.version.clone();
 
         tokio::spawn(async move {
             while let Some(event) = relay_rx.recv().await {
-                handle_network_event(
+                let (_ans_reply, _recv_reply) = handle_network_event(
                     event,
                     &event_tx,
                     &contacts,
                     &config,
+                    &version_relay,
                     &history_relay,
                     Some(&file_tasks_relay),
                     None,
                 );
-                // No ANSENTRY reply for relay peers — server handles presence
+                // No ANSENTRY or RECVMSG reply for relay peers — server handles delivery
             }
         });
 
@@ -796,7 +806,7 @@ impl Engine {
     /// Check whether an IP is blacklisted
     pub fn is_ip_blacklisted(&self, ip: &str) -> bool {
         match self.history {
-            Some(ref history) => history.lock().unwrap().is_blacklisted(ip).unwrap_or(false),
+            Some(ref history) => history.lock().unwrap().is_blacklisted(ip).unwrap_or(true),
             None => false,
         }
     }
@@ -822,7 +832,13 @@ impl Engine {
     /// Get all blacklisted IPs
     pub fn get_blacklist(&self) -> Vec<String> {
         match self.history {
-            Some(ref history) => history.lock().unwrap().get_blacklist().unwrap_or_default(),
+            Some(ref history) => match history.lock().unwrap().get_blacklist() {
+                Ok(list) => list,
+                Err(e) => {
+                    tracing::warn!("Failed to get blacklist from DB: {e}");
+                    Vec::new()
+                }
+            },
             None => Vec::new(),
         }
     }
@@ -832,7 +848,7 @@ impl Engine {
         // Simple: use timestamp millis as ID
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_millis() as u64
     }
 
@@ -898,14 +914,14 @@ impl Engine {
 
     /// Ensure we have a keypair for BR_ENTRY/ANSENTRY broadcasts.
     /// Returns our current public key (32 bytes).
-    fn ensure_keypair(&self) -> Vec<u8> {
+    fn ensure_keypair(&self) -> anyhow::Result<Vec<u8>> {
         let mut kp = self.our_keypair.lock().unwrap();
         if let Some((_, pub_key)) = kp.as_ref() {
-            return pub_key.clone();
+            return Ok(pub_key.clone());
         }
-        let (priv_key, pub_key) = generate_keypair().unwrap();
+        let (priv_key, pub_key) = crate::network::crypto::generate_broadcast_keypair();
         *kp = Some((priv_key, pub_key.clone()));
-        pub_key
+        Ok(pub_key)
     }
 }
 
@@ -1016,10 +1032,10 @@ impl Engine {
 
 // ─── Network event handler (runs in tokio task) ──────────────
 
-/// Check whether an IP is blacklisted (silently returns false if DB unavailable)
+/// Check whether an IP is blacklisted (returns true on DB error to fail closed)
 fn is_ip_blacklisted(ip: &str, history: &Option<Arc<std::sync::Mutex<HistoryDb>>>) -> bool {
     match history {
-        Some(ref h) => h.lock().unwrap().is_blacklisted(ip).unwrap_or(false),
+        Some(ref h) => h.lock().unwrap().is_blacklisted(ip).unwrap_or(true),
         None => false,
     }
 }
@@ -1028,11 +1044,12 @@ fn handle_network_event(
     event: NetworkEvent,
     event_tx: &mpsc::UnboundedSender<FrontendEvent>,
     contacts: &Arc<Mutex<ContactBook>>,
-    _config: &AppConfig,
+    config: &AppConfig,
+    version: &str,
     history: &Option<Arc<std::sync::Mutex<HistoryDb>>>,
-    _file_tasks: Option<&Arc<std::sync::Mutex<HashMap<u64, Arc<FileTaskHandle>>>>>,
+    file_tasks: Option<&Arc<std::sync::Mutex<HashMap<u64, Arc<FileTaskHandle>>>>>,
     crypto_sessions: Option<&Arc<Mutex<HashMap<String, (FeiqEncryptor, FeiqDecryptor)>>>>,
-) -> Option<(String, u16)> {
+) -> (Option<(String, u16)>, Option<(String, u16, Vec<u8>)>) {
     // ─── Blacklist check — drop events from blacklisted IPs ──
     let event_ip = match &event {
         NetworkEvent::FellowOnline(post)
@@ -1040,12 +1057,13 @@ fn handle_network_event(
         | NetworkEvent::FellowOffline(post)
         | NetworkEvent::Message(post) => Some(&post.from.ip),
         NetworkEvent::GetFileData { from, .. } => Some(&from.ip),
+        NetworkEvent::ReleaseFiles { from, .. } => Some(&from.ip),
         NetworkEvent::Error(_) => None,
     };
     if let Some(ip) = event_ip {
         if is_ip_blacklisted(ip, history) {
             tracing::debug!("Dropping event from blacklisted IP: {ip}");
-            return None;
+            return (None, None);
         }
     }
 
@@ -1070,7 +1088,13 @@ fn handle_network_event(
 
             // ─── Drain & deliver offline messages ──────────
             if let Some(ref history) = history {
-                let pending = history.lock().unwrap().drain_pending(&ip).unwrap_or_default();
+                let pending = match history.lock().unwrap().drain_pending(&ip) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        tracing::warn!("Failed to drain pending messages for {ip}: {e}");
+                        Vec::new()
+                    }
+                };
                 if !pending.is_empty() {
                     tracing::info!("Delivering {} offline messages for {}", pending.len(), ip);
                     for msg in &pending {
@@ -1105,7 +1129,7 @@ fn handle_network_event(
             }
 
             // Reply ANSENTRY for mutual discovery (return to caller)
-            Some((ip, port))
+            (Some((ip, port)), None)
         }
         NetworkEvent::FellowAnsEntry(post) => {
             let fellow = post.from;
@@ -1122,7 +1146,7 @@ fn handle_network_event(
                     fellow: display_fellow,
                 });
             }
-            None // ANSENTRY is itself a reply, don't reply to a reply
+            (None, None) // ANSENTRY is itself a reply, don't reply to a reply
         }
         NetworkEvent::FellowOffline(post) => {
             let mut fellow = post.from;
@@ -1130,7 +1154,7 @@ fn handle_network_event(
             let mut book = contacts.lock().unwrap();
             book.upsert(fellow.clone());
             let _ = event_tx.send(FrontendEvent::ContactUpdate { fellow });
-            None
+            (None, None)
         }
         NetworkEvent::Message(mut post) => {
             // ─── Decrypt if IPMSG_ENCRYPTOPT flag is set ──────────
@@ -1142,7 +1166,8 @@ fn handle_network_event(
                             post.extra = plaintext;
                             post.cmd_id &= !IPMSG_ENCRYPTOPT;
                             post.contents.clear();
-                            let text = decode_gbk(&post.extra);
+                            let is_utf8 = is_opt_set(post.cmd_id, IPMSG_UTF8OPT);
+                            let text = decode_by_utf8opt(&post.extra, is_utf8);
                             if !text.is_empty() {
                                 post.contents.push(Content::Text {
                                     text,
@@ -1188,6 +1213,10 @@ fn handle_network_event(
                 }
             });
 
+            // Save fields for RECVMSG before post.from might be moved
+            let recv_sender_ip = post.from.ip.clone();
+            let recv_sender_port = post.from.port;
+
             if !post.contents.is_empty() {
                 let timestamp = post.when.timestamp_millis();
                 let from_name = post.from.display_name().to_string();
@@ -1200,7 +1229,7 @@ fn handle_network_event(
                 );
 
                 // ─── Process file contents: create FileTaskHandle entries ──
-                if let Some(ref ft) = _file_tasks {
+                if let Some(ref ft) = file_tasks {
                     for content in &mut post.contents {
                         if let Content::File(ref mut fc) = content {
                             if fc.file_type != IPMSG_FILE_DIR {
@@ -1280,8 +1309,24 @@ fn handle_network_event(
                 // Update contact book
                 let mut book = contacts.lock().unwrap();
                 book.upsert(post.from);
+            } else {
+                // Contents are empty — still update contact on any message
+                let mut book = contacts.lock().unwrap();
+                book.upsert(post.from);
             }
-            None
+
+            // ─── Auto-reply RECVMSG if SENDCHECKOPT is set ────────────
+            if is_opt_set(post.cmd_id, IPMSG_SENDCHECKOPT) {
+                let recv_data = build_recvmsg(
+                    &post.packet_no,
+                    &config.name,
+                    &config.host,
+                    version,
+                );
+                (None, Some((recv_sender_ip, recv_sender_port, recv_data)))
+            } else {
+                (None, None)
+            }
         }
         NetworkEvent::GetFileData {
             packet_no,
@@ -1298,11 +1343,43 @@ fn handle_network_event(
                 file_id,
                 offset,
             );
-            None
+            (None, None)
+        }
+        NetworkEvent::ReleaseFiles {
+            packet_no,
+            file_id,
+            from,
+        } => {
+            tracing::info!(
+                "ReleaseFiles from {}: packet_no={}, file_id={}",
+                from.ip, packet_no, file_id,
+            );
+            // Find and cancel matching file tasks
+            if let Some(ref ft) = file_tasks {
+                let tasks = ft.lock().unwrap();
+                for (_task_id, task) in tasks.iter() {
+                    let snap = task.snapshot();
+                    if snap.content.packet_no == packet_no
+                        && snap.content.file_id == file_id
+                    {
+                        task.request_cancel();
+                        task.set_canceled();
+                        let _ = event_tx.send(FrontendEvent::FileStateChanged {
+                            task_id: snap.id,
+                            state: FileTaskState::Canceled,
+                            message: format!(
+                                "Peer released file: {}",
+                                snap.content.filename
+                            ),
+                        });
+                    }
+                }
+            }
+            (None, None)
         }
         NetworkEvent::Error(msg) => {
             let _ = event_tx.send(FrontendEvent::Error(msg));
-            None
+            (None, None)
         }
     }
 }

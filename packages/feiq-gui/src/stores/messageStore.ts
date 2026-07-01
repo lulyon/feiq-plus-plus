@@ -18,6 +18,8 @@ export interface Content {
 }
 
 export interface Message {
+  /** Database row id from backend history (undefined for live incoming messages) */
+  id?: number;
   fromIp: string;
   fromName: string;
   contents: Content[];
@@ -61,9 +63,15 @@ export const useMessageStore = create<MessageStore>((set) => ({
   prependMessages: (ip, msgs) =>
     set((state) => {
       const existing = state.messagesByIp[ip] || [];
-      // Avoid duplicates by checking timestamps
+      // Avoid duplicates: prefer id-based dedup (from history), fallback to timestamp
+      const existingIds = new Set(
+        existing.map((m) => m.id).filter((id): id is number => id != undefined),
+      );
       const existingTimestamps = new Set(existing.map((m) => m.timestamp));
-      const newMsgs = msgs.filter((m) => !existingTimestamps.has(m.timestamp));
+      const newMsgs = msgs.filter((m) => {
+        if (m.id != null) return !existingIds.has(m.id);
+        return !existingTimestamps.has(m.timestamp);
+      });
       if (newMsgs.length === 0) return state;
       return {
         messagesByIp: {

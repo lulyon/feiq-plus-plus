@@ -41,6 +41,22 @@ pub fn decode_gbk_lossy(data: &[u8]) -> String {
     decode_gbk(data)
 }
 
+/// Decode bytes according to the UTF8OPT flag.
+/// When `is_utf8opt` is true, decodes as UTF-8; otherwise as GBK.
+pub fn decode_by_utf8opt(data: &[u8], is_utf8opt: bool) -> String {
+    if is_utf8opt {
+        // Strip trailing null byte if present
+        let data = if data.last() == Some(&0) {
+            &data[..data.len() - 1]
+        } else {
+            data
+        };
+        String::from_utf8_lossy(data).into_owned()
+    } else {
+        decode_gbk(data)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

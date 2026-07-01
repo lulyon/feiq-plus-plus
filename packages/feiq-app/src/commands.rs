@@ -222,14 +222,14 @@ pub async fn export_history(state: State<'_, AppState>, path: String) -> Result<
     validate_path(&path)?;
     let engine = state.engine.lock().await;
     let json = engine.export_history().map_err(|e| e.to_string())?;
-    std::fs::write(&path, &json).map_err(|e| e.to_string())
+    tokio::fs::write(&path, &json).await.map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 pub async fn import_history(state: State<'_, AppState>, path: String) -> Result<usize, String> {
     validate_path(&path)?;
     let engine = state.engine.lock().await;
-    let json = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
+    let json = tokio::fs::read_to_string(&path).await.map_err(|e| e.to_string())?;
     engine.import_history(&json).map_err(|e| e.to_string())
 }
 
@@ -309,6 +309,7 @@ pub async fn download_file(
     task_id: u64,
     save_path: String,
 ) -> Result<(), String> {
+    validate_path(&save_path)?;
     // Phase 1: gather task info while holding engine lock
     let (task, task_info, event_tx, network) = {
         let engine = state.engine.lock().await;
@@ -435,6 +436,7 @@ pub async fn send_file(
     ip: String,
     file_path: String,
 ) -> Result<u64, String> {
+    validate_path(&file_path)?;
     let engine = state.engine.lock().await;
     engine
         .send_file_to(&ip, &file_path)

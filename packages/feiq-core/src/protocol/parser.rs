@@ -102,7 +102,8 @@ impl RecvProtocol for RecvAnsEntry {
             // Extract public key if feiq++ peer
             extract_peer_public_key(post);
 
-            let name = decode_gbk(&post.extra);
+            let is_utf8 = is_opt_set(post.cmd_id, IPMSG_UTF8OPT);
+            let name = decode_by_utf8opt(&post.extra, is_utf8);
             if !name.is_empty() {
                 post.from.name = name;
             }
@@ -126,7 +127,8 @@ impl RecvProtocol for RecvBrEntry {
             // Extract public key if feiq++ peer
             extract_peer_public_key(post);
 
-            let name = decode_gbk(&post.extra);
+            let is_utf8 = is_opt_set(post.cmd_id, IPMSG_UTF8OPT);
+            let name = decode_by_utf8opt(&post.extra, is_utf8);
             if !name.is_empty() {
                 post.from.name = name;
             }
@@ -206,7 +208,8 @@ impl RecvProtocol for RecvReadCheck {
                 None => &post.extra[..],
             };
             if !text_bytes.is_empty() {
-                let raw_text = decode_gbk(text_bytes);
+                let is_utf8 = is_opt_set(post.cmd_id, IPMSG_UTF8OPT);
+                let raw_text = decode_by_utf8opt(text_bytes, is_utf8);
                 post.contents.push(Content::Sealed {
                     text: raw_text,
                     format: String::new(),
@@ -244,7 +247,8 @@ impl RecvProtocol for RecvText {
         };
 
         if !text_bytes.is_empty() {
-            let raw_text = decode_gbk(text_bytes);
+            let is_utf8 = is_opt_set(post.cmd_id, IPMSG_UTF8OPT);
+            let raw_text = decode_by_utf8opt(text_bytes, is_utf8);
             let content = parse_text_content(&raw_text);
             post.contents.push(content);
         }
@@ -312,7 +316,8 @@ impl RecvProtocol for RecvFile {
             }
 
             let task_bytes = &file_data[start..end];
-            if let Some(content) = parse_file_task(task_bytes) {
+            let is_utf8 = is_opt_set(post.cmd_id, IPMSG_UTF8OPT);
+            if let Some(content) = parse_file_task(task_bytes, is_utf8) {
                 post.contents.push(Content::File(content));
             }
 
@@ -327,14 +332,14 @@ impl RecvProtocol for RecvFile {
 }
 
 /// Parse a single file task from bytes
-fn parse_file_task(data: &[u8]) -> Option<FileContent> {
+fn parse_file_task(data: &[u8], is_utf8: bool) -> Option<FileContent> {
     let values = split_allow_separator(data, HLIST_ENTRY_SEPARATOR);
     if values.len() < 5 {
         return None;
     }
 
     let file_id: u64 = values[0].parse().ok()?;
-    let filename = decode_gbk(values[1].as_bytes());
+    let filename = decode_by_utf8opt(values[1].as_bytes(), is_utf8);
     let size: i64 = i64::from_str_radix(&values[2], 16).ok()?;
     let modify_time: i64 = i64::from_str_radix(&values[3], 16).ok()?;
     let file_type: u32 = u32::from_str_radix(&values[4], 16).ok()?;
@@ -430,6 +435,40 @@ impl RecvProtocol for RecvGetFileData {
     }
 }
 
+// ─── RecvReleaseFiles: handles IPMSG_RELEASEFILES ───────────
+
+pub struct RecvReleaseFiles;
+
+impl RecvProtocol for RecvReleaseFiles {
+    fn name(&self) -> &str {
+        "RecvReleaseFiles"
+    }
+
+    fn read(&self, post: &mut Post, _chain: &ProtocolChain) -> bool {
+        if !is_cmd_set(post.cmd_id, IPMSG_RELEASEFILES) {
+            return false;
+        }
+
+        // Format: packetNo:fileId:\0
+        let extra_str = String::from_utf8_lossy(&post.extra);
+        let parts: Vec<&str> = extra_str.trim_end_matches(':').split(':').collect();
+        if parts.len() >= 2 {
+            if let (Ok(packet_no), Ok(file_id)) = (
+                parts[0].parse::<u64>(),
+                parts[1].parse::<u64>(),
+            ) {
+                post.get_file_data = Some(GetFileData {
+                    packet_no,
+                    file_id,
+                    offset: 0,
+                });
+            }
+        }
+
+        true // stop chain
+    }
+}
+
 // ─── EndRecv: terminal handler, triggers event if contents exist ──
 
 pub struct EndRecv;
@@ -463,6 +502,7 @@ pub fn build_default_chain() -> ProtocolChain {
     chain.add_handler(Box::new(RecvKnock));
     chain.add_handler(Box::new(RecvFile));
     chain.add_handler(Box::new(RecvGetFileData));
+    chain.add_handler(Box::new(RecvReleaseFiles));
     chain.add_handler(Box::new(EndRecv));
 
     chain

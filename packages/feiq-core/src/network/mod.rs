@@ -27,4 +27,10 @@ pub enum NetworkEvent {
     },
     /// Error in network processing
     Error(String),
+    /// Remote peer released file resources (IPMSG_RELEASEFILES)
+    ReleaseFiles {
+        packet_no: u64,
+        file_id: u64,
+        from: Fellow,
+    },
 }

@@ -1,6 +1,11 @@
+import { useMemo } from "react";
 import { useFileTransferStore, type FileTransfer } from "../stores/fileTransferStore";
 import { invoke } from "@tauri-apps/api/core";
 import { X, Download, Upload } from "lucide-react";
+
+function isTerminal(state: string): boolean {
+  return state === "finish" || state === "error" || state === "canceled";
+}
 
 /** Format file size in human-readable form */
 function formatSize(bytes: number): string {
@@ -105,12 +110,14 @@ function TransferRow({
 
 export function FileTransferPanel() {
   const transfers = useFileTransferStore((s) => s.transfers);
-  const activeTransfers = useFileTransferStore((s) => s.activeTransfers);
 
-  const active = activeTransfers();
+  const allTransfers = Object.values(transfers);
+  const active = useMemo(
+    () => allTransfers.filter((t) => !isTerminal(t.state)),
+    [transfers],
+  );
 
   // Always show if there are any transfers at all (even completed ones briefly)
-  const allTransfers = Object.values(transfers);
   if (allTransfers.length === 0) return null;
 
   const handleCancel = async (taskId: number) => {

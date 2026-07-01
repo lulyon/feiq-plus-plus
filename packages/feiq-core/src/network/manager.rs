@@ -3,7 +3,7 @@
 
 use crate::network::tcp::{FileServer, FileTransfer};
 use crate::network::udp::UdpTransport;
-use crate::protocol::constants::{IPMSG_ANSENTRY, IPMSG_BR_ENTRY, IPMSG_BR_EXIT, IPMSG_RELEASEFILES};
+use crate::protocol::constants::{IPMSG_ANSENTRY, IPMSG_BR_ENTRY, IPMSG_BR_EXIT, IPMSG_GETDIRFILES, IPMSG_GETFILEDATA, IPMSG_RELEASEFILES};
 use crate::protocol::parser::ProtocolChain;
 use crate::protocol::serializer::parse_raw;
 use super::NetworkEvent;
@@ -142,7 +142,10 @@ impl NetworkManager {
         self.protocol_chain.process(&mut post);
 
         // ─── Check for GETFILEDATA (file data request) ────────
-        if let Some(gfd) = post.get_file_data.take() {
+        if (is_cmd_set(post.cmd_id, IPMSG_GETFILEDATA) || is_cmd_set(post.cmd_id, IPMSG_GETDIRFILES))
+            && post.get_file_data.is_some()
+        {
+            let gfd = post.get_file_data.take().unwrap();
             let _ = self.event_tx.send(NetworkEvent::GetFileData {
                 packet_no: gfd.packet_no,
                 file_id: gfd.file_id,
@@ -153,8 +156,13 @@ impl NetworkManager {
         }
 
         // ─── Check for RELEASEFILES ───────────────────────────
-        if is_cmd_set(post.cmd_id, IPMSG_RELEASEFILES) {
-            // TODO: handle file release (clean up pending tasks)
+        if is_cmd_set(post.cmd_id, IPMSG_RELEASEFILES) && post.get_file_data.is_some() {
+            let gfd = post.get_file_data.take().unwrap();
+            let _ = self.event_tx.send(NetworkEvent::ReleaseFiles {
+                packet_no: gfd.packet_no,
+                file_id: gfd.file_id,
+                from: post.from,
+            });
             return;
         }
 
