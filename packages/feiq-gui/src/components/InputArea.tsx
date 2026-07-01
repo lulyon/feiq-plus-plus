@@ -98,9 +98,10 @@ export function InputArea({ fellowIp }: { fellowIp: string }) {
 
   const handleAttachFile = async () => {
     try {
+      // No filters — show all files. Platform-native dialogs don't
+      // support "*" as a file extension wildcard in filter lists.
       const selected = await dialogOpen({
         multiple: true,
-        filters: [{ name: "All Files", extensions: ["*"] }],
       });
       if (!selected) return;
 
