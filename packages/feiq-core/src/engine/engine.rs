@@ -195,6 +195,139 @@ impl Engine {
 
         let network = Arc::new(network);
 
+        // TCP accept loop for incoming file transfers (GETFILEDATA via TCP)
+        let mut tcp_queue_rx = network.start_accept_loop();
+        let file_tasks_tcp = self.file_tasks().clone();
+        let event_tx_tcp = self.event_tx.clone();
+        tokio::spawn(async move {
+            while let Some((mut ft, peer_ip)) = tcp_queue_rx.recv().await {
+                let file_tasks = file_tasks_tcp.clone();
+                let event_tx = event_tx_tcp.clone();
+                tokio::spawn(async move {
+                    // Read GETFILEDATA request: "packet_no:file_id:offset:\0"
+                    let mut buf = [0u8; 256];
+                    let n = match ft.recv(&mut buf).await {
+                        Ok(n) if n > 0 => n,
+                        Ok(_) => {
+                            tracing::debug!("TCP accept: empty request from {peer_ip}");
+                            return;
+                        }
+                        Err(e) => {
+                            tracing::error!("TCP accept: read error from {peer_ip}: {e}");
+                            return;
+                        }
+                    };
+                    // Parse colon-separated format: packet_no:file_id:offset:
+                    let request = String::from_utf8_lossy(&buf[..n]);
+                    let cleaned = request.trim_end_matches('\0').trim_end_matches(':');
+                    let parts: Vec<&str> = cleaned.split(':').collect();
+                    if parts.len() < 2 {
+                        tracing::warn!("TCP accept: malformed GETFILEDATA from {peer_ip}: {request}");
+                        return;
+                    }
+                    let packet_no: u64 = match parts[0].parse() {
+                        Ok(v) => v,
+                        Err(_) => {
+                            tracing::warn!("TCP accept: invalid packet_no from {peer_ip}: {}", parts[0]);
+                            return;
+                        }
+                    };
+                    let file_id: u64 = match parts[1].parse() {
+                        Ok(v) => v,
+                        Err(_) => {
+                            tracing::warn!("TCP accept: invalid file_id from {peer_ip}: {}", parts[1]);
+                            return;
+                        }
+                    };
+                    let offset: i64 = parts.get(2).and_then(|s| s.parse().ok()).unwrap_or(0);
+
+                    // Look up matching upload task by packet_no and file_id
+                    let task = {
+                        let tasks = file_tasks.lock().unwrap();
+                        tasks
+                            .values()
+                            .find(|t| {
+                                let s = t.snapshot();
+                                s.task_type == FileTaskType::Upload
+                                    && s.content.packet_no == packet_no
+                                    && s.content.file_id == file_id
+                            })
+                            .cloned()
+                    };
+
+                    let task = match task {
+                        Some(t) => t,
+                        None => {
+                            tracing::warn!(
+                                "TCP accept: no upload task for \
+                                 packet_no={packet_no} file_id={file_id} \
+                                 from {peer_ip}"
+                            );
+                            // Send error so peer doesn't hang on download
+                            let _ = ft.send(b"ERR: no such file").await;
+                            return;
+                        }
+                    };
+
+                    let snap = task.snapshot();
+                    let file_path = snap.content.path.clone();
+                    let task_id = snap.id;
+                    let filename = snap.content.filename.clone();
+
+                    if task.is_cancel_pending() {
+                        task.set_canceled();
+                        tracing::info!("TCP accept: task {task_id} canceled, skipping");
+                        return;
+                    }
+
+                    task.set_running();
+                    let _ = event_tx.send(FrontendEvent::FileStateChanged {
+                        task_id,
+                        state: FileTaskState::Running,
+                        message: format!("Sending: {filename}"),
+                    });
+
+                    let result = {
+                        let task_for_progress = task.clone();
+                        let tx = event_tx.clone();
+                        ft.send_file(&file_path, offset, |progress, total_size| {
+                            if task_for_progress.update_progress(progress) {
+                                let _ = tx.send(FrontendEvent::FileProgress {
+                                    task_id,
+                                    progress,
+                                    total: total_size,
+                                });
+                            }
+                        })
+                        .await
+                    };
+
+                    match result {
+                        Ok(_) => {
+                            task.set_finish();
+                            let _ = event_tx.send(FrontendEvent::FileStateChanged {
+                                task_id,
+                                state: FileTaskState::Finish,
+                                message: format!("Sent: {filename}"),
+                            });
+                            tracing::info!("TCP accept: file {filename} sent to {peer_ip}");
+                        }
+                        Err(e) => {
+                            task.set_error(e.to_string());
+                            let _ = event_tx.send(FrontendEvent::FileStateChanged {
+                                task_id,
+                                state: FileTaskState::Error(e.to_string()),
+                                message: format!("Send failed: {e}"),
+                            });
+                            tracing::warn!(
+                                "TCP accept: failed to send {filename} to {peer_ip}: {e}"
+                            );
+                        }
+                    }
+                });
+            }
+        });
+
         // UDP receive loop
         let n = network.clone();
         tokio::spawn(async move {
