@@ -97,6 +97,8 @@ fn main() {
             commands::download_file,
             commands::cancel_file_task,
             commands::send_file,
+            commands::send_folder,
+            commands::download_folder,
         ])
         .run(tauri::generate_context!())
         .expect("error while running feiq++");

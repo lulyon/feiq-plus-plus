@@ -5,6 +5,7 @@ use feiq_core::engine::events::FrontendEvent;
 use feiq_core::protocol::types::{FileTaskState, FileTaskType, Fellow};
 use feiq_core::storage::history::MessageRecord;
 use feiq_core::storage::settings::AppConfig;
+use std::io::Write as IoWrite;
 use std::path::PathBuf;
 use tauri::State;
 use tracing;
@@ -427,10 +428,264 @@ pub async fn send_file(
 ) -> Result<u64, String> {
     validate_path(&file_path)?;
     let engine = state.engine.lock().await;
+
+    // Auto-detect: if path is a directory, route to folder transfer
+    let is_dir = std::fs::metadata(&file_path)
+        .map(|m| m.is_dir())
+        .unwrap_or(false);
+
+    if is_dir {
+        engine
+            .send_folder_to(&ip, &file_path)
+            .await
+            .map_err(|e| e.to_string())
+    } else {
+        engine
+            .send_file_to(&ip, &file_path)
+            .await
+            .map_err(|e| e.to_string())
+    }
+}
+
+/// Send a folder notification to a peer (feiq++ only).
+/// Returns the task_id for tracking.
+#[tauri::command]
+pub async fn send_folder(
+    state: State<'_, AppState>,
+    ip: String,
+    folder_path: String,
+) -> Result<u64, String> {
+    validate_path(&folder_path)?;
+    let engine = state.engine.lock().await;
     engine
-        .send_file_to(&ip, &file_path)
+        .send_folder_to(&ip, &folder_path)
         .await
         .map_err(|e| e.to_string())
+}
+
+/// Download a folder from a peer after receiving a folder notification.
+/// Connects via TCP, receives manifest, and downloads all files.
+#[tauri::command]
+pub async fn download_folder(
+    state: State<'_, AppState>,
+    task_id: u64,
+    save_path: String,
+) -> Result<(), String> {
+    use feiq_core::protocol::constants::{
+        FOLDER_FILE_ACK, FOLDER_MANIFEST_REQUEST, FOLDER_TRANSFER_CANCEL,
+        FOLDER_TRANSFER_COMPLETE,
+    };
+    use feiq_core::protocol::types::FileTaskType;
+    use std::path::Path;
+
+    validate_path(&save_path)?;
+
+    // Phase 1: gather task info while holding engine lock
+    let (task, task_info, event_tx, network) = {
+        let engine = state.engine.lock().await;
+        let task = engine.get_file_task(task_id).ok_or("Task not found")?;
+        let snap = task.snapshot();
+
+        if snap.task_type != FileTaskType::Download {
+            return Err("Not a download task".into());
+        }
+        if task.is_cancel_pending() {
+            task.set_canceled();
+            let _ = engine.event_tx().send(FrontendEvent::FolderStateChanged {
+                task_id,
+                state: FileTaskState::Canceled,
+                message: "Download canceled by user".into(),
+            });
+            return Err("Download canceled by user".into());
+        }
+
+        // Parse folder metadata from the content filename
+        let folder_meta = snap.content.filename
+            .strip_prefix("__FOLDER__")
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok());
+
+        let folder_name = folder_meta
+            .as_ref()
+            .and_then(|m| m["name"].as_str())
+            .unwrap_or(&snap.content.filename)
+            .to_string();
+        let transfer_id = folder_meta
+            .as_ref()
+            .and_then(|m| m["tid"].as_u64())
+            .unwrap_or(snap.content.packet_no);
+
+        // Look up peer port
+        let peer_port = engine
+            .find_contact(&snap.fellow_ip)
+            .map(|f| f.port)
+            .unwrap_or(2425);
+
+        let task_info = (
+            snap.fellow_ip.clone(),
+            peer_port,
+            transfer_id,
+            folder_name,
+        );
+        let event_tx = engine.event_tx().clone();
+        let network = engine.network().ok_or("Network not available")?.clone();
+
+        (task, task_info, event_tx, network)
+    };
+
+    let (peer_ip, peer_port, transfer_id, folder_name) = task_info;
+
+    // Set task to running
+    task.set_running();
+    let _ = event_tx.send(FrontendEvent::FolderStateChanged {
+        task_id,
+        state: FileTaskState::Running,
+        message: format!("Downloading folder: {folder_name}"),
+    });
+
+    // Connect TCP
+    let mut ft = network
+        .connect_for_file(&peer_ip, peer_port)
+        .await
+        .map_err(|e| {
+            task.set_error(e.to_string());
+            let _ = event_tx.send(FrontendEvent::FolderStateChanged {
+                task_id,
+                state: FileTaskState::Error(e.to_string()),
+                message: format!("Connection failed: {e}"),
+            });
+            e.to_string()
+        })?;
+
+    // Send FOLDER_MANIFEST_REQUEST + transfer_id
+    let mut request = FOLDER_MANIFEST_REQUEST.to_vec();
+    write!(&mut request, "{}\n", transfer_id).unwrap();
+    ft.send(&request).await.map_err(|e| {
+        task.set_error(e.to_string());
+        e.to_string()
+    })?;
+
+    // Receive manifest
+    let manifest = ft.recv_folder_manifest().await.map_err(|e| {
+        task.set_error(format!("Failed to receive manifest: {e}"));
+        let _ = event_tx.send(FrontendEvent::FolderStateChanged {
+            task_id,
+            state: FileTaskState::Error(format!("Failed to receive manifest: {e}")),
+            message: format!("Manifest error: {e}"),
+        });
+        format!("{e}")
+    })?;
+
+    let total_files = manifest.total_files;
+    let total_bytes = manifest.total_bytes as i64;
+
+    // Create the base directory
+    let base_dir = Path::new(&save_path);
+    std::fs::create_dir_all(base_dir).map_err(|e| {
+        task.set_error(e.to_string());
+        e.to_string()
+    })?;
+
+    // Download files one by one
+    let mut completed: u32 = 0;
+    let mut overall_bytes: i64 = 0;
+
+    for entry in &manifest.files {
+        if task.is_cancel_pending() {
+            task.set_canceled();
+            let _ = ft.send_marker(FOLDER_TRANSFER_CANCEL).await;
+            let _ = event_tx.send(FrontendEvent::FolderStateChanged {
+                task_id,
+                state: FileTaskState::Canceled,
+                message: "Folder download canceled".into(),
+            });
+            return Err("Download canceled".into());
+        }
+
+        let file_path = base_dir.join(&entry.relative_path);
+
+        // Create parent directories
+        if let Some(parent) = file_path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                task.set_error(format!("Failed to create directory: {e}"));
+                format!("{e}")
+            })?;
+        }
+
+        let file_path_str = file_path.to_string_lossy().to_string();
+
+        // Receive file header (validates we're in sync)
+        let (rel_path, file_size) = ft.recv_folder_file_header().await.map_err(|e| {
+            task.set_error(format!("Failed to receive file header: {e}"));
+            format!("{e}")
+        })?;
+
+        if rel_path != entry.relative_path || file_size != entry.size {
+            task.set_error("Folder transfer protocol mismatch".into());
+            return Err("Protocol mismatch".into());
+        }
+
+        // Receive file content with progress
+        let recv_result = {
+            let tx_clone = event_tx.clone();
+            let rel_clone = entry.relative_path.clone();
+            ft.recv_file(&file_path_str, entry.size as i64, move |progress, total| {
+                let current_overall = overall_bytes + progress;
+                let _ = tx_clone.send(FrontendEvent::FolderProgress {
+                    task_id,
+                    overall_progress: current_overall,
+                    overall_total: total_bytes,
+                    current_file: rel_clone.clone(),
+                    current_file_progress: progress,
+                    current_file_total: total,
+                    files_completed: completed + 1,
+                    total_files,
+                });
+            })
+            .await
+        };
+
+        match recv_result {
+            Ok(_) => {}
+            Err(e) => {
+                task.set_error(format!("Failed to receive {}: {}", entry.relative_path, e));
+                return Err(format!("{e}"));
+            }
+        }
+
+        overall_bytes += entry.size as i64;
+        completed += 1;
+
+        // Send ACK to signal ready for next file
+        let _ = ft.send_marker(FOLDER_FILE_ACK).await;
+
+        let _ = event_tx.send(FrontendEvent::FolderProgress {
+            task_id,
+            overall_progress: overall_bytes,
+            overall_total: total_bytes,
+            current_file: entry.relative_path.clone(),
+            current_file_progress: entry.size as i64,
+            current_file_total: entry.size as i64,
+            files_completed: completed,
+            total_files,
+        });
+    }
+
+    // Receive completion marker
+    match ft.expect_marker(FOLDER_TRANSFER_COMPLETE).await {
+        Ok(true) => {
+            task.set_finish();
+            let _ = event_tx.send(FrontendEvent::FolderStateChanged {
+                task_id,
+                state: FileTaskState::Finish,
+                message: format!("Downloaded folder: {folder_name} ({} files)", completed),
+            });
+            Ok(())
+        }
+        _ => {
+            task.set_error("Transfer incomplete".into());
+            Err("Transfer incomplete".into())
+        }
+    }
 }
 
 // ─── Unread Badge ─────────────────────────────────────────────

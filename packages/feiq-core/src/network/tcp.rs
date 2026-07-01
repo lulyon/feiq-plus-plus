@@ -6,7 +6,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::time::{timeout, Duration};
 
 use crate::protocol::constants::{IPMSG_FILE_DIR, IPMSG_FILE_REGULAR};
-use crate::protocol::types::FileContent;
+use crate::protocol::types::{FileContent, FolderFileEntry, FolderManifest};
 
 /// List files in a directory, returning IPMSG-formatted file entries.
 /// Recursively lists all files under `dir_path`.
@@ -161,6 +161,71 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&path);
+    }
+
+    #[test]
+    fn test_build_folder_manifest_basic() {
+        let (dir_path, path) = create_temp_dir();
+
+        std::fs::write(path.join("a.txt"), "hello").unwrap();
+        std::fs::write(path.join("b.txt"), "world!").unwrap();
+        let sub = path.join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        std::fs::write(sub.join("c.txt"), "nested").unwrap();
+
+        let manifest = super::build_folder_manifest(&dir_path, 12345).unwrap();
+        assert_eq!(manifest.transfer_id, 12345);
+        assert_eq!(manifest.total_files, 3);
+        assert_eq!(manifest.total_bytes, 5 + 6 + 6); // "hello" + "world!" + "nested"
+        assert!(manifest.files.iter().any(|f| f.relative_path == "a.txt"));
+        assert!(manifest.files.iter().any(|f| f.relative_path == "b.txt"));
+        assert!(manifest.files.iter().any(|f| f.relative_path == "sub/c.txt"));
+
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    #[test]
+    fn test_build_folder_manifest_empty_dir() {
+        let (dir_path, path) = create_temp_dir();
+        assert!(super::build_folder_manifest(&dir_path, 1).is_none());
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    #[test]
+    fn test_build_folder_manifest_nonexistent() {
+        assert!(super::build_folder_manifest("/tmp/feiq_nonexistent_98765", 1).is_none());
+    }
+
+    #[test]
+    fn test_folder_manifest_serialization_roundtrip() {
+        use crate::protocol::types::{FolderFileEntry, FolderManifest};
+        let manifest = FolderManifest {
+            transfer_id: 42,
+            folder_name: "test_folder".into(),
+            total_files: 2,
+            total_bytes: 100,
+            files: vec![
+                FolderFileEntry {
+                    relative_path: "a.txt".into(),
+                    size: 50,
+                    modify_time: 1000,
+                },
+                FolderFileEntry {
+                    relative_path: "sub/b.txt".into(),
+                    size: 50,
+                    modify_time: 2000,
+                },
+            ],
+        };
+        let json = serde_json::to_vec(&manifest).unwrap();
+        let decoded: FolderManifest = serde_json::from_slice(&json).unwrap();
+        assert_eq!(decoded.transfer_id, 42);
+        assert_eq!(decoded.folder_name, "test_folder");
+        assert_eq!(decoded.total_files, 2);
+        assert_eq!(decoded.total_bytes, 100);
+        assert_eq!(decoded.files.len(), 2);
+        assert_eq!(decoded.files[0].relative_path, "a.txt");
+        assert_eq!(decoded.files[1].relative_path, "sub/b.txt");
     }
 }
 
@@ -321,4 +386,158 @@ impl FileTransfer {
         let n = self.stream.read(buf).await?;
         Ok(n)
     }
+
+    // ─── Folder transfer protocol methods ────────────────────────
+
+    /// Send the folder manifest as JSON with 4-byte LE u32 length prefix.
+    pub async fn send_folder_manifest(
+        &mut self,
+        manifest: &FolderManifest,
+    ) -> anyhow::Result<()> {
+        let json = serde_json::to_vec(manifest)?;
+        let len = json.len() as u32;
+        self.stream.write_all(&len.to_le_bytes()).await?;
+        self.stream.write_all(&json).await?;
+        Ok(())
+    }
+
+    /// Receive the folder manifest (4-byte LE u32 length prefix + JSON body).
+    pub async fn recv_folder_manifest(&mut self) -> anyhow::Result<FolderManifest> {
+        let mut len_buf = [0u8; 4];
+        self.stream.read_exact(&mut len_buf).await?;
+        let len = u32::from_le_bytes(len_buf) as usize;
+
+        let mut json_buf = vec![0u8; len];
+        self.stream.read_exact(&mut json_buf).await?;
+        let manifest: FolderManifest = serde_json::from_slice(&json_buf)?;
+        Ok(manifest)
+    }
+
+    /// Send a per-file header before streaming file content.
+    /// Format: 4-byte LE u32 path_len + UTF-8 path bytes + 8-byte LE u64 file_size.
+    pub async fn send_folder_file_header(
+        &mut self,
+        relative_path: &str,
+        file_size: u64,
+    ) -> anyhow::Result<()> {
+        let path_bytes = relative_path.as_bytes();
+        let path_len = path_bytes.len() as u32;
+        self.stream.write_all(&path_len.to_le_bytes()).await?;
+        self.stream.write_all(path_bytes).await?;
+        self.stream.write_all(&file_size.to_le_bytes()).await?;
+        Ok(())
+    }
+
+    /// Receive a per-file header.
+    /// Returns (relative_path, file_size).
+    pub async fn recv_folder_file_header(&mut self) -> anyhow::Result<(String, u64)> {
+        let mut path_len_buf = [0u8; 4];
+        self.stream.read_exact(&mut path_len_buf).await?;
+        let path_len = u32::from_le_bytes(path_len_buf) as usize;
+
+        let mut path_buf = vec![0u8; path_len];
+        self.stream.read_exact(&mut path_buf).await?;
+        let relative_path = String::from_utf8(path_buf)
+            .map_err(|e| anyhow::anyhow!("Invalid UTF-8 in folder file path: {e}"))?;
+
+        let mut size_buf = [0u8; 8];
+        self.stream.read_exact(&mut size_buf).await?;
+        let file_size = u64::from_le_bytes(size_buf);
+
+        Ok((relative_path, file_size))
+    }
+
+    /// Send a protocol marker (fixed byte string).
+    pub async fn send_marker(&mut self, marker: &[u8]) -> anyhow::Result<()> {
+        self.stream.write_all(marker).await?;
+        Ok(())
+    }
+
+    /// Read exactly `marker.len()` bytes and compare against the expected marker.
+    pub async fn expect_marker(&mut self, marker: &[u8]) -> anyhow::Result<bool> {
+        let mut buf = vec![0u8; marker.len()];
+        match self.stream.read_exact(&mut buf).await {
+            Ok(_) => Ok(buf == marker),
+            Err(_) => Ok(false),
+        }
+    }
+}
+
+/// Build a `FolderManifest` by walking a directory tree.
+/// Returns None if the path is not a readable directory or is empty.
+pub fn build_folder_manifest(
+    folder_path: &str,
+    transfer_id: u64,
+) -> Option<FolderManifest> {
+    let metadata = std::fs::metadata(folder_path).ok()?;
+    if !metadata.is_dir() {
+        return None;
+    }
+
+    let folder_name = std::path::Path::new(folder_path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("unknown")
+        .to_string();
+
+    let mut files = Vec::new();
+    walk_directory(folder_path, "", &mut files)?;
+
+    if files.is_empty() {
+        return None;
+    }
+
+    let total_bytes: u64 = files.iter().map(|f| f.size).sum();
+
+    Some(FolderManifest {
+        transfer_id,
+        folder_name,
+        total_files: files.len() as u32,
+        total_bytes,
+        files,
+    })
+}
+
+/// Recursively walk a directory, collecting file entries with relative paths.
+fn walk_directory(base_path: &str, relative_prefix: &str, files: &mut Vec<FolderFileEntry>) -> Option<()> {
+    let dir = std::fs::read_dir(base_path).ok()?;
+
+    for entry in dir {
+        let entry = entry.ok()?;
+        let path = entry.path();
+        let name = path.file_name()?.to_str()?.to_string();
+
+        // Skip hidden files
+        if name.starts_with('.') {
+            continue;
+        }
+
+        let metadata = std::fs::metadata(&path).ok()?;
+        let rel_path = if relative_prefix.is_empty() {
+            name.clone()
+        } else {
+            format!("{}/{}", relative_prefix, name)
+        };
+
+        if metadata.is_dir() {
+            let sub_base = path.to_string_lossy().to_string();
+            walk_directory(&sub_base, &rel_path, files)?;
+        } else if metadata.is_file() {
+            let modify_time = metadata
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+
+            files.push(FolderFileEntry {
+                relative_path: rel_path,
+                size: metadata.len(),
+                modify_time,
+            });
+        }
+        // Skip symlinks, devices, etc.
+    }
+
+    Some(())
 }

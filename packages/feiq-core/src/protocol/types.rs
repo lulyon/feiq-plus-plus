@@ -182,6 +182,32 @@ pub struct GetFileData {
     pub offset: i64,
 }
 
+/// Folder transfer manifest sent before file data over TCP
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FolderManifest {
+    /// Unique transfer identifier (matches packet_no from UDP notification)
+    pub transfer_id: u64,
+    /// Folder name (last component of the path)
+    pub folder_name: String,
+    /// Total number of files in the folder tree
+    pub total_files: u32,
+    /// Total bytes of all files combined
+    pub total_bytes: u64,
+    /// All file entries with relative paths from folder root
+    pub files: Vec<FolderFileEntry>,
+}
+
+/// A single file entry within a folder transfer manifest
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FolderFileEntry {
+    /// Relative path from the folder root (e.g., "subdir/file.txt")
+    pub relative_path: String,
+    /// File size in bytes
+    pub size: u64,
+    /// Last modification time (Unix epoch seconds)
+    pub modify_time: i64,
+}
+
 /// Message content enum
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
@@ -214,6 +240,23 @@ pub enum Content {
         #[serde(default)]
         ttl_seconds: u32,
     },
+    #[serde(rename = "folder")]
+    Folder {
+        /// Folder name (last component of the path)
+        name: String,
+        /// Number of files in the folder tree
+        file_count: u32,
+        /// Total size of all files in bytes
+        total_size: u64,
+        /// Transfer ID for TCP handshake (matches packet_no)
+        transfer_id: u64,
+        /// Packet number for protocol routing
+        #[serde(default)]
+        packet_no: u64,
+        /// Local task ID assigned by the engine for tracking
+        #[serde(default)]
+        local_task_id: Option<u64>,
+    },
 }
 
 impl Content {
@@ -225,6 +268,7 @@ impl Content {
             Content::Image { .. } => "image",
             Content::Id { .. } => "id",
             Content::Sealed { .. } => "sealed",
+            Content::Folder { .. } => "folder",
         }
     }
 
@@ -234,6 +278,10 @@ impl Content {
 
     pub fn is_file(&self) -> bool {
         matches!(self, Content::File(_))
+    }
+
+    pub fn is_folder(&self) -> bool {
+        matches!(self, Content::Folder { .. })
     }
 
     pub fn is_knock(&self) -> bool {

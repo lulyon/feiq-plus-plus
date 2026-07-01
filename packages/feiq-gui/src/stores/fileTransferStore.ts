@@ -8,6 +8,14 @@ export interface FileTransfer {
   state: "not_start" | "running" | "finish" | "error" | "canceled";
   direction: "upload" | "download";
   errorMessage?: string;
+  /** Folder transfer specific fields */
+  isFolder?: boolean;
+  folderName?: string;
+  filesCompleted?: number;
+  totalFiles?: number;
+  currentFile?: string;
+  currentFileProgress?: number;
+  currentFileTotal?: number;
 }
 
 interface FileTransferStore {

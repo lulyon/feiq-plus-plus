@@ -126,6 +126,17 @@ pub const HLIST_ENTRY_SEPARATOR: u8 = 0x3A;
 /// Null terminator
 pub const MSG_NULL: u8 = 0x00;
 
+// ─── Folder transfer TCP protocol markers (feiq++ custom) ─────
+
+/// Sent by receiver over TCP to request the folder manifest
+pub const FOLDER_MANIFEST_REQUEST: &[u8] = b"FOLDER_MANIFEST_REQUEST\n";
+/// Sent by sender after all files have been transferred successfully
+pub const FOLDER_TRANSFER_COMPLETE: &[u8] = b"FOLDER_TRANSFER_COMPLETE\n";
+/// Sent by either side to gracefully cancel the folder transfer
+pub const FOLDER_TRANSFER_CANCEL: &[u8] = b"FOLDER_TRANSFER_CANCEL\n";
+/// Sent by receiver to signal it's ready for the next file (acknowledges previous)
+pub const FOLDER_FILE_ACK: &[u8] = b"FOLDER_FILE_ACK\n";
+
 // ─── Helper functions ────────────────────────────────────────
 
 /// Check if command matches (compare low 8 bits)

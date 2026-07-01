@@ -40,6 +40,32 @@ pub enum FrontendEvent {
         state: FileTaskState,
         message: String,
     },
+    /// Folder transfer progress update
+    #[serde(rename = "folder_progress")]
+    FolderProgress {
+        task_id: u64,
+        /// Total bytes transferred so far (across all files)
+        overall_progress: i64,
+        /// Total bytes for all files
+        overall_total: i64,
+        /// Current file's relative path within the folder
+        current_file: String,
+        /// Current file progress in bytes
+        current_file_progress: i64,
+        /// Current file total size in bytes
+        current_file_total: i64,
+        /// Number of files completed (including current if finished)
+        files_completed: u32,
+        /// Total number of files in the folder
+        total_files: u32,
+    },
+    /// Folder transfer state changed
+    #[serde(rename = "folder_state_changed")]
+    FolderStateChanged {
+        task_id: u64,
+        state: FileTaskState,
+        message: String,
+    },
     /// Engine error
     #[serde(rename = "engine_error")]
     Error(String),

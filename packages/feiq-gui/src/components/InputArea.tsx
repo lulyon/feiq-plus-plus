@@ -1,6 +1,6 @@
 import { useState, useRef, useEffect, type KeyboardEvent } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { Send, Smile, Paperclip } from "lucide-react";
+import { Send, Smile, Paperclip, FolderOpen } from "lucide-react";
 import { useMessageStore } from "../stores/messageStore";
 import { useContactStore } from "../stores/contactStore";
 import { EmojiPicker } from "./EmojiPicker";
@@ -16,8 +16,9 @@ export function InputArea({ fellowIp }: { fellowIp: string }) {
   useEffect(() => {
     invoke<{ send_by_enter?: boolean }>("get_settings")
       .then((s) => setSendByEnter(s.send_by_enter ?? true))
-      .catch(() => {}); // default to true on error
+      .catch(() => {});
   }, []);
+
   const addMessage = useMessageStore((s) => s.addMessage);
   const contacts = useContactStore((s) => s.contacts);
 
@@ -38,7 +39,6 @@ export function InputArea({ fellowIp }: { fellowIp: string }) {
     setText("");
     inputRef.current?.focus();
 
-    // Actually send over network
     if (fellow) {
       invoke("send_text", { ip: fellow.ip, text: trimmed })
         .catch((e) => console.error("Send failed:", e));
@@ -51,7 +51,6 @@ export function InputArea({ fellowIp }: { fellowIp: string }) {
         e.preventDefault();
         sendText();
       }
-      // If sendByEnter is false, allow default Enter behavior (newline)
     }
   };
 
@@ -61,21 +60,14 @@ export function InputArea({ fellowIp }: { fellowIp: string }) {
     inputRef.current?.focus();
   };
 
-  const handleAttachFile = async () => {
+  const handleSendFiles = async () => {
     try {
-      // No filters — show all files. Platform-native dialogs don't
-      // support "*" as a file extension wildcard in filter lists.
-      const selected = await dialogOpen({
-        multiple: true,
-      });
+      const selected = await dialogOpen({ multiple: true });
       if (!selected) return;
 
       const paths = Array.isArray(selected) ? selected : [selected];
       const fellow = contacts.find((c) => c.ip === fellowIp);
-      if (!fellow) {
-        console.warn("No contact selected for file send");
-        return;
-      }
+      if (!fellow) { console.warn("No contact selected"); return; }
 
       for (const filePath of paths) {
         if (!filePath) continue;
@@ -86,27 +78,55 @@ export function InputArea({ fellowIp }: { fellowIp: string }) {
         }
       }
     } catch (e) {
-      console.error("File attach dialog failed:", e);
+      console.error("File dialog failed:", e);
+    }
+  };
+
+  const handleSendFolder = async () => {
+    try {
+      const selected = await dialogOpen({ directory: true, multiple: false });
+      if (!selected) return;
+
+      const fellow = contacts.find((c) => c.ip === fellowIp);
+      if (!fellow) { console.warn("No contact selected"); return; }
+
+      try {
+        await invoke("send_folder", { ip: fellow.ip, folderPath: selected as string });
+      } catch (e) {
+        console.error("send_folder failed:", e);
+      }
+    } catch (e) {
+      console.error("Folder dialog failed:", e);
     }
   };
 
   return (
     <div className="border-t border-border px-4 py-3 bg-surface-alt relative">
-      {/* Emoji Picker */}
       {showEmoji && (
         <EmojiPicker onSelect={insertEmoji} onClose={() => setShowEmoji(false)} />
       )}
 
       <div className="flex items-end gap-2">
-        {/* File attachment button */}
+        {/* Send files button */}
         <button
-          onClick={handleAttachFile}
+          onClick={handleSendFiles}
           className="flex-shrink-0 w-8 h-8 flex items-center justify-center
                      rounded-lg hover:bg-surface-alt text-text-muted transition-colors cursor-pointer mb-1"
-          title="Attach file"
+          title="Send file(s)"
         >
           <Paperclip className="w-5 h-5" />
         </button>
+
+        {/* Send folder button */}
+        <button
+          onClick={handleSendFolder}
+          className="flex-shrink-0 w-8 h-8 flex items-center justify-center
+                     rounded-lg hover:bg-surface-alt text-text-muted transition-colors cursor-pointer mb-1"
+          title="Send folder"
+        >
+          <FolderOpen className="w-5 h-5" />
+        </button>
+
         {/* Emoji button */}
         <button
           onClick={() => setShowEmoji(!showEmoji)}
