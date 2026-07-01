@@ -4,7 +4,7 @@
 use feiq_core::engine::engine::{build_ans_entry, build_br_entry, build_knock, build_text_message};
 use feiq_core::network::NetworkEvent;
 use feiq_core::protocol::constants::*;
-use feiq_core::protocol::parser::ProtocolChain;
+
 use feiq_core::protocol::serializer::parse_raw;
 use std::sync::Arc;
 use tokio::net::UdpSocket;
@@ -28,6 +28,7 @@ impl TestPeer {
                 .expect("bind failed"),
         );
         socket.set_broadcast(true).ok();
+        let bound_port = socket.local_addr().unwrap().port();
         let mac = mac_address::get_mac_address()
             .ok()
             .flatten()
@@ -39,7 +40,7 @@ impl TestPeer {
             mac,
             name: name.into(),
             ver,
-            port,
+            port: bound_port,
         }
     }
 
@@ -224,7 +225,7 @@ async fn test_two_instances_exchange_text() {
 
     // ── Test 3c: Verify port is not default when received from non-standard port ──
     let bob2 = Arc::new(TestPeer::new("BobNonStd", 13553).await);
-    let (bob2_tx, mut bob2_rx) = mpsc::unbounded_channel::<NetworkEvent>();
+    let (bob2_tx, _bob2_rx) = mpsc::unbounded_channel::<NetworkEvent>();
     let _b2 = bob2.clone().spawn_recv(bob2_tx);
     sleep(Duration::from_millis(200)).await;
 

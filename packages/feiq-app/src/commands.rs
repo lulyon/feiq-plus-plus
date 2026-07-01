@@ -12,6 +12,14 @@ use tracing;
 
 /// Validate a file path for security (prevent path traversal and access to system files).
 pub fn validate_path(path: &str) -> Result<(), String> {
+    // Reject empty paths
+    if path.is_empty() || path.trim().is_empty() {
+        return Err("Path is empty".into());
+    }
+    // Reject null byte injection
+    if path.contains('\0') {
+        return Err("Path contains null byte".into());
+    }
     let normalized = path.replace('\\', "/");
     if normalized.contains("..") {
         return Err("Path traversal detected: '..' is not allowed".into());
@@ -168,7 +176,7 @@ pub async fn send_knock(state: State<'_, AppState>, ip: String) -> Result<(), St
 pub async fn send_text(state: State<'_, AppState>, ip: String, text: String) -> Result<(), String> {
     let engine = state.engine.lock().await;
     let port = engine.find_contact(&ip).map(|f| f.port).unwrap_or(2425);
-    tracing::info!("send_text to {ip}: contact_port={port}, text={text}");
+    tracing::info!("send_text to {ip}: contact_port={port}");
     engine.send_text_to(&ip, port, &text).await.map_err(|e| e.to_string())
 }
 
@@ -265,7 +273,7 @@ pub async fn send_group_text(
     text: String,
 ) -> Result<(), String> {
     let engine = state.engine.lock().await;
-    tracing::info!("send_group_text to group={group_name}, text={text}");
+    tracing::info!("send_group_text to group={group_name}");
     engine
         .send_text_to_group(&group_name, &text)
         .await
@@ -374,20 +382,24 @@ pub async fn download_file(
         e.to_string()
     })?;
 
-    // Receive file with progress callbacks
+    // Receive file with progress callbacks and cancellation support
     let recv_result = {
         let task_clone = task.clone();
         let tx_clone = event_tx.clone();
-        ft.recv_file(&save_path, total, move |progress, total_size| {
-            let should_notify = task_clone.update_progress(progress);
-            if should_notify {
-                let _ = tx_clone.send(FrontendEvent::FileProgress {
-                    task_id,
-                    progress,
-                    total: total_size,
-                });
-            }
-        })
+        ft.recv_file(
+            &save_path, total,
+            move |progress, total_size| {
+                let should_notify = task_clone.update_progress(progress);
+                if should_notify {
+                    let _ = tx_clone.send(FrontendEvent::FileProgress {
+                        task_id,
+                        progress,
+                        total: total_size,
+                    });
+                }
+            },
+            Some(&*task.cancel_flag),
+        )
         .await
     };
 
@@ -403,11 +415,16 @@ pub async fn download_file(
         }
         Err(e) => {
             task.set_error(e.to_string());
-            let _ = event_tx.send(FrontendEvent::FileStateChanged {
-                task_id,
-                state: FileTaskState::Error(e.to_string()),
-                message: format!("Download failed: {}", e),
-            });
+            // Only emit Error event if task is not already in a terminal state
+            // (e.g., user canceled while I/O was in-flight)
+            let snap = task.snapshot();
+            if snap.state != FileTaskState::Canceled && snap.state != FileTaskState::Finish {
+                let _ = event_tx.send(FrontendEvent::FileStateChanged {
+                    task_id,
+                    state: FileTaskState::Error(e.to_string()),
+                    message: format!("Download failed: {}", e),
+                });
+            }
             Err(e.to_string())
         }
     }
@@ -480,7 +497,10 @@ pub async fn download_folder(
 
     validate_path(&save_path)?;
 
-    // Phase 1: gather task info while holding engine lock
+    // Phase 1: gather task info while holding engine lock.
+    // Set task to running INSIDE the lock to avoid TOCTOU race
+    // where a cancellation could arrive between the lock release
+    // and the set_running() call.
     let (task, task_info, event_tx, network) = {
         let engine = state.engine.lock().await;
         let task = engine.get_file_task(task_id).ok_or("Task not found")?;
@@ -499,6 +519,9 @@ pub async fn download_folder(
             return Err("Download canceled by user".into());
         }
 
+        // Set running inside the lock so cancel can't race through
+        task.set_running();
+
         // Parse folder metadata from the content filename
         let folder_meta = snap.content.filename
             .strip_prefix("__FOLDER__")
@@ -513,6 +536,13 @@ pub async fn download_folder(
             .as_ref()
             .and_then(|m| m["tid"].as_u64())
             .unwrap_or(snap.content.packet_no);
+
+        // Emit Running event inside the lock (belt-and-suspenders with set_running)
+        let _ = engine.event_tx().send(FrontendEvent::FolderStateChanged {
+            task_id,
+            state: FileTaskState::Running,
+            message: format!("Downloading folder: {folder_name}"),
+        });
 
         // Look up peer port
         let peer_port = engine
@@ -534,14 +564,6 @@ pub async fn download_folder(
 
     let (peer_ip, peer_port, transfer_id, folder_name) = task_info;
 
-    // Set task to running
-    task.set_running();
-    let _ = event_tx.send(FrontendEvent::FolderStateChanged {
-        task_id,
-        state: FileTaskState::Running,
-        message: format!("Downloading folder: {folder_name}"),
-    });
-
     // Connect TCP
     let mut ft = network
         .connect_for_file(&peer_ip, peer_port)
@@ -561,6 +583,11 @@ pub async fn download_folder(
     write!(&mut request, "{}\n", transfer_id).unwrap();
     ft.send(&request).await.map_err(|e| {
         task.set_error(e.to_string());
+        let _ = event_tx.send(FrontendEvent::FolderStateChanged {
+            task_id,
+            state: FileTaskState::Error(e.to_string()),
+            message: format!("Failed to send manifest request: {e}"),
+        });
         e.to_string()
     })?;
 
@@ -575,13 +602,31 @@ pub async fn download_folder(
         format!("{e}")
     })?;
 
+    // Verify manifest transfer_id matches the expected one from UDP metadata.
+    // This provides integrity: a MITM on the TCP connection cannot substitute
+    // a different manifest without knowing the original transfer_id.
+    if manifest.transfer_id != transfer_id {
+        task.set_error("Folder manifest transfer_id mismatch".into());
+        let _ = event_tx.send(FrontendEvent::FolderStateChanged {
+            task_id,
+            state: FileTaskState::Error("Folder manifest transfer_id mismatch".into()),
+            message: "Manifest integrity check failed".into(),
+        });
+        return Err("Folder manifest transfer_id mismatch".into());
+    }
+
     let total_files = manifest.total_files;
-    let total_bytes = manifest.total_bytes as i64;
+    let total_bytes: i64 = i64::try_from(manifest.total_bytes).unwrap_or(i64::MAX);
 
     // Create the base directory
     let base_dir = Path::new(&save_path);
     std::fs::create_dir_all(base_dir).map_err(|e| {
         task.set_error(e.to_string());
+        let _ = event_tx.send(FrontendEvent::FolderStateChanged {
+            task_id,
+            state: FileTaskState::Error(e.to_string()),
+            message: format!("Failed to create directory: {e}"),
+        });
         e.to_string()
     })?;
 
@@ -601,12 +646,29 @@ pub async fn download_folder(
             return Err("Download canceled".into());
         }
 
+        // Path traversal prevention: reject relative paths containing '..'
+        let normalized = entry.relative_path.replace('\\', "/");
+        if normalized.contains("..") || normalized.contains('\0') {
+            task.set_error("Path traversal detected in folder manifest".into());
+            let _ = event_tx.send(FrontendEvent::FolderStateChanged {
+                task_id,
+                state: FileTaskState::Error("Path traversal detected in folder manifest".into()),
+                message: "Path traversal detected".into(),
+            });
+            return Err("Path traversal detected: '..' is not allowed in file paths".into());
+        }
+
         let file_path = base_dir.join(&entry.relative_path);
 
         // Create parent directories
         if let Some(parent) = file_path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| {
                 task.set_error(format!("Failed to create directory: {e}"));
+                let _ = event_tx.send(FrontendEvent::FolderStateChanged {
+                    task_id,
+                    state: FileTaskState::Error(format!("Failed to create directory: {e}")),
+                    message: format!("Dir error: {e}"),
+                });
                 format!("{e}")
             })?;
         }
@@ -616,31 +678,58 @@ pub async fn download_folder(
         // Receive file header (validates we're in sync)
         let (rel_path, file_size) = ft.recv_folder_file_header().await.map_err(|e| {
             task.set_error(format!("Failed to receive file header: {e}"));
+            let _ = event_tx.send(FrontendEvent::FolderStateChanged {
+                task_id,
+                state: FileTaskState::Error(format!("Failed to receive file header: {e}")),
+                message: format!("File header error: {e}"),
+            });
             format!("{e}")
         })?;
 
         if rel_path != entry.relative_path || file_size != entry.size {
             task.set_error("Folder transfer protocol mismatch".into());
+            let _ = event_tx.send(FrontendEvent::FolderStateChanged {
+                task_id,
+                state: FileTaskState::Error("Folder transfer protocol mismatch".into()),
+                message: "Protocol mismatch".into(),
+            });
             return Err("Protocol mismatch".into());
         }
 
-        // Receive file content with progress
+        // Send ACK before receiving file data to avoid deadlock: sender waits
+        // for ACK before sending file content, so we must ACK first.
+        let _ = ft.send_marker(FOLDER_FILE_ACK).await;
+
+        // Receive file content with progress (throttled via update_progress)
         let recv_result = {
             let tx_clone = event_tx.clone();
             let rel_clone = entry.relative_path.clone();
-            ft.recv_file(&file_path_str, entry.size as i64, move |progress, total| {
-                let current_overall = overall_bytes + progress;
-                let _ = tx_clone.send(FrontendEvent::FolderProgress {
-                    task_id,
-                    overall_progress: current_overall,
-                    overall_total: total_bytes,
-                    current_file: rel_clone.clone(),
-                    current_file_progress: progress,
-                    current_file_total: total,
-                    files_completed: completed + 1,
-                    total_files,
-                });
-            })
+            let task_cancel = task.clone();
+            let task_throttle = task.clone();
+            ft.recv_file(
+                &file_path_str, entry.size as i64,
+                move |progress, total| {
+                    // Skip event emission if task is already canceled
+                    if task_cancel.is_cancel_pending() {
+                        return;
+                    }
+                    let current_overall = overall_bytes + progress;
+                    // Throttle FolderProgress events via update_progress
+                    if task_throttle.update_progress(current_overall) {
+                        let _ = tx_clone.send(FrontendEvent::FolderProgress {
+                            task_id,
+                            overall_progress: current_overall,
+                            overall_total: total_bytes,
+                            current_file: rel_clone.clone(),
+                            current_file_progress: progress,
+                            current_file_total: total,
+                            files_completed: completed + 1,
+                            total_files,
+                        });
+                    }
+                },
+                Some(&*task.cancel_flag),
+            )
             .await
         };
 
@@ -648,6 +737,15 @@ pub async fn download_folder(
             Ok(_) => {}
             Err(e) => {
                 task.set_error(format!("Failed to receive {}: {}", entry.relative_path, e));
+                // Notify peer and emit error event
+                let _ = ft.send_marker(FOLDER_TRANSFER_CANCEL).await;
+                let _ = event_tx.send(FrontendEvent::FolderStateChanged {
+                    task_id,
+                    state: FileTaskState::Error(format!("Failed to receive {}: {}", entry.relative_path, e)),
+                    message: format!("Receive error: {}", entry.relative_path),
+                });
+                // Clean up partial file
+                let _ = std::fs::remove_file(&file_path_str);
                 return Err(format!("{e}"));
             }
         }
@@ -670,9 +768,14 @@ pub async fn download_folder(
         });
     }
 
-    // Receive completion marker
-    match ft.expect_marker(FOLDER_TRANSFER_COMPLETE).await {
-        Ok(true) => {
+    // Receive completion marker (with timeout to prevent indefinite hang)
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        ft.expect_marker(FOLDER_TRANSFER_COMPLETE),
+    )
+    .await
+    {
+        Ok(Ok(true)) => {
             task.set_finish();
             let _ = event_tx.send(FrontendEvent::FolderStateChanged {
                 task_id,
@@ -681,9 +784,32 @@ pub async fn download_folder(
             });
             Ok(())
         }
-        _ => {
-            task.set_error("Transfer incomplete".into());
-            Err("Transfer incomplete".into())
+        Ok(Ok(false)) => {
+            task.set_error("Transfer incomplete: wrong completion marker".into());
+            let _ = event_tx.send(FrontendEvent::FolderStateChanged {
+                task_id,
+                state: FileTaskState::Error("Transfer incomplete: wrong completion marker".into()),
+                message: "Wrong completion marker".into(),
+            });
+            Err("Transfer incomplete: wrong completion marker".into())
+        }
+        Ok(Err(e)) => {
+            task.set_error(format!("Transfer incomplete: {e}"));
+            let _ = event_tx.send(FrontendEvent::FolderStateChanged {
+                task_id,
+                state: FileTaskState::Error(format!("Transfer incomplete: {e}")),
+                message: format!("Completion marker error: {e}"),
+            });
+            Err(format!("{e}"))
+        }
+        Err(_) => {
+            task.set_error("Transfer incomplete: completion marker timed out".into());
+            let _ = event_tx.send(FrontendEvent::FolderStateChanged {
+                task_id,
+                state: FileTaskState::Error("Completion marker timed out".into()),
+                message: "Completion marker timed out".into(),
+            });
+            Err("Completion marker timed out".into())
         }
     }
 }
@@ -738,5 +864,47 @@ mod tests {
             let result = validate_path(path);
             assert!(result.is_ok(), "Expected '{}' to be allowed: {:?}", path, result.err());
         }
+    }
+
+    #[test]
+    fn test_validate_path_rejects_null_byte() {
+        let cases = [
+            "/tmp/foo\0.txt",
+            "/tmp/../../etc/passwd\0suffix",
+            "safe.txt\0../../etc/passwd",
+            "\0/tmp/bar.txt",
+            "/tmp/evil.exe\0",
+        ];
+        for path in &cases {
+            let result = validate_path(path);
+            assert!(result.is_err(), "Expected '{}' to be rejected for null byte", path);
+            let err = result.unwrap_err();
+            assert!(
+                err.contains("null byte"),
+                "error should mention 'null byte', got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_path_rejects_empty_path() {
+        assert!(validate_path("").is_err(), "empty path should be rejected");
+    }
+
+    #[test]
+    fn test_validate_path_rejects_whitespace_only_path() {
+        assert!(validate_path("   ").is_err(), "whitespace-only path should be rejected");
+        assert!(validate_path("\t").is_err(), "tab-only path should be rejected");
+        assert!(validate_path("\n").is_err(), "newline-only path should be rejected");
+    }
+
+    #[test]
+    fn test_validate_path_rejects_null_byte_with_traversal_disguise() {
+        // Combined attack: null byte terminates string at OS level, bypassing traversal check
+        let path = "safe_folder/safe_file.txt\0../../etc/passwd";
+        let result = validate_path(path);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.contains("null byte"), "error should mention 'null byte', got: {err}");
     }
 }

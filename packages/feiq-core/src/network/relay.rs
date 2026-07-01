@@ -139,15 +139,6 @@ impl RelayClient {
         ip
     }
 
-    fn lookup_peer_id(&self, ip: &str) -> Option<String> {
-        self.peer_map
-            .lock()
-            .unwrap()
-            .iter()
-            .find(|(_, v)| *v == ip)
-            .map(|(k, _)| k.clone())
-    }
-
     // ─── Public send API ──────────────────────────────────────
 
     /// Send an IPMSG datagram to a specific peer through the relay.
@@ -233,7 +224,7 @@ impl RelayClient {
         let send_tx = tx.clone();
         // Share with send_json() so engine-triggered send_to/broadcast reuse
         // the persistent WS connection instead of opening a new one.
-        *self.ws_write_tx.lock().unwrap() = Some(tx);
+        *self.ws_write_tx.lock().unwrap_or_else(|e| e.into_inner()) = Some(tx);
 
         let writer_handle = tokio::spawn(async move {
             loop {
@@ -288,7 +279,7 @@ impl RelayClient {
 
         // Clear shared write channel on disconnect so send_json returns error
         // instead of queuing messages that will never be sent.
-        *self.ws_write_tx.lock().unwrap() = None;
+        *self.ws_write_tx.lock().unwrap_or_else(|e| e.into_inner()) = None;
         writer_handle.abort();
         Ok(())
     }
@@ -304,7 +295,7 @@ impl RelayClient {
 
         match msg {
             ServerMsg::Joined { client_id, peers } => {
-                *self.client_id.lock().unwrap() = Some(client_id);
+                *self.client_id.lock().unwrap_or_else(|e| e.into_inner()) = Some(client_id);
                 for peer in &peers {
                     self.register_and_emit_online(peer);
                 }
@@ -313,7 +304,7 @@ impl RelayClient {
                 self.register_and_emit_online(&peer);
             }
             ServerMsg::PeerOffline { peer_id } => {
-                if let Some(ip) = self.peer_map.lock().unwrap().remove(&peer_id) {
+                if let Some(ip) = self.peer_map.lock().unwrap_or_else(|e| e.into_inner()).remove(&peer_id) {
                     let mut post = Post::new(&ip);
                     post.cmd_id = crate::protocol::constants::IPMSG_BR_EXIT;
                     post.from.online = false;
@@ -434,7 +425,7 @@ impl RelayClient {
         // Use the persistent WebSocket connection's write channel instead of
         // opening a new connection per message (which would require a new Join
         // handshake and be silently dropped by the server).
-        let tx_guard = self.ws_write_tx.lock().unwrap();
+        let tx_guard = self.ws_write_tx.lock().unwrap_or_else(|e| e.into_inner());
         match tx_guard.as_ref() {
             Some(tx) => {
                 tx.send(msg.to_string())

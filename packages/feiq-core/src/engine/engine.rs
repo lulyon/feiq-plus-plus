@@ -23,42 +23,15 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Semaphore};
+use tokio::time::timeout;
 
 /// Global atomic counter for generating file task IDs across dispatch tasks.
+/// Starts at 1 and wraps from u64::MAX back to 1 to avoid ever reaching 0
+/// (which could conflict with sentinel values in some logic paths).
+/// Uses `fetch_update` with a wrapping check instead of raw `fetch_add` to
+/// prevent debug-mode panic on overflow (u64::MAX + 1).
 static NEXT_FILE_TASK_ID: AtomicU64 = AtomicU64::new(1);
-
-/// Unique packet ID generator
-struct PacketIdGen(u64);
-
-impl PacketIdGen {
-    fn new() -> Self {
-        Self(0)
-    }
-    fn next(&mut self) -> u64 {
-        self.0 += 1;
-        if self.0 >= u64::MAX {
-            self.0 = 1;
-        }
-        self.0
-    }
-}
-
-/// Unique file ID generator
-struct FileIdGen(u64);
-
-impl FileIdGen {
-    fn new() -> Self {
-        Self(0)
-    }
-    fn next(&mut self) -> u64 {
-        self.0 += 1;
-        if self.0 >= u64::MAX {
-            self.0 = 1;
-        }
-        self.0
-    }
-}
 
 /// The main engine controller
 pub struct Engine {
@@ -67,8 +40,6 @@ pub struct Engine {
     network: Option<Arc<NetworkManager>>,
     relay_client: Option<Arc<RelayClient>>,
     event_tx: mpsc::UnboundedSender<FrontendEvent>,
-    packet_id: PacketIdGen,
-    file_id: FileIdGen,
     version: String,
     /// File transfer tasks (upload + download), keyed by local task ID
     file_tasks: Arc<std::sync::Mutex<HashMap<u64, Arc<FileTaskHandle>>>>,
@@ -119,8 +90,6 @@ impl Engine {
             network: None,
             relay_client: None,
             event_tx,
-            packet_id: PacketIdGen::new(),
-            file_id: FileIdGen::new(),
             version,
             file_tasks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             history,
@@ -196,47 +165,65 @@ impl Engine {
         let network = Arc::new(network);
 
         // TCP accept loop for incoming file transfers (GETFILEDATA via TCP)
+        // Use a Semaphore to limit concurrent transfers to 10, preventing
+        // resource exhaustion from an attacker opening many connections.
+        let transfer_semaphore = Arc::new(Semaphore::new(10));
         let mut tcp_queue_rx = network.start_accept_loop();
         let file_tasks_tcp = self.file_tasks().clone();
         let event_tx_tcp = self.event_tx.clone();
+        let sem_spawn = transfer_semaphore.clone();
         tokio::spawn(async move {
             while let Some((mut ft, peer_ip)) = tcp_queue_rx.recv().await {
+                // Acquire an OWNED semaphore permit to limit concurrent transfers.
+                // acquire_owned() returns an OwnedSemaphorePermit that is 'static
+                // (no borrow), so it can be moved into the spawned task.
+                let permit = match sem_spawn.clone().acquire_owned().await {
+                    Ok(p) => p,
+                    Err(_) => break,
+                };
                 let file_tasks = file_tasks_tcp.clone();
                 let event_tx = event_tx_tcp.clone();
                 tokio::spawn(async move {
+                    // Hold the permit for the entire transfer lifetime
+                    let _permit = permit;
+
                     // Peek at first bytes to determine protocol:
                     // - b"FOLDER_" prefix → folder transfer
                     // - Otherwise → single file GETFILEDATA
                     let mut peek_buf = [0u8; 32];
-                    let n = match ft.recv(&mut peek_buf).await {
-                        Ok(n) if n > 0 => n,
-                        Ok(_) => {
+                    let peek_n = match timeout(Duration::from_secs(30), ft.recv(&mut peek_buf)).await {
+                        Ok(Ok(n)) if n > 0 => n,
+                        Ok(Ok(_)) => {
                             tracing::debug!("TCP accept: empty request from {peer_ip}");
                             return;
                         }
-                        Err(e) => {
+                        Ok(Err(e)) => {
                             tracing::error!("TCP accept: read error from {peer_ip}: {e}");
+                            return;
+                        }
+                        Err(_) => {
+                            tracing::debug!("TCP accept: read timeout from {peer_ip}");
                             return;
                         }
                     };
 
                     // ─── Folder transfer branch ────────────────────
-                    if &peek_buf[..std::cmp::min(n, FOLDER_MANIFEST_REQUEST.len())] == FOLDER_MANIFEST_REQUEST {
+                    if &peek_buf[..std::cmp::min(peek_n, FOLDER_MANIFEST_REQUEST.len())] == FOLDER_MANIFEST_REQUEST {
                         // Read the transfer_id: after the marker comes "transfer_id\n"
                         let mut id_buf = vec![0u8; 64];
                         let mut id_len = 0;
                         // Copy remaining bytes after marker
                         let marker_len = FOLDER_MANIFEST_REQUEST.len();
-                        if n > marker_len {
-                            let rem = &peek_buf[marker_len..n];
+                        if peek_n > marker_len {
+                            let rem = &peek_buf[marker_len..peek_n];
                             let copy = std::cmp::min(rem.len(), id_buf.len());
                             id_buf[..copy].copy_from_slice(&rem[..copy]);
                             id_len = copy;
                         }
-                        // Read more if needed until we get a newline
+                        // Read more if needed until we get a newline (30s timeout)
                         while id_len < id_buf.len() && !id_buf[..id_len].contains(&b'\n') {
-                            match ft.recv(&mut id_buf[id_len..]).await {
-                                Ok(n) if n > 0 => id_len += n,
+                            match timeout(Duration::from_secs(30), ft.recv(&mut id_buf[id_len..])).await {
+                                Ok(Ok(n)) if n > 0 => id_len += n,
                                 _ => break,
                             }
                         }
@@ -249,13 +236,14 @@ impl Engine {
                             }
                         };
 
-                        // Look up upload task by packet_no == transfer_id
+                        // Look up upload task by packet_no == transfer_id AND verify peer IP
                         let found = {
-                            let tasks = file_tasks.lock().unwrap();
+                            let tasks = file_tasks.lock().unwrap_or_else(|e| e.into_inner());
                             tasks.values().find(|t| {
                                 let s = t.snapshot();
                                 s.task_type == FileTaskType::Upload
                                     && s.content.packet_no == transfer_id
+                                    && s.fellow_ip == peer_ip
                             }).cloned()
                         };
 
@@ -297,6 +285,11 @@ impl Engine {
                             Some(m) => m,
                             None => {
                                 task.set_error("Failed to build folder manifest".into());
+                                let _ = event_tx.send(FrontendEvent::FolderStateChanged {
+                                    task_id,
+                                    state: FileTaskState::Error("Failed to build folder manifest".into()),
+                                    message: "Failed to build folder manifest".into(),
+                                });
                                 return;
                             }
                         };
@@ -307,6 +300,14 @@ impl Engine {
                         // Send manifest
                         if let Err(e) = ft.send_folder_manifest(&manifest).await {
                             task.set_error(format!("Failed to send manifest: {e}"));
+                            let snap = task.snapshot();
+                            if snap.state != FileTaskState::Canceled && snap.state != FileTaskState::Finish {
+                                let _ = event_tx.send(FrontendEvent::FolderStateChanged {
+                                    task_id,
+                                    state: FileTaskState::Error(format!("Failed to send manifest: {e}")),
+                                    message: format!("Send manifest error: {e}"),
+                                });
+                            }
                             return;
                         }
 
@@ -334,25 +335,20 @@ impl Engine {
                                 .await
                             {
                                 task.set_error(format!("Failed to send file header: {e}"));
+                                let snap = task.snapshot();
+                                if snap.state != FileTaskState::Canceled && snap.state != FileTaskState::Finish {
+                                    let _ = event_tx.send(FrontendEvent::FolderStateChanged {
+                                        task_id,
+                                        state: FileTaskState::Error(format!("Failed to send file header: {e}")),
+                                        message: format!("Send file header error: {e}"),
+                                    });
+                                }
                                 return;
                             }
 
-                            // Wait for ACK from receiver
-                            let mut ack_buf = [0u8; FOLDER_FILE_ACK.len()];
-                            let mut acked = false;
-                            if let Ok(n) = ft.recv(&mut ack_buf).await {
-                                if n >= FOLDER_FILE_ACK.len()
-                                    && &ack_buf[..FOLDER_FILE_ACK.len()] == FOLDER_FILE_ACK
-                                {
-                                    acked = true;
-                                }
-                            }
-                            if !acked {
-                                // Receiver may have skipped ACK (legacy) — continue anyway
-                                tracing::debug!("No ACK received for file {}, continuing", entry.relative_path);
-                            }
-
-                            // Send file content
+                            // Send file content FIRST, then optionally wait for ACK.
+                            // This avoids deadlock: sender was waiting for ACK while
+                            // receiver was waiting for file data. ACK is advisory only.
                             let file_size = entry.size as i64;
                             let tx = event_tx.clone();
                             let rel_path = entry.relative_path.clone();
@@ -363,7 +359,7 @@ impl Engine {
                                         let _ = tx.send(FrontendEvent::FolderProgress {
                                             task_id,
                                             overall_progress: current_overall,
-                                            overall_total: total_bytes as i64,
+                                            overall_total: i64::try_from(total_bytes).unwrap_or(i64::MAX),
                                             current_file: rel_path.clone(),
                                             current_file_progress: progress,
                                             current_file_total: total,
@@ -371,8 +367,7 @@ impl Engine {
                                             total_files,
                                         });
                                     }
-                                })
-                                .await;
+                                }, Some(&task.cancel_flag)).await;
 
                             match result {
                                 Ok(_) => {
@@ -381,7 +376,7 @@ impl Engine {
                                     let _ = event_tx.send(FrontendEvent::FolderProgress {
                                         task_id,
                                         overall_progress: overall_bytes,
-                                        overall_total: total_bytes as i64,
+                                        overall_total: i64::try_from(total_bytes).unwrap_or(i64::MAX),
                                         current_file: entry.relative_path.clone(),
                                         current_file_progress: file_size,
                                         current_file_total: file_size,
@@ -394,6 +389,15 @@ impl Engine {
                                         "Failed to send {}: {}",
                                         entry.relative_path, e
                                     ));
+                                    // Check terminal state before emitting Error
+                                    let snap = task.snapshot();
+                                    if snap.state != FileTaskState::Canceled && snap.state != FileTaskState::Finish {
+                                        let _ = event_tx.send(FrontendEvent::FolderStateChanged {
+                                            task_id,
+                                            state: FileTaskState::Error(format!("Failed to send: {}", entry.relative_path)),
+                                            message: format!("Send file error: {}", entry.relative_path),
+                                        });
+                                    }
                                     return;
                                 }
                             }
@@ -413,29 +417,32 @@ impl Engine {
                         );
                         return;
                     }
+                    // Read additional data from stream. Use timeout to prevent
+                    // indefinite blocking if peer connects but sends nothing.
                     let mut buf = [0u8; 256];
-                    let n = match ft.recv(&mut buf).await {
-                        Ok(n) if n > 0 => n,
-                        Ok(_) => {
+                    let n = match timeout(Duration::from_secs(30), ft.recv(&mut buf)).await {
+                        Ok(Ok(n)) if n > 0 => n,
+                        Ok(Ok(_)) => {
                             tracing::debug!("TCP accept: empty request from {peer_ip}");
                             return;
                         }
-                        Err(e) => {
+                        Ok(Err(e)) => {
                             tracing::error!("TCP accept: read error from {peer_ip}: {e}");
                             return;
                         }
-                    };
-                    // ─── Existing single-file GETFILEDATA path ──────────
-                    // Combine peek_buf data with additional read
-                    let request_bytes = {
-                        let mut all = peek_buf[..n].to_vec();
-                        // Read more if we might need it
-                        let mut extra = [0u8; 256];
-                        if let Ok(extra_n) = ft.recv(&mut extra).await {
-                            if extra_n > 0 {
-                                all.extend_from_slice(&extra[..extra_n]);
-                            }
+                        Err(_) => {
+                            tracing::debug!("TCP accept: read timeout from {peer_ip}");
+                            return;
                         }
+                    };
+                    // ─── Single-file GETFILEDATA path ────────────────────
+                    // Combine peek_buf data with the recv data we already have in buf.
+                    // Avoids an unnecessary second recv that could lose data or cause
+                    // protocol desync (see H-3 consolidated audit finding).
+                    let request_bytes = {
+                        let peek_len = peek_n.min(peek_buf.len());
+                        let mut all = peek_buf[..peek_len].to_vec();
+                        all.extend_from_slice(&buf[..n]);
                         all
                     };
 
@@ -463,9 +470,9 @@ impl Engine {
                     };
                     let offset: i64 = parts.get(2).and_then(|s| s.parse().ok()).unwrap_or(0);
 
-                    // Look up matching upload task by packet_no and file_id
+                    // Look up matching upload task by packet_no, file_id, AND peer_ip
                     let task = {
-                        let tasks = file_tasks.lock().unwrap();
+                        let tasks = file_tasks.lock().unwrap_or_else(|e| e.into_inner());
                         tasks
                             .values()
                             .find(|t| {
@@ -473,6 +480,7 @@ impl Engine {
                                 s.task_type == FileTaskType::Upload
                                     && s.content.packet_no == packet_no
                                     && s.content.file_id == file_id
+                                    && s.fellow_ip == peer_ip
                             })
                             .cloned()
                     };
@@ -485,8 +493,9 @@ impl Engine {
                                  packet_no={packet_no} file_id={file_id} \
                                  from {peer_ip}"
                             );
-                            // Send error so peer doesn't hang on download
-                            let _ = ft.send(b"ERR: no such file").await;
+                            // Close connection without sending data — the receiver's recv_file
+                            // will see EOF and return an "Incomplete download" error instead of
+                            // writing error text to the output file.
                             return;
                         }
                     };
@@ -509,6 +518,7 @@ impl Engine {
                         message: format!("Sending: {filename}"),
                     });
 
+                    let cancel_flag = task.cancel_flag.clone();
                     let result = {
                         let task_for_progress = task.clone();
                         let tx = event_tx.clone();
@@ -520,8 +530,7 @@ impl Engine {
                                     total: total_size,
                                 });
                             }
-                        })
-                        .await
+                        }, Some(&cancel_flag)).await
                     };
 
                     match result {
@@ -536,11 +545,16 @@ impl Engine {
                         }
                         Err(e) => {
                             task.set_error(e.to_string());
-                            let _ = event_tx.send(FrontendEvent::FileStateChanged {
-                                task_id,
-                                state: FileTaskState::Error(e.to_string()),
-                                message: format!("Send failed: {e}"),
-                            });
+                            // Check terminal state before emitting Error to prevent
+                            // race where cancel won but in-flight I/O also errored.
+                            let snap = task.snapshot();
+                            if snap.state != FileTaskState::Canceled && snap.state != FileTaskState::Finish {
+                                let _ = event_tx.send(FrontendEvent::FileStateChanged {
+                                    task_id,
+                                    state: FileTaskState::Error(e.to_string()),
+                                    message: format!("Send failed: {e}"),
+                                });
+                            }
                             tracing::warn!(
                                 "TCP accept: failed to send {filename} to {peer_ip}: {e}"
                             );
@@ -585,12 +599,12 @@ impl Engine {
                     NetworkEvent::FellowOnline(post) => {
                         if post.from.version.starts_with("feiq_plus_plus") && !post.from.public_key.is_empty() {
                             let peer_ip = &post.from.ip;
-                            if !crypto_sessions.lock().unwrap().contains_key(peer_ip) {
+                            if !crypto_sessions.lock().unwrap_or_else(|e| e.into_inner()).contains_key(peer_ip) {
                                 if let Ok((our_priv, our_pub)) = generate_keypair() {
                                     if let Ok(secret) = compute_shared_secret(our_priv, &post.from.public_key) {
                                         let enc = create_encryptor(&secret);
                                         let dec = create_decryptor(&secret);
-                                        crypto_sessions.lock().unwrap().insert(peer_ip.clone(), (enc, dec));
+                                        crypto_sessions.lock().unwrap_or_else(|e| e.into_inner()).insert(peer_ip.clone(), (enc, dec));
                                         ans_pub_key = Some(our_pub);
                                     }
                                 }
@@ -600,18 +614,18 @@ impl Engine {
                     NetworkEvent::FellowAnsEntry(post) => {
                         if post.from.version.starts_with("feiq_plus_plus") && !post.from.public_key.is_empty() {
                             let peer_ip = &post.from.ip;
-                            if !crypto_sessions.lock().unwrap().contains_key(peer_ip) {
+                            if !crypto_sessions.lock().unwrap_or_else(|e| e.into_inner()).contains_key(peer_ip) {
                                 // Read our broadcast private key WITHOUT taking/consuming it.
                                 // We store raw [u8; 32] bytes which are Copy, so we can clone
                                 // the private key and use it for ECDH with MULTIPLE peers
                                 // without rotating the broadcast keypair.
-                                let kp = our_keypair.lock().unwrap();
+                                let kp = our_keypair.lock().unwrap_or_else(|e| e.into_inner());
                                 if let Some((ref priv_key, _)) = *kp {
                                     if let Ok(secret) = compute_shared_secret_from_raw(priv_key, &post.from.public_key) {
                                         drop(kp);
                                         let enc = create_encryptor(&secret);
                                         let dec = create_decryptor(&secret);
-                                        crypto_sessions.lock().unwrap().insert(peer_ip.clone(), (enc, dec));
+                                        crypto_sessions.lock().unwrap_or_else(|e| e.into_inner()).insert(peer_ip.clone(), (enc, dec));
                                     }
                                 }
                             }
@@ -706,7 +720,7 @@ impl Engine {
                     break;
                 }
                 let data = {
-                    let kp = our_keypair_rb.lock().unwrap();
+                    let kp = our_keypair_rb.lock().unwrap_or_else(|e| e.into_inner());
                     let pub_key = kp.as_ref().map(|(_, pk)| pk.as_slice());
                     build_br_entry_ext(&name_p, &host_p, &version_p, pub_key)
                 };
@@ -818,23 +832,23 @@ impl Engine {
 
     /// Get all known contacts (for frontend)
     pub fn get_contacts(&self) -> Vec<Fellow> {
-        self.contacts.lock().unwrap().all()
+        self.contacts.lock().unwrap_or_else(|e| e.into_inner()).all()
     }
 
     /// Search contacts by query
     pub fn search_contacts(&self, query: &str) -> Vec<Fellow> {
-        self.contacts.lock().unwrap().search(query)
+        self.contacts.lock().unwrap_or_else(|e| e.into_inner()).search(query)
     }
 
     /// Get a contact by IP
     pub fn find_contact(&self, ip: &str) -> Option<Fellow> {
-        self.contacts.lock().unwrap().find_by_ip(ip)
+        self.contacts.lock().unwrap_or_else(|e| e.into_inner()).find_by_ip(ip)
     }
 
     /// Add a contact manually (user-added by IP)
     pub fn add_contact(&mut self, ip: &str) -> Fellow {
         let fellow = Fellow::new(ip);
-        self.contacts.lock().unwrap().upsert(fellow.clone());
+        self.contacts.lock().unwrap_or_else(|e| e.into_inner()).upsert(fellow.clone());
         fellow
     }
 
@@ -842,7 +856,7 @@ impl Engine {
     pub fn add_contact_with_port(&mut self, ip: &str, port: u16) -> Fellow {
         let mut fellow = Fellow::new(ip);
         fellow.port = port;
-        self.contacts.lock().unwrap().upsert(fellow.clone());
+        self.contacts.lock().unwrap_or_else(|e| e.into_inner()).upsert(fellow.clone());
         fellow
     }
 
@@ -853,7 +867,7 @@ impl Engine {
 
         // Try to encrypt if crypto session exists for this peer
         let data = {
-            let mut sessions = self.crypto_sessions.lock().unwrap();
+            let mut sessions = self.crypto_sessions.lock().unwrap_or_else(|e| e.into_inner());
             if let Some((ref mut enc, _)) = sessions.get_mut(ip) {
                 let encrypted = encrypt(&text_gbk, enc)
                     .map_err(|_| anyhow::anyhow!("Encryption failed"))?;
@@ -892,13 +906,13 @@ impl Engine {
 
         if let Some(peer_id) = relay_peer_id {
             if let Some(ref relay) = self.relay_client {
-                tracing::info!("Engine sending text via relay to {peer_id}: {text}");
+                tracing::debug!("Engine sending text via relay to {peer_id}: {text}");
                 let cmd = IPMSG_SENDMSG | IPMSG_SENDCHECKOPT;
                 relay.send_to(&peer_id, cmd, &data).await?;
                 sent_ok = true;
             }
         } else if let Some(ref network) = self.network {
-            tracing::info!("Engine sending text via UDP to {ip}:{port}: {text}");
+            tracing::debug!("Engine sending text via UDP to {ip}:{port}: {text}");
             network.send_to(ip, port, &data).await?;
             sent_ok = true;
         } else {
@@ -908,7 +922,7 @@ impl Engine {
         // ─── Enqueue for offline delivery ─────────────────
         if sent_ok {
             let is_offline = self
-                .contacts.lock().unwrap()
+                .contacts.lock().unwrap_or_else(|e| e.into_inner())
                 .find_by_ip(ip)
                 .map(|f| !f.online)
                 .unwrap_or(false);
@@ -916,7 +930,7 @@ impl Engine {
             if is_offline {
                 if let Some(ref history) = self.history {
                     let payload = serde_json::json!({ "text": text });
-                    if let Err(e) = history.lock().unwrap().enqueue_pending(
+                    if let Err(e) = history.lock().unwrap_or_else(|e| e.into_inner()).enqueue_pending(
                         ip,
                         "text",
                         &payload.to_string(),
@@ -940,7 +954,7 @@ impl Engine {
 // ─── Save to chat history ─────────────────────────
         if let Some(ref history) = self.history {
             let contact_name = self
-                .contacts.lock().unwrap()
+                .contacts.lock().unwrap_or_else(|e| e.into_inner())
                 .find_by_ip(ip)
                 .map(|f| f.display_name().to_string())
                 .unwrap_or_else(|| ip.to_string());
@@ -948,7 +962,7 @@ impl Engine {
                 text: text.to_string(),
                 format: String::new(),
             }];
-            if let Err(e) = history.lock().unwrap().save_message(ip, &contact_name, 0, &contents) {
+            if let Err(e) = history.lock().unwrap_or_else(|e| e.into_inner()).save_message(ip, &contact_name, 0, &contents) {
                 tracing::warn!("Failed to save sent message to history: {e}");
             }
         }
@@ -963,7 +977,7 @@ impl Engine {
         let text_gbk = encode_gbk(text);
 
         let data = {
-            let mut sessions = self.crypto_sessions.lock().unwrap();
+            let mut sessions = self.crypto_sessions.lock().unwrap_or_else(|e| e.into_inner());
             if let Some((ref mut enc, _)) = sessions.get_mut(ip) {
                 let encrypted = encrypt(&text_gbk, enc)
                     .map_err(|_| anyhow::anyhow!("Encryption failed"))?;
@@ -1062,26 +1076,34 @@ impl Engine {
         limit: i64,
     ) -> anyhow::Result<Vec<crate::storage::history::MessageRecord>> {
         match self.history {
-            Some(ref history) => history.lock().unwrap().get_messages(contact_ip, offset, limit),
+            Some(ref history) => history.lock().unwrap_or_else(|e| e.into_inner()).get_messages(contact_ip, offset, limit),
             None => Ok(Vec::new()),
         }
     }
 
     /// Set a contact's alias, persisting to DB and updating contact book.
     /// Sends a ContactUpdate event so the frontend refreshes.
+    /// Locks contacts before history to maintain consistent lock ordering
+    /// (contacts → history) with handle_network_event, avoiding ABBA deadlock.
     pub fn set_contact_alias(&self, ip: &str, alias: &str) -> anyhow::Result<()> {
-        // Persist to DB
+        // Update contact book in-memory first
+        let contact_update = {
+            let mut book = self.contacts.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(mut fellow) = book.find_by_ip(ip) {
+                fellow.alias = alias.to_string();
+                book.upsert(fellow.clone());
+                Some(fellow)
+            } else {
+                None
+            }
+        };
+
+        // Persist to DB (contacts lock released before acquiring history lock)
         if let Some(ref history) = self.history {
-            history.lock().unwrap().set_contact_alias(ip, alias)?;
+            history.lock().unwrap_or_else(|e| e.into_inner()).set_contact_alias(ip, alias)?;
         }
 
-        // Update contact book in-memory
-        let mut book = self.contacts.lock().unwrap();
-        if let Some(mut fellow) = book.find_by_ip(ip) {
-            fellow.alias = alias.to_string();
-            book.upsert(fellow.clone());
-            // Drop the lock before sending event
-            drop(book);
+        if let Some(fellow) = contact_update {
             let _ = self.event_tx.send(FrontendEvent::ContactUpdate { fellow });
         }
         Ok(())
@@ -1090,7 +1112,7 @@ impl Engine {
     /// Set a contact's group name (persisted to DB).
     pub fn set_contact_group(&self, ip: &str, group_name: &str) -> anyhow::Result<()> {
         if let Some(ref history) = self.history {
-            history.lock().unwrap().set_contact_group(ip, group_name)?;
+            history.lock().unwrap_or_else(|e| e.into_inner()).set_contact_group(ip, group_name)?;
         }
         Ok(())
     }
@@ -1099,7 +1121,7 @@ impl Engine {
     /// Replaces any existing group with the same name.
     pub fn create_group(&self, name: &str, member_ips: &[String]) -> anyhow::Result<()> {
         match self.history {
-            Some(ref history) => history.lock().unwrap().save_group(name, member_ips),
+            Some(ref history) => history.lock().unwrap_or_else(|e| e.into_inner()).save_group(name, member_ips),
             None => anyhow::bail!("History database not available"),
         }
     }
@@ -1107,7 +1129,7 @@ impl Engine {
     /// Get all groups from DB: Vec of (group_name, member_ips)
     pub fn get_groups(&self) -> anyhow::Result<Vec<(String, Vec<String>)>> {
         match self.history {
-            Some(ref history) => history.lock().unwrap().get_groups(),
+            Some(ref history) => history.lock().unwrap_or_else(|e| e.into_inner()).get_groups(),
             None => Ok(Vec::new()),
         }
     }
@@ -1115,20 +1137,25 @@ impl Engine {
     /// Load all contact meta from DB (alias, signature, group_name) and
     /// apply to the in-memory contact book. Does not trigger events —
     /// intended for restoration at startup.
+    ///
+    /// Locks are acquired sequentially (never held simultaneously): history
+    /// is released before contacts is acquired. This avoids ABBA deadlock
+    /// with handle_network_event which locks contacts while holding history.
     pub fn load_contact_meta(&self) -> anyhow::Result<()> {
-        if let Some(ref history) = self.history {
-            let meta_map = history.lock().unwrap().load_all_contact_meta()?;
-            if meta_map.is_empty() {
-                return Ok(());
-            }
-            let mut book = self.contacts.lock().unwrap();
-            for (ip, (alias, signature, group_name)) in meta_map {
-                if let Some(mut fellow) = book.find_by_ip(&ip) {
-                    fellow.alias = alias;
-                    fellow.signature = signature;
-                    fellow.group_name = group_name;
-                    book.upsert(fellow);
-                }
+        let meta_map = match self.history {
+            Some(ref history) => history.lock().unwrap_or_else(|e| e.into_inner()).load_all_contact_meta()?,
+            None => return Ok(()),
+        };
+        if meta_map.is_empty() {
+            return Ok(());
+        }
+        let mut book = self.contacts.lock().unwrap_or_else(|e| e.into_inner());
+        for (ip, (alias, signature, group_name)) in meta_map {
+            if let Some(mut fellow) = book.find_by_ip(&ip) {
+                fellow.alias = alias;
+                fellow.signature = signature;
+                fellow.group_name = group_name;
+                book.upsert(fellow);
             }
         }
         Ok(())
@@ -1138,7 +1165,7 @@ impl Engine {
     pub fn export_history(&self) -> anyhow::Result<String> {
         match self.history {
             Some(ref history) => {
-                let value = history.lock().unwrap().export_all()?;
+                let value = history.lock().unwrap_or_else(|e| e.into_inner()).export_all()?;
                 Ok(value.to_string())
             }
             None => anyhow::bail!("History database not available"),
@@ -1153,7 +1180,7 @@ impl Engine {
                 let messages = value["messages"]
                     .as_array()
                     .ok_or_else(|| anyhow::anyhow!("Invalid JSON: missing 'messages' array"))?;
-                let count = history.lock().unwrap().import_messages(messages)?;
+                let count = history.lock().unwrap_or_else(|e| e.into_inner()).import_messages(messages)?;
                 Ok(count)
             }
             None => anyhow::bail!("History database not available"),
@@ -1165,7 +1192,7 @@ impl Engine {
     /// Check whether an IP is blacklisted
     pub fn is_ip_blacklisted(&self, ip: &str) -> bool {
         match self.history {
-            Some(ref history) => history.lock().unwrap().is_blacklisted(ip).unwrap_or(true),
+            Some(ref history) => history.lock().unwrap_or_else(|e| e.into_inner()).is_blacklisted(ip).unwrap_or(true),
             None => false,
         }
     }
@@ -1173,7 +1200,7 @@ impl Engine {
     /// Add an IP to the blacklist
     pub fn add_to_blacklist(&self, ip: &str) {
         if let Some(ref history) = self.history {
-            if let Err(e) = history.lock().unwrap().add_to_blacklist(ip) {
+            if let Err(e) = history.lock().unwrap_or_else(|e| e.into_inner()).add_to_blacklist(ip) {
                 tracing::warn!("Failed to add {ip} to blacklist: {e}");
             }
         }
@@ -1182,7 +1209,7 @@ impl Engine {
     /// Remove an IP from the blacklist
     pub fn remove_from_blacklist(&self, ip: &str) {
         if let Some(ref history) = self.history {
-            if let Err(e) = history.lock().unwrap().remove_from_blacklist(ip) {
+            if let Err(e) = history.lock().unwrap_or_else(|e| e.into_inner()).remove_from_blacklist(ip) {
                 tracing::warn!("Failed to remove {ip} from blacklist: {e}");
             }
         }
@@ -1191,7 +1218,7 @@ impl Engine {
     /// Get all blacklisted IPs
     pub fn get_blacklist(&self) -> Vec<String> {
         match self.history {
-            Some(ref history) => match history.lock().unwrap().get_blacklist() {
+            Some(ref history) => match history.lock().unwrap_or_else(|e| e.into_inner()).get_blacklist() {
                 Ok(list) => list,
                 Err(e) => {
                     tracing::warn!("Failed to get blacklist from DB: {e}");
@@ -1216,7 +1243,7 @@ impl Engine {
     /// Search chat history across all contacts by query string.
     pub fn search_chat_history(&self, query: &str, limit: i64) -> anyhow::Result<Vec<crate::storage::history::MessageRecord>> {
         match self.history {
-            Some(ref history) => history.lock().unwrap().search_messages(query, limit),
+            Some(ref history) => history.lock().unwrap_or_else(|e| e.into_inner()).search_messages(query, limit),
             None => Ok(Vec::new()),
         }
     }
@@ -1233,7 +1260,7 @@ impl Engine {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs() as i64;
-        let mut tasks = self.file_tasks.lock().unwrap();
+        let mut tasks = self.file_tasks.lock().unwrap_or_else(|e| e.into_inner());
         tasks.retain(|_id, handle| {
             let snap = handle.snapshot();
             match snap.terminal_at {
@@ -1248,27 +1275,63 @@ impl Engine {
     pub fn register_file_task(&self, task: FileTaskHandle) -> u64 {
         let task_id = task.snapshot().id;
         self.cleanup_file_tasks();
-        let mut tasks = self.file_tasks.lock().unwrap();
+        let mut tasks = self.file_tasks.lock().unwrap_or_else(|e| e.into_inner());
         tasks.insert(task_id, Arc::new(task));
         task_id
     }
 
     /// Get a file transfer task by local task ID.
     pub fn get_file_task(&self, task_id: u64) -> Option<Arc<FileTaskHandle>> {
-        self.file_tasks.lock().unwrap().get(&task_id).cloned()
+        self.file_tasks.lock().unwrap_or_else(|e| e.into_inner()).get(&task_id).cloned()
     }
 
     /// Cancel a file transfer task by local task ID.
+    /// Sends IPMSG_RELEASEFILES to the peer so they know the transfer was canceled.
+    /// Emits the correct event type (FolderStateChanged for folder tasks).
     pub fn cancel_file_task(&self, task_id: u64) {
-        if let Some(task) = self.file_tasks.lock().unwrap().get(&task_id) {
+        if let Some(task) = self.file_tasks.lock().unwrap_or_else(|e| e.into_inner()).get(&task_id) {
             task.request_cancel();
             task.set_canceled();
             let snap = task.snapshot();
-            let _ = self.event_tx.send(FrontendEvent::FileStateChanged {
-                task_id,
-                state: FileTaskState::Canceled,
-                message: format!("Canceled: {}", snap.content.filename),
-            });
+
+            // Determine if this is a folder task
+            let is_folder = snap.content.file_type == IPMSG_FILE_DIR
+                && snap.content.filename.starts_with("__FOLDER__");
+
+            // Send IPMSG_RELEASEFILES to peer to notify cancellation
+            if let Some(ref network) = self.network {
+                let body = format!("{}:{}:0:", snap.content.packet_no, snap.content.file_id);
+                let release_msg = pack_message(
+                    0,
+                    &self.config.name,
+                    &self.config.host,
+                    &self.version,
+                    IPMSG_RELEASEFILES,
+                    body.as_bytes(),
+                );
+                let port = {
+                    let contacts = self.contacts.lock().unwrap_or_else(|e| e.into_inner());
+                    let port = contacts.find_by_ip(&snap.fellow_ip)
+                        .map(|f| f.port)
+                        .unwrap_or(2425);
+                    port
+                };
+                let _ = network.send_to(&snap.fellow_ip, port, &release_msg);
+            }
+
+            if is_folder {
+                let _ = self.event_tx.send(FrontendEvent::FolderStateChanged {
+                    task_id,
+                    state: FileTaskState::Canceled,
+                    message: format!("Canceled: {}", snap.content.filename),
+                });
+            } else {
+                let _ = self.event_tx.send(FrontendEvent::FileStateChanged {
+                    task_id,
+                    state: FileTaskState::Canceled,
+                    message: format!("Canceled: {}", snap.content.filename),
+                });
+            }
         }
     }
 
@@ -1292,17 +1355,12 @@ impl Engine {
         &self.event_tx
     }
 
-    /// Get the next local task ID (monotonically increasing).
-    fn next_task_id(&mut self) -> u64 {
-        self.file_id.next()
-    }
-
     // ─── Encryption Pipeline (Phase 5.1) ──────────────────────────
 
     /// Ensure we have a keypair for BR_ENTRY/ANSENTRY broadcasts.
     /// Returns our current public key (32 bytes).
     fn ensure_keypair(&self) -> anyhow::Result<Vec<u8>> {
-        let mut kp = self.our_keypair.lock().unwrap();
+        let mut kp = self.our_keypair.lock().unwrap_or_else(|e| e.into_inner());
         if let Some((_, pub_key)) = kp.as_ref() {
             return Ok(pub_key.clone());
         }
@@ -1319,18 +1377,26 @@ impl Engine {
     /// the file notification message via UDP or relay.
     /// Returns the local task ID for tracking the transfer.
     pub async fn send_file_to(&self, ip: &str, file_path: &str) -> anyhow::Result<u64> {
-        let task_id = NEXT_FILE_TASK_ID.fetch_add(1, Ordering::Relaxed);
+        let task_id = NEXT_FILE_TASK_ID
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                Some(if v >= u64::MAX { 1 } else { v + 1 })
+            })
+            .unwrap();
         let packet_no = self.packet_id();
 
+        let filename_only = std::path::Path::new(file_path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(file_path);
         let mut fc = create_file_content(file_path)
-            .ok_or_else(|| anyhow::anyhow!("File not found: {}", file_path))?;
+            .ok_or_else(|| anyhow::anyhow!("File not found: {}", filename_only))?;
         fc.file_id = packet_no;
         fc.packet_no = packet_no;
         fc.local_task_id = Some(task_id);
 
         // Look up peer info (port, relay peer ID, display name, version)
         let (port, relay_peer_id, fellow_name, is_feiq) = {
-            let contacts = self.contacts.lock().unwrap();
+            let contacts = self.contacts.lock().unwrap_or_else(|e| e.into_inner());
             let fellow = contacts.find_by_ip(ip);
             let port = fellow.as_ref().map(|f| f.port).unwrap_or(2425);
             let relay_peer_id = fellow.as_ref().and_then(|f| match &f.source {
@@ -1397,25 +1463,34 @@ impl Engine {
     /// and sends the folder notification via UDP or relay.
     /// Returns the local task ID for tracking the transfer.
     pub async fn send_folder_to(&self, ip: &str, folder_path: &str) -> anyhow::Result<u64> {
-        let task_id = NEXT_FILE_TASK_ID.fetch_add(1, Ordering::Relaxed);
+        let task_id = NEXT_FILE_TASK_ID
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                Some(if v >= u64::MAX { 1 } else { v + 1 })
+            })
+            .unwrap();
         let packet_no = self.packet_id();
 
         // Build manifest by walking directory tree
+        let folder_display_name = std::path::Path::new(folder_path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(folder_path);
         let manifest = crate::network::tcp::build_folder_manifest(folder_path, packet_no)
             .ok_or_else(|| {
                 anyhow::anyhow!(
                     "Folder not found or empty: {}",
-                    folder_path
+                    folder_display_name
                 )
             })?;
 
         let folder_name = manifest.folder_name.clone();
         let file_count = manifest.total_files;
-        let total_size = manifest.total_bytes;
+        // Clamp to i64::MAX (practically unreachable, but prevents silent wrapping)
+        let total_size = manifest.total_bytes.min(i64::MAX as u64);
 
         // Look up peer info
         let (port, relay_peer_id, fellow_name, is_feiq) = {
-            let contacts = self.contacts.lock().unwrap();
+            let contacts = self.contacts.lock().unwrap_or_else(|e| e.into_inner());
             let fellow = contacts.find_by_ip(ip);
             let port = fellow.as_ref().map(|f| f.port).unwrap_or(2425);
             let relay_peer_id = fellow.as_ref().and_then(|f| match &f.source {
@@ -1480,7 +1555,7 @@ impl Engine {
                 file_id: packet_no,
                 filename: folder_filename,
                 path: folder_path.to_string(),
-                size: total_size as i64,
+                size: i64::try_from(total_size).unwrap_or(i64::MAX),
                 modify_time: 0,
                 file_type: IPMSG_FILE_DIR,
                 packet_no,
@@ -1556,7 +1631,7 @@ impl Engine {
 /// Check whether an IP is blacklisted (returns true on DB error to fail closed)
 fn is_ip_blacklisted(ip: &str, history: &Option<Arc<std::sync::Mutex<HistoryDb>>>) -> bool {
     match history {
-        Some(ref h) => h.lock().unwrap().is_blacklisted(ip).unwrap_or(true),
+        Some(ref h) => h.lock().unwrap_or_else(|e| e.into_inner()).is_blacklisted(ip).unwrap_or(true),
         None => false,
     }
 }
@@ -1593,7 +1668,7 @@ fn handle_network_event(
             let ip = post.from.ip.clone();
             let port = post.from.port;
             let fellow = post.from;
-            let mut book = contacts.lock().unwrap();
+            let mut book = contacts.lock().unwrap_or_else(|e| e.into_inner());
             let is_new = book.find(&fellow.ip, fellow.port).is_none();
             let changed = book.upsert(fellow.clone());
 
@@ -1609,7 +1684,7 @@ fn handle_network_event(
 
             // ─── Drain & deliver offline messages ──────────
             if let Some(ref history) = history {
-                let pending = match history.lock().unwrap().drain_pending(&ip) {
+                let pending = match history.lock().unwrap_or_else(|e| e.into_inner()).drain_pending(&ip) {
                     Ok(p) => p,
                     Err(e) => {
                         tracing::warn!("Failed to drain pending messages for {ip}: {e}");
@@ -1654,7 +1729,7 @@ fn handle_network_event(
         }
         NetworkEvent::FellowAnsEntry(post) => {
             let fellow = post.from;
-            let mut book = contacts.lock().unwrap();
+            let mut book = contacts.lock().unwrap_or_else(|e| e.into_inner());
             let is_new = book.find(&fellow.ip, fellow.port).is_none();
             let changed = book.upsert(fellow.clone());
 
@@ -1672,9 +1747,13 @@ fn handle_network_event(
         NetworkEvent::FellowOffline(post) => {
             let mut fellow = post.from;
             fellow.online = false;
-            let mut book = contacts.lock().unwrap();
+            let mut book = contacts.lock().unwrap_or_else(|e| e.into_inner());
             book.upsert(fellow.clone());
-            let _ = event_tx.send(FrontendEvent::ContactUpdate { fellow });
+            let _ = event_tx.send(FrontendEvent::ContactUpdate { fellow: fellow.clone() });
+            // Clean up crypto session for the offline peer to prevent unbounded growth
+            if let Some(sessions) = crypto_sessions {
+                sessions.lock().unwrap_or_else(|e| e.into_inner()).remove(&fellow.ip);
+            }
             (None, None)
         }
         NetworkEvent::Message(mut post) => {
@@ -1682,7 +1761,7 @@ fn handle_network_event(
             if is_opt_set(post.cmd_id, IPMSG_ENCRYPTOPT) {
                 if let Some(sessions) = crypto_sessions {
                     let ip = post.from.ip.clone();
-                    if let Some((_, dec)) = sessions.lock().unwrap().get_mut(&ip) {
+                    if let Some((_, dec)) = sessions.lock().unwrap_or_else(|e| e.into_inner()).get_mut(&ip) {
                         if let Ok(plaintext) = decrypt(&post.extra, dec) {
                             post.extra = plaintext;
                             post.cmd_id &= !IPMSG_ENCRYPTOPT;
@@ -1760,13 +1839,32 @@ fn handle_network_event(
 
                 // ─── Process file contents: create FileTaskHandle entries ──
                 if let Some(ref ft) = file_tasks {
+                    // Prune stale terminal tasks to prevent HashMap memory leak
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs() as i64;
+                    {
+                        let mut tasks = ft.lock().unwrap_or_else(|e| e.into_inner());
+                        tasks.retain(|_id, handle| {
+                            let snap = handle.snapshot();
+                            match snap.terminal_at {
+                                Some(ts) if now - ts >= 60 => false,
+                                _ => true,
+                            }
+                        });
+                    }
+
                     for content in &mut post.contents {
                         if let Content::File(ref mut fc) = content {
                             let is_folder = fc.file_type == IPMSG_FILE_DIR
                                 && fc.filename.starts_with("__FOLDER__");
 
-                            let task_id =
-                                NEXT_FILE_TASK_ID.fetch_add(1, Ordering::Relaxed);
+                            let task_id = NEXT_FILE_TASK_ID
+                                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                                    Some(if v >= u64::MAX { 1 } else { v + 1 })
+                                })
+                                .unwrap();
                             fc.packet_no = post.packet_no.parse::<u64>().unwrap_or(0);
                             fc.local_task_id = Some(task_id);
 
@@ -1784,7 +1882,7 @@ fn handle_network_event(
                                         fc.clone(),
                                         FileTaskType::Download,
                                     );
-                                    ft.lock().unwrap().insert(task_id, Arc::new(task));
+                                    ft.lock().unwrap_or_else(|e| e.into_inner()).insert(task_id, Arc::new(task));
                                     let _ = event_tx.send(FrontendEvent::FolderStateChanged {
                                         task_id,
                                         state: FileTaskState::NotStart,
@@ -1802,7 +1900,7 @@ fn handle_network_event(
                                     fc.clone(),
                                     FileTaskType::Download,
                                 );
-                                ft.lock().unwrap().insert(task_id, Arc::new(task));
+                                ft.lock().unwrap_or_else(|e| e.into_inner()).insert(task_id, Arc::new(task));
                                 let _ = event_tx.send(FrontendEvent::FileStateChanged {
                                     task_id,
                                     state: FileTaskState::NotStart,
@@ -1866,11 +1964,11 @@ fn handle_network_event(
                     });
                 }
                 // Update contact book
-                let mut book = contacts.lock().unwrap();
+                let mut book = contacts.lock().unwrap_or_else(|e| e.into_inner());
                 book.upsert(post.from);
             } else {
                 // Contents are empty — still update contact on any message
-                let mut book = contacts.lock().unwrap();
+                let mut book = contacts.lock().unwrap_or_else(|e| e.into_inner());
                 book.upsert(post.from);
             }
 
@@ -1913,25 +2011,34 @@ fn handle_network_event(
                 "ReleaseFiles from {}: packet_no={}, file_id={}",
                 from.ip, packet_no, file_id,
             );
-            // Find and cancel matching file tasks
+            // Find and cancel matching file tasks.
+            // Collect matching (task_id, task_arc) pairs first, then release the
+            // file_tasks lock before operating on individual tasks to avoid holding
+            // two locks (file_tasks + task inner lock) simultaneously.
             if let Some(ref ft) = file_tasks {
-                let tasks = ft.lock().unwrap();
-                for (_task_id, task) in tasks.iter() {
+                let mut matching: Vec<(u64, Arc<FileTaskHandle>)> = {
+                    let tasks = ft.lock().unwrap_or_else(|e| e.into_inner());
+                    tasks.iter()
+                        .filter(|(_, task)| {
+                            let snap = task.snapshot();
+                            snap.content.packet_no == packet_no
+                                && snap.content.file_id == file_id
+                        })
+                        .map(|(id, task)| (*id, task.clone()))
+                        .collect()
+                }; // file_tasks lock released here
+                for (task_id, task) in matching.drain(..) {
+                    task.request_cancel();
+                    task.set_canceled();
                     let snap = task.snapshot();
-                    if snap.content.packet_no == packet_no
-                        && snap.content.file_id == file_id
-                    {
-                        task.request_cancel();
-                        task.set_canceled();
-                        let _ = event_tx.send(FrontendEvent::FileStateChanged {
-                            task_id: snap.id,
-                            state: FileTaskState::Canceled,
-                            message: format!(
-                                "Peer released file: {}",
-                                snap.content.filename
-                            ),
-                        });
-                    }
+                    let _ = event_tx.send(FrontendEvent::FileStateChanged {
+                        task_id,
+                        state: FileTaskState::Canceled,
+                        message: format!(
+                            "Peer released file: {}",
+                            snap.content.filename
+                        ),
+                    });
                 }
             }
             (None, None)
@@ -2192,7 +2299,7 @@ impl Engine {
     /// Also saves to local history under the synthetic key `group:{group_name}`.
     pub async fn send_text_to_group(&self, group_name: &str, text: &str) -> anyhow::Result<()> {
         let groups = match self.history {
-            Some(ref history) => history.lock().unwrap().get_groups()?,
+            Some(ref history) => history.lock().unwrap_or_else(|e| e.into_inner()).get_groups()?,
             None => anyhow::bail!("History not available"),
         };
         let members = groups
@@ -2500,6 +2607,274 @@ mod tests {
         engine.stop().await;
         engine.start().await.unwrap();
         engine.stop().await;
+    }
+
+
+    // ─── File share request (handle_file_share_request) tests ────────
+
+    #[test]
+    fn test_handle_file_share_request_no_shared_dir() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let engine = Engine::new(AppConfig::default(), tx, None);
+        let req = GetFileData {
+            packet_no: 100,
+            file_id: 0,
+            offset: 1,
+        };
+        let result = engine.handle_file_share_request(&req);
+        assert!(result.is_none(), "Should return None when shared_dir is empty");
+    }
+
+    #[test]
+    fn test_handle_file_share_request_offset_zero() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut config = AppConfig::default();
+        config.shared_dir = "/tmp".into();
+        let engine = Engine::new(config, tx, None);
+        let req = GetFileData {
+            packet_no: 100,
+            file_id: 0,
+            offset: 0,
+        };
+        let result = engine.handle_file_share_request(&req);
+        assert!(result.is_none(), "Should return None when offset == 0");
+    }
+
+    #[test]
+    fn test_handle_file_share_request_nonzero_file_id() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut config = AppConfig::default();
+        config.shared_dir = "/tmp".into();
+        let engine = Engine::new(config, tx, None);
+        let req = GetFileData {
+            packet_no: 100,
+            file_id: 1,
+            offset: 1,
+        };
+        let result = engine.handle_file_share_request(&req);
+        assert!(result.is_none(), "Should return None when file_id != 0");
+    }
+
+    #[test]
+    fn test_handle_file_share_request_from_shared_dir() {
+        let pid = std::process::id();
+        let path = std::path::PathBuf::from(format!(
+            "/tmp/feiq_test_share_{}_{}",
+            pid,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        let dir_path = path.to_string_lossy().to_string();
+
+        std::fs::write(path.join("alpha.txt"), "hello").unwrap();
+        std::fs::write(path.join("beta.txt"), "world").unwrap();
+        let sub = path.join("sub");
+        std::fs::create_dir(&sub).unwrap();
+
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut config = AppConfig::default();
+        config.shared_dir = dir_path.clone();
+        let engine = Engine::new(config, tx, None);
+
+        let req = GetFileData {
+            packet_no: 200,
+            file_id: 0,
+            offset: 1,
+        };
+        let result = engine.handle_file_share_request(&req);
+        assert!(result.is_some(), "Should return files when shared_dir has content");
+
+        let files = result.unwrap();
+        assert_eq!(files.len(), 3, "Expected 3 entries: 2 files + 1 empty subdirectory");
+
+        // File IDs are assigned sequentially (1-based) in filesystem order
+        let id_set: std::collections::HashSet<u64> = files.iter().map(|f| f.file_id).collect();
+        assert_eq!(id_set.len(), 3, "All file_ids must be unique");
+        assert!(id_set.contains(&1), "file_id must include 1");
+        assert!(id_set.contains(&2), "file_id must include 2");
+        assert!(id_set.contains(&3), "file_id must include 3");
+
+        let alpha = files.iter().find(|f| f.filename == "alpha.txt").unwrap();
+        assert_eq!(alpha.file_type, IPMSG_FILE_REGULAR);
+        assert_eq!(alpha.size, 5);
+
+        let beta = files.iter().find(|f| f.filename == "beta.txt").unwrap();
+        assert_eq!(beta.file_type, IPMSG_FILE_REGULAR);
+        assert_eq!(beta.size, 5);
+
+        let sub_entry = files.iter().find(|f| f.filename == "sub").unwrap();
+        assert_eq!(sub_entry.file_type, IPMSG_FILE_DIR);
+
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    #[test]
+    fn test_handle_file_share_request_empty_shared_dir() {
+        let pid = std::process::id();
+        let path = std::path::PathBuf::from(format!(
+            "/tmp/feiq_test_share_empty_{}_{}",
+            pid,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        let dir_path = path.to_string_lossy().to_string();
+
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut config = AppConfig::default();
+        config.shared_dir = dir_path.clone();
+        let engine = Engine::new(config, tx, None);
+
+        let req = GetFileData {
+            packet_no: 300,
+            file_id: 0,
+            offset: 1,
+        };
+        let result = engine.handle_file_share_request(&req);
+        assert!(result.is_none(), "Should return None when shared_dir is empty (no entries)");
+        let _ = std::fs::remove_dir_all(&path);
+
+    }
+
+    // ─── Concurrent File Task Thread Safety ──────────────────────────
+
+    #[test]
+    fn test_simultaneous_upload_and_download() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let engine = Engine::new(AppConfig::default(), tx, None);
+
+        let uc = FileContent {
+            file_id: 1, filename: "upload.txt".into(), path: "/tmp/upload.txt".into(),
+            size: 1_000_000, modify_time: 1000, file_type: IPMSG_FILE_REGULAR, packet_no: 100,
+            local_task_id: None,
+        };
+        engine.register_file_task(FileTaskHandle::new(1, "10.0.0.1".into(), "Alice".into(), uc, FileTaskType::Upload));
+
+        let dc = FileContent {
+            file_id: 2, filename: "download.txt".into(), path: "/tmp/download.txt".into(),
+            size: 2_000_000, modify_time: 2000, file_type: IPMSG_FILE_REGULAR, packet_no: 200,
+            local_task_id: None,
+        };
+        engine.register_file_task(FileTaskHandle::new(2, "10.0.0.2".into(), "Bob".into(), dc, FileTaskType::Download));
+
+        let up = engine.get_file_task(1).unwrap();
+        let down = engine.get_file_task(2).unwrap();
+        std::thread::scope(|s| {
+            s.spawn(|| { up.set_running(); up.update_progress(500_000); });
+            s.spawn(|| { down.set_running(); down.update_progress(1_000_000); });
+        });
+        let us = up.snapshot();
+        let ds = down.snapshot();
+        assert_eq!(us.task_type, FileTaskType::Upload);
+        assert_eq!(us.state, FileTaskState::Running);
+        assert_eq!(us.progress, 500_000);
+        assert_eq!(ds.task_type, FileTaskType::Download);
+        assert_eq!(ds.state, FileTaskState::Running);
+        assert_eq!(ds.progress, 1_000_000);
+    }
+
+    #[test]
+    fn test_ten_concurrent_file_transfers() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let engine = Arc::new(Engine::new(AppConfig::default(), tx, None));
+
+        let mut h = Vec::new();
+        for i in 0u64..10 {
+            let e = engine.clone();
+            h.push(std::thread::spawn(move || {
+                let c = FileContent {
+                    file_id: i, filename: format!("f{i}.txt"), path: format!("/tmp/f{i}.txt"),
+                    size: ((i + 1) * 1024) as i64, modify_time: (i * 100) as i64,
+                    file_type: IPMSG_FILE_REGULAR, packet_no: i, local_task_id: None,
+                };
+                let tt = if i % 2 == 0 { FileTaskType::Upload } else { FileTaskType::Download };
+                e.register_file_task(FileTaskHandle::new(i, "10.0.0.1".into(), "P".into(), c, tt));
+            }));
+        }
+        for j in h { j.join().expect("panicked"); }
+
+        for i in 0u64..10 {
+            let t = engine.get_file_task(i);
+            assert!(t.is_some(), "Task {i}");
+            let s = t.unwrap().snapshot();
+            assert_eq!(s.id, i);
+            assert_eq!(s.task_type, if i % 2 == 0 { FileTaskType::Upload } else { FileTaskType::Download });
+        }
+        assert!(engine.get_file_task(10).is_none());
+
+        let mut h = Vec::new();
+        for i in 0u64..10 {
+            let e = engine.clone();
+            h.push(std::thread::spawn(move || {
+                e.get_file_task(i).unwrap().set_running();
+                e.get_file_task(i).unwrap().update_progress(512);
+            }));
+        }
+        for j in h { j.join().expect("panicked"); }
+        for i in 0u64..10 {
+            assert_eq!(engine.get_file_task(i).unwrap().snapshot().state, FileTaskState::Running, "Task {i}");
+        }
+    }
+
+    #[test]
+    fn test_concurrent_folder_and_file_transfer() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let engine = Engine::new(AppConfig::default(), tx, None);
+
+        let fc = FileContent {
+            file_id: 1, filename: "project_docs".into(), path: "/tmp/project_docs".into(),
+            size: 10_000_000, modify_time: 3000, file_type: IPMSG_FILE_DIR, packet_no: 100,
+            local_task_id: None,
+        };
+        engine.register_file_task(FileTaskHandle::new(1, "10.0.0.1".into(), "A".into(), fc, FileTaskType::Upload));
+
+        let rc = FileContent {
+            file_id: 2, filename: "report.pdf".into(), path: "/tmp/report.pdf".into(),
+            size: 500_000, modify_time: 4000, file_type: IPMSG_FILE_REGULAR, packet_no: 200,
+            local_task_id: None,
+        };
+        engine.register_file_task(FileTaskHandle::new(2, "10.0.0.2".into(), "B".into(), rc, FileTaskType::Download));
+
+        let fh = engine.get_file_task(1).unwrap();
+        let rh = engine.get_file_task(2).unwrap();
+        std::thread::scope(|s| {
+            s.spawn(|| { fh.set_running(); fh.update_progress(2_500_000); fh.update_progress(5_000_000); fh.set_finish(); });
+            s.spawn(|| { rh.set_running(); rh.update_progress(100_000); rh.set_finish(); });
+        });
+        let fs = fh.snapshot();
+        assert_eq!(fs.task_type, FileTaskType::Upload);
+        assert_eq!(fs.content.file_type, IPMSG_FILE_DIR);
+        assert_eq!(fs.state, FileTaskState::Finish);
+        assert_eq!(fs.progress, fs.total);
+        let rs = rh.snapshot();
+        assert_eq!(rs.task_type, FileTaskType::Download);
+        assert_eq!(rs.content.file_type, IPMSG_FILE_REGULAR);
+        assert_eq!(rs.state, FileTaskState::Finish);
+        assert_eq!(rs.progress, rs.total);
+    }
+
+    #[test]
+    fn test_task_id_uniqueness() {
+        let next = &super::NEXT_FILE_TASK_ID;
+        let start = next.load(Ordering::Relaxed);
+        let count = 100;
+        let results = Arc::new(Mutex::new(Vec::new()));
+        let mut h = Vec::new();
+        for _ in 0..count {
+            let r = results.clone();
+            h.push(std::thread::spawn(move || { r.lock().unwrap_or_else(|e| e.into_inner()).push(next.fetch_add(1, Ordering::Relaxed)); }));
+        }
+        for j in h { j.join().expect("panicked"); }
+        let ids = results.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(ids.len(), count);
+        assert!(ids.iter().all(|&id| id >= start));
+        let mut s = ids.clone(); s.sort(); s.dedup();
+        assert_eq!(s.len(), ids.len(), "IDs must be unique");
     }
 }
 

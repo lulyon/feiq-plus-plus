@@ -14,6 +14,7 @@ pub struct AppState {
     pub engine: Arc<Mutex<Engine>>,
     pub config: Arc<Mutex<AppConfig>>,
     pub event_rx: Arc<Mutex<mpsc::UnboundedReceiver<FrontendEvent>>>,
+    #[allow(dead_code)]
     pub event_tx: mpsc::UnboundedSender<FrontendEvent>,
     pub running: Arc<Mutex<bool>>,
     /// Shared unread message counter for tray badge

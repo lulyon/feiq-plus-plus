@@ -40,6 +40,12 @@ impl HistoryDb {
         let need_init = !path.exists();
         let conn = Connection::open(path)?;
 
+        // Enable WAL mode for multi-instance safety and set busy timeout to avoid SQLITE_BUSY
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL;
+             PRAGMA busy_timeout=5000;",
+        )?;
+
         if need_init {
             conn.execute_batch(
                 "CREATE TABLE IF NOT EXISTS messages (

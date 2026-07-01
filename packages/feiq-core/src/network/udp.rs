@@ -3,6 +3,7 @@
 
 use crate::protocol::constants::MAX_RCV_SIZE;
 use mac_address::get_mac_address;
+use socket2::{Domain, Protocol, Socket, Type};
 use std::net::SocketAddr;
 use tokio::net::UdpSocket;
 
@@ -15,8 +16,14 @@ pub struct UdpTransport {
 impl UdpTransport {
     /// Create and bind a UDP socket to the given port
     pub async fn bind(port: u16) -> anyhow::Result<Self> {
+        // Create a socket2 socket with SO_REUSEADDR enabled for multi-instance support
         let addr: SocketAddr = format!("0.0.0.0:{port}").parse()?;
-        let socket = UdpSocket::bind(addr).await?;
+        let socket2_socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
+        socket2_socket.set_reuse_address(true)?;
+        socket2_socket.set_nonblocking(true)?;
+        let sock_addr: socket2::SockAddr = addr.into();
+        socket2_socket.bind(&sock_addr)?;
+        let socket = UdpSocket::from_std(socket2_socket.into())?;
 
         // Enable broadcast
         socket.set_broadcast(true)?;

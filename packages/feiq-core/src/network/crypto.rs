@@ -2,7 +2,7 @@
 //! ECDH (x25519) key exchange + AES-256-GCM encryption via ring 0.17.
 //! Only activated between feiq++ peers (detected via version string).
 
-use ring::aead::{Aad, BoundKey, Nonce, NonceSequence, OpeningKey, SealingKey, UnboundKey, AES_256_GCM};
+use ring::aead::{Aad, Nonce, NonceSequence, UnboundKey, AES_256_GCM};
 use ring::agreement::{agree_ephemeral, EphemeralPrivateKey, UnparsedPublicKey, X25519};
 use ring::hkdf;
 use ring::rand::SecureRandom;
@@ -11,6 +11,7 @@ use x25519_dalek::x25519;
 use x25519_dalek::X25519_BASEPOINT_BYTES;
 
 const NONCE_LEN: usize = 12;
+#[allow(dead_code)]
 const TAG_LEN: usize = 16;
 const KEY_LEN: usize = 32;
 
@@ -48,10 +49,9 @@ pub struct FeiqEncryptor {
     nonce_seq: CounterNonceSequence,
 }
 
-/// Decryptor state: raw key bytes + nonce sequence
+/// Decryptor state: raw key bytes only (nonce is received as part of ciphertext)
 pub struct FeiqDecryptor {
     key_bytes: [u8; KEY_LEN],
-    nonce_seq: CounterNonceSequence,
 }
 
 /// Generate ephemeral x25519 keypair
@@ -97,7 +97,6 @@ pub fn create_encryptor(shared_secret: &[u8]) -> FeiqEncryptor {
 pub fn create_decryptor(shared_secret: &[u8]) -> FeiqDecryptor {
     FeiqDecryptor {
         key_bytes: derive_key_bytes(shared_secret),
-        nonce_seq: CounterNonceSequence::new(),
     }
 }
 

@@ -1,12 +1,15 @@
 //! Async TCP for file transfer (IPMSG GETFILEDATA / GETDIRFILES).
 //! Chunk size: 64KB for feiq++ <-> feiq++, compatible with legacy 2048-byte clients.
 
+use socket2::{Domain, Protocol, Socket, Type};
+use std::net::SocketAddr;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::{timeout, Duration};
 
 use crate::protocol::constants::{IPMSG_FILE_DIR, IPMSG_FILE_REGULAR};
 use crate::protocol::types::{FileContent, FolderFileEntry, FolderManifest};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// List files in a directory, returning IPMSG-formatted file entries.
 /// Recursively lists all files under `dir_path`.
@@ -30,10 +33,18 @@ pub fn list_directory(dir_path: &str, _base_path: &str) -> Vec<FileContent> {
         };
 
         let path = entry.path();
-        let metadata = match std::fs::metadata(&path) {
+        // Use symlink_metadata to detect symlink directories (prevents infinite recursion
+        // from symlinks pointing to parent directories).
+        let sym_meta = match std::fs::symlink_metadata(&path) {
             Ok(m) => m,
             Err(_) => continue,
         };
+        if sym_meta.file_type().is_symlink() {
+            // Skip symlink directories to prevent infinite recursion.
+            // Symlink files are skipped to prevent traversal attacks.
+            continue;
+        }
+        let metadata = sym_meta;
 
         let filename = path
             .file_name()
@@ -51,7 +62,7 @@ pub fn list_directory(dir_path: &str, _base_path: &str) -> Vec<FileContent> {
         } else if metadata.is_file() {
             IPMSG_FILE_REGULAR
         } else {
-            continue; // Skip symlinks, devices, etc.
+            continue; // Skip devices, etc.
         };
 
         let file_content = FileContent {
@@ -238,10 +249,17 @@ pub struct FileServer {
 }
 
 impl FileServer {
-    /// Start TCP server on the given port
+    /// Start TCP server on the given port with SO_REUSEADDR enabled
+    /// for multi-instance testing and quick restart support.
     pub async fn bind(port: u16) -> anyhow::Result<Self> {
-        let addr = format!("0.0.0.0:{port}");
-        let listener = TcpListener::bind(&addr).await?;
+        let addr: SocketAddr = format!("0.0.0.0:{port}").parse()?;
+        let socket2_socket = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))?;
+        socket2_socket.set_reuse_address(true)?;
+        socket2_socket.set_nonblocking(true)?;
+        let sock_addr: socket2::SockAddr = addr.into();
+        socket2_socket.bind(&sock_addr)?;
+        socket2_socket.listen(1024)?;
+        let listener = TcpListener::from_std(socket2_socket.into())?;
         tracing::info!("TCP file server listening on port {port}");
         Ok(Self { listener })
     }
@@ -288,15 +306,25 @@ impl FileTransfer {
 
     /// Send a file from disk with progress callback.
     /// Returns total bytes sent. Each read/write has a 300s timeout.
+    /// If `cancel_flag` is provided and set to true, aborts early and returns
+    /// a `Canceled` error.
     pub async fn send_file<F>(
         &mut self,
         file_path: &str,
         offset: i64,
         progress_cb: F,
+        cancel_flag: Option<&AtomicBool>,
     ) -> anyhow::Result<i64>
     where
         F: Fn(i64, i64),
     {
+        // Reject negative offset (would wrap to u64::MAX and seek past end)
+        if offset < 0 {
+            return Err(anyhow::anyhow!(
+                "send_file: invalid negative offset {offset}"
+            ));
+        }
+
         let mut file = tokio::fs::File::open(file_path).await?;
         let total = file.metadata().await?.len() as i64;
 
@@ -310,6 +338,13 @@ impl FileTransfer {
         let mut buf = vec![0u8; FILE_CHUNK_SIZE];
 
         while sent < total {
+            // Check cancellation before each chunk
+            if let Some(flag) = cancel_flag {
+                if flag.load(Ordering::Relaxed) {
+                    return Err(anyhow::anyhow!("send_file: canceled by user"));
+                }
+            }
+
             let to_read = std::cmp::min(FILE_CHUNK_SIZE, (total - sent) as usize);
             let n = timeout(Duration::from_secs(300), file.read(&mut buf[..to_read]))
                 .await
@@ -331,11 +366,16 @@ impl FileTransfer {
     /// Rejects files larger than MAX_FILE_SIZE to prevent DoS attacks
     /// where a malicious peer declares a fake huge file size.
     /// Each read/write has a 300s timeout.
+    /// If `cancel_flag` is provided and set to true, aborts early and
+    /// removes the partial file, returning a `Canceled` error.
+    /// If the function returns an error (cancel, timeout, or disk failure),
+    /// the partially written file is removed to prevent orphaned files.
     pub async fn recv_file<F>(
         &mut self,
         file_path: &str,
         total_size: i64,
         progress_cb: F,
+        cancel_flag: Option<&AtomicBool>,
     ) -> anyhow::Result<i64>
     where
         F: Fn(i64, i64),
@@ -351,34 +391,51 @@ impl FileTransfer {
             return Err(anyhow::anyhow!("Invalid negative file size: {total_size}"));
         }
 
+        let file_created = std::path::Path::new(file_path).exists();
         let mut file = tokio::fs::File::create(file_path).await?;
         let mut received: i64 = 0;
         let mut buf = vec![0u8; FILE_CHUNK_SIZE];
 
-        while received < total_size {
-            let to_read = std::cmp::min(FILE_CHUNK_SIZE, (total_size - received) as usize);
-            let n = timeout(Duration::from_secs(300), self.stream.read(&mut buf[..to_read]))
-                .await
-                .map_err(|_| anyhow::anyhow!("recv_file: socket read timed out after 300s"))??;
-            if n == 0 {
-                break; // EOF
+        let result: anyhow::Result<i64> = async {
+            while received < total_size {
+                // Check cancellation before each chunk
+                if let Some(flag) = cancel_flag {
+                    if flag.load(Ordering::Relaxed) {
+                        return Err(anyhow::anyhow!("recv_file: canceled by user"));
+                    }
+                }
+
+                let to_read = std::cmp::min(FILE_CHUNK_SIZE, (total_size - received) as usize);
+                let n = timeout(Duration::from_secs(300), self.stream.read(&mut buf[..to_read]))
+                    .await
+                    .map_err(|_| anyhow::anyhow!("recv_file: socket read timed out after 300s"))??;
+                if n == 0 {
+                    break; // EOF
+                }
+                timeout(Duration::from_secs(300), file.write_all(&buf[..n]))
+                    .await
+                    .map_err(|_| anyhow::anyhow!("recv_file: disk write timed out after 300s"))??;
+                received += n as i64;
+                progress_cb(received, total_size);
             }
-            timeout(Duration::from_secs(300), file.write_all(&buf[..n]))
-                .await
-                .map_err(|_| anyhow::anyhow!("recv_file: disk write timed out after 300s"))??;
-            received += n as i64;
-            progress_cb(received, total_size);
+
+            file.flush().await?;
+
+            if received < total_size {
+                return Err(anyhow::anyhow!(
+                    "Incomplete download: received {received} of {total_size} bytes (early EOF)"
+                ));
+            }
+
+            Ok(received)
+        }.await;
+
+        // Clean up partial file on error (unless file was pre-existing)
+        if result.is_err() && !file_created {
+            let _ = std::fs::remove_file(file_path);
         }
 
-        file.flush().await?;
-
-        if received < total_size {
-            return Err(anyhow::anyhow!(
-                "Incomplete download: received {received} of {total_size} bytes (early EOF)"
-            ));
-        }
-
-        Ok(received)
+        result
     }
 
     /// Receive raw bytes with timeout
@@ -402,14 +459,32 @@ impl FileTransfer {
     }
 
     /// Receive the folder manifest (4-byte LE u32 length prefix + JSON body).
+    /// Rejects manifests larger than 10 MiB to prevent OOM attacks.
     pub async fn recv_folder_manifest(&mut self) -> anyhow::Result<FolderManifest> {
+        const MAX_MANIFEST_SIZE: usize = 10 * 1024 * 1024; // 10 MiB
+
         let mut len_buf = [0u8; 4];
         self.stream.read_exact(&mut len_buf).await?;
         let len = u32::from_le_bytes(len_buf) as usize;
 
+        if len > MAX_MANIFEST_SIZE {
+            return Err(anyhow::anyhow!(
+                "Manifest size {len} exceeds maximum {MAX_MANIFEST_SIZE}"
+            ));
+        }
+
         let mut json_buf = vec![0u8; len];
         self.stream.read_exact(&mut json_buf).await?;
         let manifest: FolderManifest = serde_json::from_slice(&json_buf)?;
+
+        // Limit total files to prevent resource exhaustion
+        if manifest.total_files > 50000 {
+            return Err(anyhow::anyhow!(
+                "Manifest total_files {} exceeds maximum 50000",
+                manifest.total_files
+            ));
+        }
+
         Ok(manifest)
     }
 
@@ -430,10 +505,19 @@ impl FileTransfer {
 
     /// Receive a per-file header.
     /// Returns (relative_path, file_size).
+    /// Rejects path lengths larger than 4096 to prevent OOM attacks.
     pub async fn recv_folder_file_header(&mut self) -> anyhow::Result<(String, u64)> {
+        const MAX_PATH_LEN: usize = 4096;
+
         let mut path_len_buf = [0u8; 4];
         self.stream.read_exact(&mut path_len_buf).await?;
         let path_len = u32::from_le_bytes(path_len_buf) as usize;
+
+        if path_len > MAX_PATH_LEN {
+            return Err(anyhow::anyhow!(
+                "Folder file path length {path_len} exceeds maximum {MAX_PATH_LEN}"
+            ));
+        }
 
         let mut path_buf = vec![0u8; path_len];
         self.stream.read_exact(&mut path_buf).await?;
@@ -454,11 +538,13 @@ impl FileTransfer {
     }
 
     /// Read exactly `marker.len()` bytes and compare against the expected marker.
+    /// Uses a 30-second timeout to prevent indefinite blocking.
     pub async fn expect_marker(&mut self, marker: &[u8]) -> anyhow::Result<bool> {
         let mut buf = vec![0u8; marker.len()];
-        match self.stream.read_exact(&mut buf).await {
-            Ok(_) => Ok(buf == marker),
-            Err(_) => Ok(false),
+        match timeout(Duration::from_secs(30), self.stream.read_exact(&mut buf)).await {
+            Ok(Ok(_)) => Ok(buf == marker),
+            Ok(Err(_)) => Ok(false),
+            Err(_) => Ok(false), // timeout
         }
     }
 }
@@ -503,27 +589,46 @@ fn walk_directory(base_path: &str, relative_prefix: &str, files: &mut Vec<Folder
     let dir = std::fs::read_dir(base_path).ok()?;
 
     for entry in dir {
-        let entry = entry.ok()?;
+        let entry = match entry {
+            Ok(e) => e,
+            Err(_) => continue, // skip unreadable entries instead of aborting
+        };
         let path = entry.path();
-        let name = path.file_name()?.to_str()?.to_string();
+        let name = match path.file_name().and_then(|n| n.to_str()) {
+            Some(n) => n.to_string(),
+            None => continue, // skip non-UTF-8 filenames
+        };
 
         // Skip hidden files
         if name.starts_with('.') {
             continue;
         }
 
-        let metadata = std::fs::metadata(&path).ok()?;
+        // Use symlink_metadata to detect symlinks without following them.
+        // ALL symlinks are skipped to prevent traversal attacks and
+        // infinite recursion from symlinks pointing to parent directories.
+        let sym_meta = match std::fs::symlink_metadata(&path) {
+            Ok(m) => m,
+            Err(_) => continue, // skip instead of aborting the entire walk
+        };
+        if sym_meta.file_type().is_symlink() {
+            continue; // skip all symlinks
+        }
+
+        let meta = sym_meta; // not a symlink, use it directly
+
         let rel_path = if relative_prefix.is_empty() {
             name.clone()
         } else {
             format!("{}/{}", relative_prefix, name)
         };
 
-        if metadata.is_dir() {
+        if meta.is_dir() {
+            // Recursively walk subdirectories
             let sub_base = path.to_string_lossy().to_string();
-            walk_directory(&sub_base, &rel_path, files)?;
-        } else if metadata.is_file() {
-            let modify_time = metadata
+            let _ = walk_directory(&sub_base, &rel_path, files); // skip unreadable subdirs
+        } else if meta.is_file() {
+            let modify_time = meta
                 .modified()
                 .ok()
                 .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
@@ -532,11 +637,11 @@ fn walk_directory(base_path: &str, relative_prefix: &str, files: &mut Vec<Folder
 
             files.push(FolderFileEntry {
                 relative_path: rel_path,
-                size: metadata.len(),
+                size: meta.len(),
                 modify_time,
             });
         }
-        // Skip symlinks, devices, etc.
+        // Skip devices, symlink dirs (already handled above), etc.
     }
 
     Some(())

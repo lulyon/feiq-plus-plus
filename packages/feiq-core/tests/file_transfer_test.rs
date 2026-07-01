@@ -41,6 +41,9 @@ impl TestPeer {
                 .expect("bind failed"),
         );
         socket.set_broadcast(true).ok();
+        // Retrieve the actual bound port (the OS may have assigned a different
+        // port if port was 0, though callers use explicit ports that must match).
+        let bound_port = socket.local_addr().unwrap().port();
         let mac = mac_address::get_mac_address()
             .ok()
             .flatten()
@@ -52,7 +55,7 @@ impl TestPeer {
             mac,
             name: name.into(),
             ver,
-            port,
+            port: bound_port,
         }
     }
 
@@ -572,6 +575,310 @@ async fn test_file_notification_multiple_entries() {
     }
 }
 
+// ─── Folder Manifest Edge Cases ─────────────────────────────────
+
+fn temp_dir_path() -> (String, std::path::PathBuf) {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::path::PathBuf::from(format!("/tmp/feiq_test_fm_{nanos}"));
+    (dir.to_string_lossy().to_string(), dir)
+}
+
+#[test]
+fn test_folder_manifest_nested_empty_dirs() {
+    // An entirely empty directory tree (all empty subdirs, zero files)
+    // must return None -- no files to transfer.
+    let (path_str, dir) = temp_dir_path();
+    std::fs::create_dir_all(dir.join("a/empty1")).unwrap();
+    std::fs::create_dir_all(dir.join("a/empty2/deep")).unwrap();
+    std::fs::create_dir_all(dir.join("b/c")).unwrap();
+
+    let manifest =
+        feiq_core::network::tcp::build_folder_manifest(&path_str, 1001);
+    assert!(
+        manifest.is_none(),
+        "Tree with only empty dirs should return None, got {:?}",
+        manifest
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_folder_manifest_empty_dirs_with_files() {
+    // Empty subdirectories mixed with real files: files must be
+    // counted correctly while empty dirs contribute nothing.
+    let (path_str, dir) = temp_dir_path();
+    std::fs::create_dir_all(dir.join("empty1")).unwrap();
+    std::fs::create_dir_all(dir.join("sub/empty2")).unwrap();
+    std::fs::write(dir.join("root.txt"), "root").unwrap();
+    std::fs::write(dir.join("sub/file.txt"), "nested").unwrap();
+
+    let manifest = feiq_core::network::tcp::build_folder_manifest(&path_str, 2002)
+        .expect("Should produce manifest when files exist");
+    assert_eq!(manifest.transfer_id, 2002);
+    assert_eq!(manifest.total_files, 2);
+    assert_eq!(manifest.total_bytes, 4 + 6); // "root" + "nested"
+    assert!(manifest.files.iter().any(|f| f.relative_path == "root.txt"));
+    assert!(manifest
+        .files
+        .iter()
+        .any(|f| f.relative_path == "sub/file.txt"));
+    // Empty dirs must not appear as entries
+    assert!(!manifest.files.iter().any(|f| f.relative_path == "empty1"));
+    assert!(!manifest
+        .files
+        .iter()
+        .any(|f| f.relative_path == "sub/empty2"));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_folder_manifest_deeply_nested_single_file() {
+    // Deeply nested directory tree (10 levels) with one file at the
+    // lowest leaf. Relative path must reflect full nesting.
+    let (path_str, dir) = temp_dir_path();
+    let deep = dir.join("a/b/c/d/e/f/g/h/i/j");
+    std::fs::create_dir_all(&deep).unwrap();
+    std::fs::write(deep.join("leaf.txt"), "deeply nested content").unwrap();
+
+    let manifest = feiq_core::network::tcp::build_folder_manifest(&path_str, 3003)
+        .expect("Should produce manifest");
+    assert_eq!(manifest.transfer_id, 3003);
+    assert_eq!(manifest.total_files, 1);
+    assert_eq!(
+        manifest.files[0].relative_path, "a/b/c/d/e/f/g/h/i/j/leaf.txt",
+        "relative path must capture all 10 nesting levels"
+    );
+    assert_eq!(
+        manifest.files[0].size,
+        "deeply nested content".len() as u64
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_folder_manifest_deeply_nested_multi_level_files() {
+    // Files at multiple nesting levels in a deep tree. All relative
+    // paths, total file count, and total bytes must be correct.
+    let (path_str, dir) = temp_dir_path();
+    std::fs::create_dir_all(dir.join("lvl1/lvl2/lvl3")).unwrap();
+    std::fs::write(dir.join("root.txt"), "root").unwrap();
+    std::fs::write(dir.join("lvl1/mid.txt"), "mid").unwrap();
+    std::fs::write(dir.join("lvl1/lvl2/deep.txt"), "deep").unwrap();
+    std::fs::write(dir.join("lvl1/lvl2/lvl3/leaf.txt"), "leaf").unwrap();
+
+    let manifest = feiq_core::network::tcp::build_folder_manifest(&path_str, 4004)
+        .expect("Should produce manifest");
+    assert_eq!(manifest.total_files, 4);
+    assert_eq!(manifest.total_bytes, 4 + 3 + 4 + 4);
+    assert!(manifest
+        .files
+        .iter()
+        .any(|f| f.relative_path == "root.txt"));
+    assert!(manifest
+        .files
+        .iter()
+        .any(|f| f.relative_path == "lvl1/mid.txt"));
+    assert!(manifest
+        .files
+        .iter()
+        .any(|f| f.relative_path == "lvl1/lvl2/deep.txt"));
+    assert!(manifest
+        .files
+        .iter()
+        .any(|f| f.relative_path == "lvl1/lvl2/lvl3/leaf.txt"));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_folder_manifest_working_symlink_file() {
+    // Symlinks are skipped by walk_directory (using symlink_metadata) to
+    // prevent infinite recursion from symlinks pointing to parent dirs.
+    // Only regular files and directories are included.
+    let (path_str, dir) = temp_dir_path();
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("real.txt"), "real").unwrap();
+
+    #[cfg(unix)]
+    std::os::unix::fs::symlink("real.txt", dir.join("link.txt")).unwrap();
+
+    let manifest = feiq_core::network::tcp::build_folder_manifest(&path_str, 5005)
+        .expect("Should produce manifest");
+
+    let real_file = manifest.files.iter().any(|f| f.relative_path == "real.txt");
+    assert!(real_file, "real.txt must be in manifest");
+
+    #[cfg(unix)]
+    {
+        // Symlinks are skipped for security (prevents traversal attacks)
+        let symlink_included = manifest.files.iter().any(|f| f.relative_path == "link.txt");
+        assert!(!symlink_included, "Symlinks must be excluded from manifest");
+        assert_eq!(manifest.total_files, 1, "Only real.txt should be in manifest");
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_folder_manifest_broken_symlink() {
+    // walk_directory uses symlink_metadata() which succeeds for broken
+    // symlinks (reads the link itself, not the target). The symlink is
+    // then skipped (since symlink_metadata.file_type().is_symlink() is
+    // true), so the directory walk continues normally.
+    let (path_str, dir) = temp_dir_path();
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("real.txt"), "real").unwrap();
+
+    #[cfg(unix)]
+    std::os::unix::fs::symlink("ghost.txt", dir.join("broken.txt")).unwrap();
+
+    // On all platforms, the broken symlink is skipped and real.txt is found
+    let manifest = feiq_core::network::tcp::build_folder_manifest(&path_str, 5006)
+        .expect("Should produce manifest (broken symlink is skipped, real file remains)");
+    assert_eq!(manifest.total_files, 1, "Only real.txt should be in manifest");
+    assert!(manifest.files.iter().any(|f| f.relative_path == "real.txt"));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_folder_manifest_special_chars_roundtrip() {
+    // Special characters in file paths must survive JSON serialization
+    // and deserialization: spaces, unicode, emoji, and colon.
+    let (path_str, dir) = temp_dir_path();
+    std::fs::create_dir_all(dir.join("sub dir")).unwrap();
+    std::fs::write(dir.join("file with spaces.txt"), "spaces").unwrap();
+    std::fs::write(dir.join("sub dir/中文文件.txt"), "chinese").unwrap();
+    std::fs::write(dir.join("emoji_😊_test.txt"), "emoji").unwrap();
+    std::fs::write(dir.join("colon:file.txt"), "colon").unwrap();
+
+    let manifest = feiq_core::network::tcp::build_folder_manifest(&path_str, 6006)
+        .expect("Should produce manifest");
+    assert_eq!(manifest.total_files, 4);
+
+    // Roundtrip through JSON
+    let json = serde_json::to_vec(&manifest).unwrap();
+    let decoded: feiq_core::protocol::types::FolderManifest =
+        serde_json::from_slice(&json).unwrap();
+
+    assert_eq!(decoded.transfer_id, 6006);
+    assert_eq!(decoded.folder_name, manifest.folder_name);
+    assert_eq!(decoded.total_files, 4);
+    assert_eq!(decoded.total_bytes, manifest.total_bytes);
+    assert_eq!(decoded.files.len(), 4);
+
+    // All special-character paths survive roundtrip
+    assert!(decoded
+        .files
+        .iter()
+        .any(|f| f.relative_path == "file with spaces.txt"));
+    assert!(decoded
+        .files
+        .iter()
+        .any(|f| f.relative_path == "sub dir/中文文件.txt"));
+    assert!(decoded
+        .files
+        .iter()
+        .any(|f| f.relative_path == "emoji_😊_test.txt"));
+    assert!(decoded
+        .files
+        .iter()
+        .any(|f| f.relative_path == "colon:file.txt"));
+
+    // Each entry's size and modify_time also survive roundtrip
+    for entry in &manifest.files {
+        let matching = decoded
+            .files
+            .iter()
+            .find(|d| d.relative_path == entry.relative_path)
+            .unwrap_or_else(|| panic!("Missing entry in decoded: {}", entry.relative_path));
+        assert_eq!(matching.size, entry.size, "Size mismatch for {}", entry.relative_path);
+        assert_eq!(
+            matching.modify_time, entry.modify_time,
+            "modify_time mismatch for {}", entry.relative_path
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_folder_manifest_large_roundtrip() {
+    // Large manifest with 1000 files: verify JSON serialization handles
+    // sizable payloads, all counts and sizes are preserved, and no data
+    // corruption occurs during roundtrip.
+    let (path_str, dir) = temp_dir_path();
+    std::fs::create_dir_all(dir.join("batch")).unwrap();
+
+    let mut expected_total: u64 = 0;
+    for i in 0..1000 {
+        let content = format!("file_{}_content_{}", i, "x".repeat(i % 100));
+        expected_total += content.len() as u64;
+        std::fs::write(dir.join("batch").join(format!("file_{i}.dat")), &content).unwrap();
+    }
+
+    let manifest = feiq_core::network::tcp::build_folder_manifest(&path_str, 7007)
+        .expect("Should produce manifest for 1000 files");
+    assert_eq!(manifest.total_files, 1000);
+    assert_eq!(manifest.files.len(), 1000);
+    assert_eq!(manifest.total_bytes, expected_total);
+
+    // Verify aggregate matches individual entries
+    let computed: u64 = manifest.files.iter().map(|f| f.size).sum();
+    assert_eq!(computed, expected_total);
+
+    // JSON size should be substantial
+    let json = serde_json::to_vec(&manifest).unwrap();
+    assert!(
+        json.len() > 10000,
+        "JSON for 1000 files should be > 10KB, got {} bytes",
+        json.len()
+    );
+
+    // Full roundtrip
+    let decoded: feiq_core::protocol::types::FolderManifest =
+        serde_json::from_slice(&json).unwrap();
+    assert_eq!(decoded.total_files, 1000);
+    assert_eq!(decoded.total_bytes, expected_total);
+    assert_eq!(decoded.files.len(), 1000);
+
+    // Spot-check first, middle, and last entries
+    assert!(decoded
+        .files
+        .iter()
+        .any(|f| f.relative_path == "batch/file_0.dat"));
+    assert!(decoded
+        .files
+        .iter()
+        .any(|f| f.relative_path == "batch/file_500.dat"));
+    assert!(decoded
+        .files
+        .iter()
+        .any(|f| f.relative_path == "batch/file_999.dat"));
+
+    // Every entry from original must exist in decoded with matching size
+    for orig in &manifest.files {
+        let dec = decoded
+            .files
+            .iter()
+            .find(|d| d.relative_path == orig.relative_path)
+            .unwrap_or_else(|| panic!("Missing entry: {}", orig.relative_path));
+        assert_eq!(dec.size, orig.size, "Size mismatch for {}", orig.relative_path);
+        assert_eq!(
+            dec.modify_time, orig.modify_time,
+            "Time mismatch for {}", orig.relative_path
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[tokio::test]
 async fn test_file_notification_self_filter() {
     // A peer sending a file notification to itself (same MAC + name) must be
@@ -616,4 +923,320 @@ async fn test_file_notification_self_filter() {
             // Timeout or channel closed = self-filter works
         }
     }
+}
+
+// ─── Filename Edge Cases ─────────────────────────────────────────
+
+#[tokio::test]
+async fn test_file_notification_special_chars() {
+    // Newline and emoji characters in filenames.
+    // Newlines: tested via both GBK and UTF-8 paths.
+    // Emoji: tested via UTF-8 path only (GBK cannot encode emoji).
+    let alice = Arc::new(TestPeer::new("Alice", 13573).await);
+    let bob = Arc::new(TestPeer::new("Bob", 13574).await);
+
+    let (alice_tx, _alice_rx) = mpsc::unbounded_channel::<NetworkEvent>();
+    let (bob_tx, mut bob_rx) = mpsc::unbounded_channel::<NetworkEvent>();
+
+    let _a = alice.clone().spawn_recv(alice_tx);
+    let _b = bob.clone().spawn_recv(bob_tx);
+    sleep(Duration::from_millis(200)).await;
+
+    // 1. Newline in filename via GBK path
+    let file = FileContent {
+        file_id: 40001,
+        filename: "line1\nline2.txt".into(),
+        path: String::new(),
+        size: 1000,
+        modify_time: 1700000000,
+        file_type: 0,
+        packet_no: 0,
+        local_task_id: None,
+    };
+    let packet = build_file_gbk(&alice, 41001, &file);
+    alice.send_to("127.0.0.1", bob.port, &packet).await;
+    let event = tokio::time::timeout(Duration::from_secs(2), bob_rx.recv())
+        .await
+        .expect("Timeout: newline GBK notification not received")
+        .expect("Bob channel closed");
+    match &event {
+        NetworkEvent::Message(post) => {
+            assert_eq!(post.contents.len(), 1);
+            match &post.contents[0] {
+                Content::File(fc) => {
+                    assert_eq!(fc.file_id, 40001);
+                    assert_eq!(fc.filename, "line1\nline2.txt");
+                    assert_eq!(fc.size, 1000);
+                }
+                other => panic!("expected File, got {:?}", other.content_type()),
+            }
+        }
+        other => panic!("expected Message, got {:?}", other),
+    }
+
+    // 2. Newline in filename via UTF-8 path
+    let file = FileContent {
+        file_id: 40002,
+        filename: "hello\nworld.docx".into(),
+        path: String::new(),
+        size: 2048,
+        modify_time: 1700000001,
+        file_type: 1,
+        packet_no: 0,
+        local_task_id: None,
+    };
+    let packet = build_file_utf8(&alice, 41002, &file);
+    alice.send_to("127.0.0.1", bob.port, &packet).await;
+    let event = tokio::time::timeout(Duration::from_secs(2), bob_rx.recv())
+        .await
+        .expect("Timeout: newline UTF-8 notification not received")
+        .expect("Bob channel closed");
+    match &event {
+        NetworkEvent::Message(post) => {
+            assert_eq!(post.contents.len(), 1);
+            match &post.contents[0] {
+                Content::File(fc) => {
+                    assert_eq!(fc.file_id, 40002);
+                    assert_eq!(fc.filename, "hello\nworld.docx");
+                    assert_eq!(fc.size, 2048);
+                }
+                other => panic!("expected File, got {:?}", other.content_type()),
+            }
+        }
+        other => panic!("expected Message, got {:?}", other),
+    }
+
+    // 3. Emoji in filename via UTF-8 path
+    let file = FileContent {
+        file_id: 40003,
+        filename: "report_😊_final🎉.pdf".into(),
+        path: String::new(),
+        size: 4096,
+        modify_time: 1700000002,
+        file_type: 2,
+        packet_no: 0,
+        local_task_id: None,
+    };
+    let packet = build_file_utf8(&alice, 41003, &file);
+    alice.send_to("127.0.0.1", bob.port, &packet).await;
+    let event = tokio::time::timeout(Duration::from_secs(2), bob_rx.recv())
+        .await
+        .expect("Timeout: emoji UTF-8 notification not received")
+        .expect("Bob channel closed");
+    match &event {
+        NetworkEvent::Message(post) => {
+            assert_eq!(post.contents.len(), 1);
+            match &post.contents[0] {
+                Content::File(fc) => {
+                    assert_eq!(fc.file_id, 40003);
+                    assert_eq!(fc.filename, "report_😊_final🎉.pdf");
+                    assert_eq!(fc.size, 4096);
+                }
+                other => panic!("expected File, got {:?}", other.content_type()),
+            }
+        }
+        other => panic!("expected Message, got {:?}", other),
+    }
+}
+
+#[tokio::test]
+async fn test_file_notification_long_filename() {
+    // 500-char ASCII filename via both GBK and UTF-8 paths.
+    // Verifies that oversize filenames survive build -> wire -> parse roundtrip.
+    let alice = Arc::new(TestPeer::new("Alice", 13575).await);
+    let bob = Arc::new(TestPeer::new("Bob", 13576).await);
+    let (alice_tx, _alice_rx) = mpsc::unbounded_channel::<NetworkEvent>();
+    let (bob_tx, mut bob_rx) = mpsc::unbounded_channel::<NetworkEvent>();
+    let _a = alice.clone().spawn_recv(alice_tx);
+    let _b = bob.clone().spawn_recv(bob_tx);
+    sleep(Duration::from_millis(200)).await;
+
+    let long_name = "a".repeat(500) + ".txt";
+    assert_eq!(long_name.len(), 504);
+
+    // UTF-8 path
+    let file = FileContent {
+        file_id: 50001,
+        filename: long_name.clone(),
+        path: String::new(),
+        size: 0xABCD,
+        modify_time: 0x12345678,
+        file_type: 1,
+        packet_no: 0,
+        local_task_id: None,
+    };
+    let packet = build_file_utf8(&alice, 51001, &file);
+    assert!(
+        packet.len() < 4000,
+        "UTF-8 packet too large for 4096-byte recv buffer: {}",
+        packet.len()
+    );
+    alice.send_to("127.0.0.1", bob.port, &packet).await;
+    let event = tokio::time::timeout(Duration::from_secs(2), bob_rx.recv())
+        .await
+        .expect("Timeout: long filename UTF-8")
+        .expect("Bob channel closed");
+    match &event {
+        NetworkEvent::Message(post) => {
+            assert_eq!(post.contents.len(), 1);
+            match &post.contents[0] {
+                Content::File(fc) => {
+                    assert_eq!(fc.file_id, 50001);
+                    assert_eq!(fc.filename, long_name);
+                    assert_eq!(fc.size, 0xABCD);
+                    assert_eq!(fc.modify_time, 0x12345678);
+                }
+                other => panic!("expected File, got {:?}", other.content_type()),
+            }
+        }
+        other => panic!("expected Message, got {:?}", other),
+    }
+
+    // GBK path (ASCII filename produces identical bytes)
+    let packet_gbk = build_file_gbk(&alice, 51002, &file);
+    assert!(
+        packet_gbk.len() < 4000,
+        "GBK packet too large for 4096-byte recv buffer: {}",
+        packet_gbk.len()
+    );
+    alice.send_to("127.0.0.1", bob.port, &packet_gbk).await;
+    let event = tokio::time::timeout(Duration::from_secs(2), bob_rx.recv())
+        .await
+        .expect("Timeout: long filename GBK")
+        .expect("Bob channel closed");
+    match &event {
+        NetworkEvent::Message(post) => {
+            assert_eq!(post.contents.len(), 1);
+            match &post.contents[0] {
+                Content::File(fc) => {
+                    assert_eq!(fc.file_id, 50001);
+                    assert_eq!(fc.filename, long_name);
+                    assert_eq!(fc.size, 0xABCD);
+                }
+                other => panic!("expected File, got {:?}", other.content_type()),
+            }
+        }
+        other => panic!("expected Message, got {:?}", other),
+    }
+}
+
+#[tokio::test]
+async fn test_file_notification_file_id_zero() {
+    // file_id = 0 is a valid protocol value and must be preserved
+    // through the full build -> wire -> parse roundtrip.
+    let alice = Arc::new(TestPeer::new("Alice", 13577).await);
+    let bob = Arc::new(TestPeer::new("Bob", 13578).await);
+    let (alice_tx, _alice_rx) = mpsc::unbounded_channel::<NetworkEvent>();
+    let (bob_tx, mut bob_rx) = mpsc::unbounded_channel::<NetworkEvent>();
+    let _a = alice.clone().spawn_recv(alice_tx);
+    let _b = bob.clone().spawn_recv(bob_tx);
+    sleep(Duration::from_millis(200)).await;
+
+    // UTF-8 path
+    let file = FileContent {
+        file_id: 0,
+        filename: "zeroid.dat".into(),
+        path: String::new(),
+        size: 777,
+        modify_time: 999,
+        file_type: 0,
+        packet_no: 0,
+        local_task_id: None,
+    };
+    let packet = build_file_utf8(&alice, 71001, &file);
+    alice.send_to("127.0.0.1", bob.port, &packet).await;
+    let event = tokio::time::timeout(Duration::from_secs(2), bob_rx.recv())
+        .await
+        .expect("Timeout: file_id=0 UTF-8")
+        .expect("Bob channel closed");
+    match &event {
+        NetworkEvent::Message(post) => {
+            assert_eq!(post.contents.len(), 1);
+            match &post.contents[0] {
+                Content::File(fc) => {
+                    assert_eq!(fc.file_id, 0, "file_id must be preserved as 0");
+                    assert_eq!(fc.filename, "zeroid.dat");
+                    assert_eq!(fc.size, 777);
+                }
+                other => panic!("expected File, got {:?}", other.content_type()),
+            }
+        }
+        other => panic!("expected Message, got {:?}", other),
+    }
+
+    // Also test via GBK path
+    let packet_gbk = build_file_gbk(&alice, 71002, &file);
+    alice.send_to("127.0.0.1", bob.port, &packet_gbk).await;
+    let event = tokio::time::timeout(Duration::from_secs(2), bob_rx.recv())
+        .await
+        .expect("Timeout: file_id=0 GBK")
+        .expect("Bob channel closed");
+    match &event {
+        NetworkEvent::Message(post) => {
+            assert_eq!(post.contents.len(), 1);
+            match &post.contents[0] {
+                Content::File(fc) => {
+                    assert_eq!(fc.file_id, 0, "file_id must be preserved as 0 via GBK path");
+                    assert_eq!(fc.filename, "zeroid.dat");
+                    assert_eq!(fc.size, 777);
+                }
+                other => panic!("expected File, got {:?}", other.content_type()),
+            }
+        }
+        other => panic!("expected Message, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_file_notification_negative_size() {
+    // Negative size: build_file_message formats the i64 size field with {:X}.
+    // For negative values this produces the full 64-bit two's complement
+    // representation (FFFFFFFFFFFFFFFF for -1). parse_file_task reads it
+    // back via i64::from_str_radix(val, 16), which rejects values exceeding
+    // i64::MAX with PosOverflow. Consequently the file entry is silently dropped.
+    let file = FileContent {
+        file_id: 60001,
+        filename: "neg_size.bin".into(),
+        path: String::new(),
+        size: -1,
+        modify_time: 0xABCD,
+        file_type: 0,
+        packet_no: 0,
+        local_task_id: None,
+    };
+    let packet = build_file_message(
+        61001,
+        "Alice",
+        "test-host",
+        "feiq_plus_plus#128#MAC0001#0#0#0#1#9",
+        &file,
+        true,
+    );
+
+    // Verify wire format: negative -1 is serialized as FFFFFFFFFFFFFFFF
+    let packet_str = String::from_utf8_lossy(&packet);
+    assert!(
+        packet_str.contains("FFFFFFFFFFFFFFFF"),
+        "Negative size -1 should be formatted as FFFFFFFFFFFFFFFF, got: {packet_str}"
+    );
+    // The hex size must appear as the field immediately after filename
+    let body_part = &packet_str[packet_str.find("neg_size.bin").unwrap_or(0)..];
+    assert!(
+        body_part.starts_with("neg_size.bin:FFFFFFFFFFFFFFFF:"),
+        "Size field should be immediately after filename: {body_part}"
+    );
+
+    // Parse through the full protocol chain
+    let mut post = parse_raw(&packet, "10.0.0.1", 2425, "OTHER_MAC", "Bob")
+        .expect("Packet should be parseable as valid IPMSG");
+    let chain = feiq_core::protocol::parser::build_default_chain();
+    chain.process(&mut post);
+
+    assert!(
+        post.contents.is_empty(),
+        "Negative size FFFFFFFFFFFFFFFF overflows i64::from_str_radix, \
+         so parse_file_task returns None and the file entry is silently dropped. \
+         Got {} content(s)",
+        post.contents.len()
+    );
 }

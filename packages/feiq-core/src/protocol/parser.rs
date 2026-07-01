@@ -714,4 +714,236 @@ mod tests {
             other => panic!("Expected Text content, got: {:?}", other.content_type()),
         }
     }
+
+    // ─── File notification edge-case tests ──────────────────────
+
+    #[test]
+    fn test_chain_file_many_entries() {
+        // Single notification with 15 file entries — all must be parsed correctly
+        let chain = build_default_chain();
+        let mut post = Post::new("192.168.1.100");
+        post.cmd_id = IPMSG_SENDMSG | IPMSG_FILEATTACHOPT;
+
+        let mut extra = vec![MSG_NULL];
+        for i in 1..=15u64 {
+            let entry = format!(
+                "{}:file_{}.dat:{:X}:{:X}:1:",
+                i,
+                i,
+                1024 * i,
+                1700000000u64,
+            );
+            extra.extend_from_slice(entry.as_bytes());
+            extra.push(FILELIST_SEPARATOR);
+        }
+        post.extra = extra;
+
+        chain.process(&mut post);
+
+        assert_eq!(
+            post.contents.len(),
+            15,
+            "all 15 file entries must be parsed"
+        );
+        for (idx, content) in post.contents.iter().enumerate() {
+            match content {
+                Content::File(fc) => {
+                    let n = idx + 1;
+                    assert_eq!(fc.file_id, n as u64, "file_id at index {idx}");
+                    assert_eq!(fc.filename, format!("file_{n}.dat"), "filename at index {idx}");
+                    assert_eq!(fc.size, (1024 * n) as i64, "size at index {idx}");
+                    assert_eq!(fc.modify_time, 1700000000, "mtime at index {idx}");
+                    assert_eq!(fc.file_type, 1, "file_type at index {idx}");
+                }
+                other => {
+                    panic!(
+                        "Expected File at index {idx}, got {:?}",
+                        other.content_type()
+                    )
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_chain_file_duplicate_ids() {
+        // Multiple file entries with the same file_id — all must be parsed and preserved.
+        // File ID duplication is allowed: different files can share a protocol ID
+        // when the sender groups them (e.g. directory listing or retransmission).
+        let chain = build_default_chain();
+        let mut post = Post::new("192.168.1.200");
+        post.cmd_id = IPMSG_SENDMSG | IPMSG_FILEATTACHOPT;
+
+        let mut extra = vec![MSG_NULL];
+        for (name, size) in [("a.txt", 100u64), ("b.txt", 200), ("c.txt", 300)] {
+            let entry = format!("42:{name}:{size:X}:{:X}:1:", 1700000000u64);
+            extra.extend_from_slice(entry.as_bytes());
+            extra.push(FILELIST_SEPARATOR);
+        }
+        post.extra = extra;
+
+        chain.process(&mut post);
+
+        assert_eq!(post.contents.len(), 3, "all 3 entries parsed");
+        let expected = [("a.txt", 100i64), ("b.txt", 200), ("c.txt", 300)];
+        for (idx, (content, (exp_name, exp_size))) in
+            post.contents.iter().zip(expected.iter()).enumerate()
+        {
+            match content {
+                Content::File(fc) => {
+                    assert_eq!(fc.file_id, 42, "file_id at index {idx}");
+                    assert_eq!(fc.filename, *exp_name, "filename at index {idx}");
+                    assert_eq!(fc.size, *exp_size, "size at index {idx}");
+                    assert_eq!(fc.modify_time, 1700000000);
+                    assert_eq!(fc.file_type, 1);
+                }
+                other => {
+                    panic!(
+                        "Expected File at index {idx}, got {:?}",
+                        other.content_type()
+                    )
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_chain_file_mixed_regular_directory() {
+        // Notification mixing regular files (file_type=1) and directories (file_type=2).
+        // Each entry's file_type must be preserved exactly.
+        let chain = build_default_chain();
+        let mut post = Post::new("10.0.0.50");
+        post.cmd_id = IPMSG_SENDMSG | IPMSG_FILEATTACHOPT;
+
+        let mut extra = vec![MSG_NULL];
+        for (id, name, size, ftype) in [
+            (1u64, "doc.pdf", 0x8000u64, 1u32),       // regular
+            (2, "my_folder", 0, 2u32),                  // directory
+            (3, "photo.jpg", 0x10000u64, 1u32),         // regular
+            (4, "subdir", 0, 2u32),                      // directory
+        ] {
+            let entry =
+                format!("{id}:{name}:{size:X}:{:X}:{ftype:X}:", 0xA5A5A5u64);
+            extra.extend_from_slice(entry.as_bytes());
+            extra.push(FILELIST_SEPARATOR);
+        }
+        post.extra = extra;
+
+        chain.process(&mut post);
+
+        assert_eq!(post.contents.len(), 4, "4 entries parsed");
+
+        let expected_types = [1u32, 2, 1, 2];
+        let expected_names = ["doc.pdf", "my_folder", "photo.jpg", "subdir"];
+        for (idx, content) in post.contents.iter().enumerate() {
+            match content {
+                Content::File(fc) => {
+                    assert_eq!(
+                        fc.file_type, expected_types[idx],
+                        "file_type at index {idx}"
+                    );
+                    assert_eq!(
+                        fc.filename, expected_names[idx],
+                        "filename at index {idx}"
+                    );
+                    assert_eq!(fc.file_id, (idx + 1) as u64, "file_id at index {idx}");
+                    if idx == 0 {
+                        assert_eq!(fc.size, 0x8000);
+                    } else if idx == 2 {
+                        assert_eq!(fc.size, 0x10000);
+                    }
+                }
+                other => {
+                    panic!(
+                        "Expected File at index {idx}, got {:?}",
+                        other.content_type()
+                    )
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_chain_file_separator_positions() {
+        // FILELIST_SEPARATOR (0x07) in unexpected positions.
+        // These are robustness tests: the parser must not panic or corrupt data.
+
+        // 1. Trailing separator after the last valid entry (common in legacy clients)
+        {
+            let chain = build_default_chain();
+            let mut post = Post::new("10.0.0.1");
+            post.cmd_id = IPMSG_SENDMSG | IPMSG_FILEATTACHOPT;
+            let mut extra = vec![MSG_NULL];
+            extra.extend_from_slice(b"1:file.txt:100:1A:1:");
+            extra.push(FILELIST_SEPARATOR); // trailing — valid, ignored after last entry
+            post.extra = extra;
+
+            chain.process(&mut post);
+            assert_eq!(post.contents.len(), 1, "trailing separator: 1 entry");
+            if let Content::File(fc) = &post.contents[0] {
+                assert_eq!(fc.file_id, 1);
+                assert_eq!(fc.filename, "file.txt");
+            } else {
+                panic!("Expected File");
+            }
+        }
+
+        // 2. Leading separator (before any entry) — causes immediate loop break, 0 entries
+        {
+            let chain = build_default_chain();
+            let mut post = Post::new("10.0.0.2");
+            post.cmd_id = IPMSG_SENDMSG | IPMSG_FILEATTACHOPT;
+            let mut extra = vec![MSG_NULL];
+            extra.push(FILELIST_SEPARATOR); // leading — no entry before it
+            extra.extend_from_slice(b"2:file2.txt:200:2A:1:");
+            extra.push(FILELIST_SEPARATOR);
+            post.extra = extra;
+
+            chain.process(&mut post);
+            assert_eq!(
+                post.contents.len(),
+                0,
+                "leading separator: 0 entries parsed"
+            );
+        }
+
+        // 3. Consecutive separators (empty entry between valid entries) — stops at the gap
+        {
+            let chain = build_default_chain();
+            let mut post = Post::new("10.0.0.3");
+            post.cmd_id = IPMSG_SENDMSG | IPMSG_FILEATTACHOPT;
+            let mut extra = vec![MSG_NULL];
+            extra.extend_from_slice(b"3:first.txt:100:1A:1:");
+            extra.push(FILELIST_SEPARATOR);
+            extra.push(FILELIST_SEPARATOR); // empty-entry gap
+            extra.extend_from_slice(b"4:second.txt:200:2A:1:");
+            extra.push(FILELIST_SEPARATOR);
+            post.extra = extra;
+
+            chain.process(&mut post);
+            assert_eq!(
+                post.contents.len(),
+                1,
+                "consecutive separator gap: only entry before gap"
+            );
+            if let Content::File(fc) = &post.contents[0] {
+                assert_eq!(fc.file_id, 3);
+                assert_eq!(fc.filename, "first.txt");
+            } else {
+                panic!("Expected File");
+            }
+        }
+
+        // 4. Only null + separator (no file data at all)
+        {
+            let chain = build_default_chain();
+            let mut post = Post::new("10.0.0.4");
+            post.cmd_id = IPMSG_SENDMSG | IPMSG_FILEATTACHOPT;
+            post.extra = vec![MSG_NULL, FILELIST_SEPARATOR];
+
+            chain.process(&mut post);
+            assert_eq!(post.contents.len(), 0, "null+separator only: 0 entries");
+        }
+    }
+
 }

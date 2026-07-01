@@ -150,3 +150,136 @@ pub fn is_cmd_set(cmd: u32, test: u32) -> bool {
 pub fn is_opt_set(cmd: u32, opt: u32) -> bool {
     (cmd & opt) == opt
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    // ─── File/folder constant uniqueness ─────────────────────
+
+    #[test]
+    fn file_type_values_are_unique() {
+        let ft: [u32; 8] = [
+            IPMSG_FILE_REGULAR,
+            IPMSG_FILE_DIR,
+            IPMSG_FILE_RETPARENT,
+            IPMSG_FILE_SYMLINK,
+            IPMSG_FILE_CDEV,
+            IPMSG_FILE_BDEV,
+            IPMSG_FILE_FIFO,
+            IPMSG_FILE_RESFORK,
+        ];
+        let mut seen = HashSet::new();
+        for v in ft {
+            assert!(seen.insert(v), "duplicate file type value: 0x{:08X}", v);
+        }
+    }
+
+    #[test]
+    fn file_attr_values_are_unique() {
+        let fa: [u32; 5] = [
+            IPMSG_FILE_RONLYOPT,
+            IPMSG_FILE_HIDDENOPT,
+            IPMSG_FILE_EXHIDDENOPT,
+            IPMSG_FILE_ARCHIVEOPT,
+            IPMSG_FILE_SYSTEMOPT,
+        ];
+        let mut seen = HashSet::new();
+        for v in fa {
+            assert!(seen.insert(v), "duplicate file attr value: 0x{:08X}", v);
+        }
+    }
+
+    #[test]
+    fn file_types_and_attrs_do_not_overlap() {
+        let ft: [u32; 8] = [
+            IPMSG_FILE_REGULAR,
+            IPMSG_FILE_DIR,
+            IPMSG_FILE_RETPARENT,
+            IPMSG_FILE_SYMLINK,
+            IPMSG_FILE_CDEV,
+            IPMSG_FILE_BDEV,
+            IPMSG_FILE_FIFO,
+            IPMSG_FILE_RESFORK,
+        ];
+        let fa: [u32; 5] = [
+            IPMSG_FILE_RONLYOPT,
+            IPMSG_FILE_HIDDENOPT,
+            IPMSG_FILE_EXHIDDENOPT,
+            IPMSG_FILE_ARCHIVEOPT,
+            IPMSG_FILE_SYSTEMOPT,
+        ];
+        for t in &ft {
+            for a in &fa {
+                assert_ne!(
+                    t, a,
+                    "file type 0x{:08X} collides with file attr 0x{:08X}",
+                    t, a
+                );
+            }
+        }
+    }
+
+    // ─── Marker byte sequence distinctness ──────────────────
+
+    #[test]
+    fn folder_marker_bytes_are_distinct() {
+        let markers: [&[u8]; 4] = [
+            FOLDER_MANIFEST_REQUEST,
+            FOLDER_TRANSFER_COMPLETE,
+            FOLDER_TRANSFER_CANCEL,
+            FOLDER_FILE_ACK,
+        ];
+        // No marker should be a prefix of another (wire protocol safety)
+        for (i, a) in markers.iter().enumerate() {
+            for (j, b) in markers.iter().enumerate() {
+                if i == j {
+                    continue;
+                }
+                let a_is_prefix = a.len() <= b.len() && &b[..a.len()] == *a;
+                assert!(
+                    !a_is_prefix,
+                    "{:?} is a prefix of {:?}",
+                    String::from_utf8_lossy(a),
+                    String::from_utf8_lossy(b)
+                );
+            }
+        }
+        // All markers are non-empty and end with newline
+        for m in &markers {
+            assert!(!m.is_empty(), "marker is empty");
+            assert_eq!(m[m.len() - 1], b'\n', "marker {:?} must end with newline", String::from_utf8_lossy(m));
+        }
+    }
+
+    #[test]
+    fn folder_marker_lengths_are_unique() {
+        let markers: [&[u8]; 4] = [
+            FOLDER_MANIFEST_REQUEST,
+            FOLDER_TRANSFER_COMPLETE,
+            FOLDER_TRANSFER_CANCEL,
+            FOLDER_FILE_ACK,
+        ];
+        let mut seen = HashSet::new();
+        for m in &markers {
+            assert!(seen.insert(m.len()), "duplicate marker length {}", m.len());
+        }
+    }
+
+    // ─── Separator byte uniqueness ──────────────────────────
+
+    #[test]
+    fn separator_bytes_are_distinct() {
+        let seps: [u8; 4] = [
+            FILELIST_SEPARATOR,
+            HOSTLIST_DUMMY,
+            HLIST_ENTRY_SEPARATOR,
+            MSG_NULL,
+        ];
+        let mut seen = HashSet::new();
+        for s in seps {
+            assert!(seen.insert(s), "duplicate separator byte 0x{:02X}", s);
+        }
+    }
+}
