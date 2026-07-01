@@ -356,7 +356,14 @@ pub async fn download_file(
     };
 
     let (peer_ip, packet_no, file_id, total, filename) = task_info;
-    let peer_port = 2425;
+    let peer_port = {
+        // Read the actual port from the contact book (not hardcoded 2425)
+        let engine = state.engine.lock().await;
+        engine
+            .find_contact(&peer_ip)
+            .map(|f| f.port)
+            .unwrap_or(2425)
+    };
 
     // Phase 2: TCP transfer (engine lock released)
     let mut ft = network

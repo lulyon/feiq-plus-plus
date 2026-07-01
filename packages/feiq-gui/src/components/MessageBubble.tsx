@@ -133,12 +133,14 @@ function normalizeContent(raw: Record<string, unknown>): NormalizedContent {
     };
   }
   if (raw.image !== undefined) return { type: "image" };
-  // Already internally-tagged or unknown — return as-is with defaults
+  // Internally-tagged (serde): {"type": "file", "file_id": 123, "filename": "...", "local_task_id": 456, ...}
+  // Fall through for file/image/sealed and unknown types
   return {
     type: String(raw.type || "text"),
     text: typeof raw.text === "string" ? raw.text : String(raw.text || ""),
     filename: String(raw.filename || ""),
     size: Number(raw.size || 0),
+    localTaskId: raw.local_task_id !== undefined ? Number(raw.local_task_id) : undefined,
   };
 }
 
@@ -151,7 +153,6 @@ async function handleFileClick(content: NormalizedContent) {
   try {
     const savePath = await save({
       defaultPath: content.filename || "download",
-      filters: [{ name: "All Files", extensions: ["*"] }],
     });
     if (!savePath) return; // User canceled
     await invoke("download_file", {
