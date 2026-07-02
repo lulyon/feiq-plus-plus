@@ -32,6 +32,18 @@ enum ClientMessage {
         ipmsg_data: String,
     },
     Ping,
+    /// Initiate a binary file transfer stream through the relay
+    FileStart {
+        to: String,
+        file_id: u64,
+        file_name: String,
+        file_size: u64,
+    },
+    /// End a binary file transfer stream
+    FileEnd {
+        to: String,
+        file_id: u64,
+    },
 }
 
 #[derive(Debug, Serialize)]
@@ -63,6 +75,19 @@ enum ServerMessage<'a> {
         messages: Vec<&'a PendingMessage>,
     },
     Pong,
+    /// Forward file transfer start notification to the receiver
+    FileStart {
+        from: String,
+        from_name: String,
+        file_id: u64,
+        file_name: String,
+        file_size: u64,
+    },
+    /// Forward file transfer end notification to the receiver
+    FileEnd {
+        from: String,
+        file_id: u64,
+    },
     Error {
         message: String,
     },
@@ -106,6 +131,11 @@ struct PendingMessage {
     timestamp: i64,
 }
 
+/// Tracks an active binary file transfer stream between two peers
+struct FileTransferStream {
+    receiver_id: String,
+}
+
 struct Room {
     clients: HashMap<String, ClientState>,
     offline_queue: Vec<PendingMessage>,
@@ -113,6 +143,8 @@ struct Room {
     /// Populated on every Join, never cleared. Used to resolve the target's
     /// stable peer_key when queuing offline messages for a disconnected peer.
     peer_key_map: HashMap<String, String>,
+    /// Active file transfer streams: (sender_id, file_id) → FileTransferStream
+    file_transfers: HashMap<(String, u64), FileTransferStream>,
 }
 
 struct Server {
@@ -131,6 +163,7 @@ impl Server {
             clients: HashMap::new(),
             offline_queue: Vec::new(),
             peer_key_map: HashMap::new(),
+            file_transfers: HashMap::new(),
         })
     }
 }
@@ -232,7 +265,29 @@ async fn handle_connection(
                         // Client disconnected
                         break;
                     }
-                    Some(Ok(_)) => {} // ignore binary/ping/pong
+                    Some(Ok(Message::Binary(data))) => {
+                        // Binary file chunk: [8 bytes file_id BE][chunk data]
+                        if data.len() >= 8 {
+                            let file_id = u64::from_be_bytes([
+                                data[0], data[1], data[2], data[3],
+                                data[4], data[5], data[6], data[7],
+                            ]);
+                            let s = server.lock().await;
+                            if let (Some(rid), Some(cid)) = (&room_name, &client_id) {
+                                if let Some(room) = s.rooms.get(rid) {
+                                    if let Some(stream) = room.file_transfers.get(&(cid.clone(), file_id)) {
+                                        if let Some(target) = room.clients.get(&stream.receiver_id) {
+                                            // Forward binary chunk (with file_id prefix) to receiver
+                                            let _ = target.tx.send(Message::Binary(data));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Some(Ok(Message::Ping(_)))
+                    | Some(Ok(Message::Pong(_)))
+                    | Some(Ok(Message::Frame(_))) => {} // ignore ping/pong/frame
                     Some(Err(e)) => {
                         tracing::warn!("WS error from {addr}: {e}");
                         break;
@@ -248,6 +303,9 @@ async fn handle_connection(
         if let Some(room) = s.rooms.get_mut(rid) {
             let client_peer_key = room.clients.get(cid).map(|c| c.peer_key.clone());
             let client_name = room.clients.get(cid).map(|c| c.name.clone()).unwrap_or_default();
+
+            // Clean up file transfer streams owned by this client
+            room.file_transfers.retain(|(sender_id, _), _| sender_id != cid);
             room.clients.remove(cid);
 
             // Clean up orphaned peer_key_map entry: remove this UUID from
@@ -389,6 +447,8 @@ async fn handle_client_msg(
             if let (Some(rid), Some(cid)) = (room_name.as_ref(), client_id.as_ref()) {
                 let mut s = server.lock().await;
                 if let Some(room) = s.rooms.get_mut(rid) {
+                    // Clean up file transfer streams owned by this client
+                    room.file_transfers.retain(|(sender_id, _), _| sender_id != cid);
                     if let Some(client) = room.clients.remove(cid) {
                         let peer_key = client.peer_key.clone();
                         // Clean orphaned peer_key_map entry
@@ -510,6 +570,63 @@ async fn handle_client_msg(
         ClientMessage::Ping => {
             let pong = serde_json::to_string(&ServerMessage::Pong).unwrap();
             let _ = tx.send(Message::Text(pong));
+        }
+
+        ClientMessage::FileStart {
+            to,
+            file_id,
+            file_name,
+            file_size,
+        } => {
+            let from_id = client_id.clone().unwrap_or_default();
+            let mut s = server.lock().await;
+            if let Some(room) = room_name.as_ref().and_then(|r| s.rooms.get_mut(r)) {
+                let from_name = room
+                    .clients
+                    .get(&from_id)
+                    .map(|c| c.name.clone())
+                    .unwrap_or_default();
+
+                // Register the file transfer stream
+                room.file_transfers.insert(
+                    (from_id.clone(), file_id),
+                    FileTransferStream {
+                        receiver_id: to.clone(),
+                    },
+                );
+
+                // Forward FileStart to receiver if online
+                if let Some(target) = room.clients.get(&to) {
+                    let msg = serde_json::to_string(&ServerMessage::FileStart {
+                        from: from_id,
+                        from_name,
+                        file_id,
+                        file_name,
+                        file_size,
+                    })
+                    .unwrap();
+                    let _ = target.tx.send(Message::Text(msg));
+                }
+            }
+        }
+
+        ClientMessage::FileEnd { to, file_id } => {
+            let from_id = client_id.clone().unwrap_or_default();
+            let mut s = server.lock().await;
+            if let Some(room) = room_name.as_ref().and_then(|r| s.rooms.get_mut(r)) {
+                // Remove the file transfer stream
+                room.file_transfers.remove(&(from_id.clone(), file_id));
+
+                // Forward FileEnd to receiver if online
+                if let Some(target) = room.clients.get(&to) {
+                    let msg = serde_json::to_string(&ServerMessage::FileEnd {
+                        from: from_id,
+                        file_id,
+                    })
+                    .unwrap();
+                    let _ = target.tx.send(Message::Text(msg));
+                }
+            }
         }
     }
 }

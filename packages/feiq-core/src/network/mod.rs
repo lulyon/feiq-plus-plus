@@ -24,6 +24,8 @@ pub enum NetworkEvent {
         file_id: u64,
         offset: i64,
         from: Fellow,
+        /// Optional password for shared directory access (IPMSG_PASSWORDOPT)
+        password: Option<String>,
     },
     /// Error in network processing
     Error(String),
@@ -32,5 +34,23 @@ pub enum NetworkEvent {
         packet_no: u64,
         file_id: u64,
         from: Fellow,
+    },
+    /// Relay file transfer: start notification from sender
+    FileStartViaRelay {
+        from_peer_id: String,
+        file_id: u64,
+        file_name: String,
+        file_size: u64,
+    },
+    /// Relay file transfer: end notification from sender
+    FileEndViaRelay {
+        from_peer_id: String,
+        file_id: u64,
+    },
+    /// Relay file transfer: binary chunk received
+    FileChunk {
+        from_peer_id: String,
+        file_id: u64,
+        data: Vec<u8>,
     },
 }

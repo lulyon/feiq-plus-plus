@@ -11,6 +11,7 @@ import type { Content } from "./stores/messageStore";
 import { useFileTransferStore, type FileTransfer } from "./stores/fileTransferStore";
 import { useGroupStore } from "./stores/groupStore";
 import type { Group } from "./stores/groupStore";
+import { useTypingStore } from "./stores/typingStore";
 
 /// ─── File transfer helpers ────────────────────────────────────
 
@@ -130,6 +131,29 @@ export default function App() {
       },
     ).then((fn) => unlisteners.push(fn));
 
+    // Sealed message read confirmation
+    listen<{ fromIp: string; fromName: string; packetNo: number }>(
+      "message-read-confirmed",
+      (event) => {
+        console.log(
+          `Message read confirmed: ${event.payload.fromName} read packet #${event.payload.packetNo}`,
+        );
+      },
+    ).then((fn) => unlisteners.push(fn));
+
+    // Typing indicator
+    listen<{ fromIp: string; fromName: string; isTyping: boolean }>(
+      "typing-indicator",
+      (event) => {
+        const { fromIp, fromName, isTyping } = event.payload;
+        if (isTyping) {
+          useTypingStore.getState().setTyping(fromIp, fromName);
+        } else {
+          useTypingStore.getState().clearTyping(fromIp);
+        }
+      },
+    ).then((fn) => unlisteners.push(fn));
+
     // Auto-start engine
     invoke("start_engine").catch((e) => console.error("Engine start failed:", e));
 
@@ -178,9 +202,10 @@ export default function App() {
     };
   }, [selectedIp]);
 
-  // ─── Apply theme class to document ─────────────────────────
+  // ─── Apply theme + font settings to document ─────────────────
   useEffect(() => {
     invoke("get_settings").then((config: any) => {
+      // Theme
       const theme = config.theme || "auto";
       if (theme === "auto") {
         const mq = window.matchMedia("(prefers-color-scheme: dark)");
@@ -192,6 +217,23 @@ export default function App() {
         document.documentElement.classList.add("theme-dark");
       } else {
         document.documentElement.classList.remove("theme-dark");
+      }
+      // Custom theme CSS variables (Feature 10)
+      if (theme === "custom" && config.custom_theme) {
+        const ct = config.custom_theme;
+        if (ct.bg) document.documentElement.style.setProperty("--color-bg", ct.bg);
+        if (ct.surface) document.documentElement.style.setProperty("--color-surface", ct.surface);
+        if (ct.primary) document.documentElement.style.setProperty("--color-primary", ct.primary);
+        if (ct.text) document.documentElement.style.setProperty("--color-text", ct.text);
+        if (ct.bubble_sent) document.documentElement.style.setProperty("--color-bubble-sent", ct.bubble_sent);
+        if (ct.bubble_recv) document.documentElement.style.setProperty("--color-bubble-recv", ct.bubble_recv);
+      }
+      // Font customization (Feature 11)
+      if (config.font_family) {
+        document.documentElement.style.setProperty("--font-family", config.font_family);
+      }
+      if (config.font_size && config.font_size !== 14) {
+        document.documentElement.style.setProperty("--font-size", `${config.font_size}px`);
       }
     });
   }, []);

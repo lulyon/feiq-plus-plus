@@ -163,8 +163,11 @@ export function Sidebar() {
     const filtered = searchQuery
       ? contacts.filter((c) => {
           const displayName = c.alias || c.name || c.pc_name || c.ip;
-          return displayName.toLowerCase().includes(searchQuery.toLowerCase()) ||
-                 c.ip.includes(searchQuery);
+          const q = searchQuery.toLowerCase();
+          return displayName.toLowerCase().includes(q) ||
+                 c.ip.includes(q) ||
+                 c.host.toLowerCase().includes(q) ||
+                 c.pc_name.toLowerCase().includes(q);
         })
       : contacts;
 

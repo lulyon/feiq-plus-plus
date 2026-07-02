@@ -43,4 +43,18 @@ pub enum FrontendEvent {
     /// Engine error
     #[serde(rename = "engine_error")]
     Error(String),
+    /// A sealed message we sent was read by the recipient
+    #[serde(rename = "message_read_confirmed")]
+    MessageReadConfirmed {
+        from_ip: String,
+        from_name: String,
+        packet_no: u64,
+    },
+    /// A peer is typing or stopped typing
+    #[serde(rename = "typing_indicator")]
+    TypingIndicator {
+        from_ip: String,
+        from_name: String,
+        is_typing: bool,
+    },
 }

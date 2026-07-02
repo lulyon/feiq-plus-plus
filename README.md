@@ -15,10 +15,14 @@
 - 实时进度显示、取消/续传
 - 拖拽发送
 - 64KB 分块传输
+- 上传/下载限速（可配置 KB/s）
+- 中继文件传输（跨网络通过 WebSocket 二进制隧道）
+- 密码保护的文件共享目录浏览
 
 ### 群组
 - 无服务器 P2P 聊天室，无限创建群组
-- 群发消息、P2P 群组分发
+- 群发消息、群文件共享、群公告、P2P 群组分发
+- 群主权限控制、群设置管理
 
 ### 跨网络通信
 - 自建 Rust WebSocket 中继服务器 `feiq-relay`
@@ -30,20 +34,25 @@
 - feiq++ 间 ECDH (x25519) + AES-256-GCM 端到端加密
 - 密封消息 (阅后即焚)
 - 随机数前缀防重放
+- 隐身模式（全局不可见）
 
 ### 用户管理
 - 好友分组树、自定义备注名/别名编辑、个性签名
+- 拼音搜索联系人（支持首字母和全拼）
 - 黑名单过滤
 - 名称/IP 搜索、自定义广播网段
+- 个人头像（SHA256 哈希 + 网络传输）
 
 ### 聊天记录
 - SQLite 持久化存储、无限滚动加载历史
 - 全文搜索、日期分隔线、JSON 导出/导入
 
 ### 个性化
-- 明/暗/自动跟随系统主题 (CSS 变量 + Tailwind)
+- 明/暗/自动/自定义主题 (CSS 变量 + Tailwind + 运行时注入)
 - 系统原生通知 + Dock/Taskbar 未读角标
 - 系统托盘快捷操作
+- 字体自定义（族 + 大小）
+- 涂鸦绘画工具（Canvas 自由绘制）
 
 ## 平台支持
 
@@ -78,16 +87,16 @@ feiq-plus-plus/
 │   │       ├── model/          # 联系人簿 (线程安全)
 │   │       └── storage/        # SQLite 聊天记录 + INI 配置
 │   ├── feiq-app/               # Tauri 2 桌面壳
-│   │   └── src/                # commands (26), events, state, tray
+│   │   └── src/                # commands (36), events, state, tray
 │   ├── feiq-relay/             # Rust WebSocket 中继服务器
 │   │   └── src/                # server, main, lib
 │   └── feiq-gui/               # React 前端
 │       └── src/
 │           ├── components/     # Sidebar, ChatPanel, MessageBubble, InputArea,
 │           │                   # EmojiPicker, SettingsDialog, CreateGroupDialog,
-│           │                   # FileTransferPanel
+│           │                   # FileTransferPanel, DoodleDialog, RemoteFileBrowser
 │           └── stores/         # Zustand: contactStore, messageStore,
-│                               # fileTransferStore, groupStore
+│                               # fileTransferStore, groupStore, typingStore
 ├── docs/
 │   ├── PLAN.md                  # 完整实现计划
 │   ├── phase-execution-plan.md  # 详细执行方案
@@ -121,7 +130,7 @@ cargo tauri dev
 # 仅编译 Rust 核心库
 cargo build --workspace
 
-# 运行全部测试 (192 Rust + 18 TypeScript)
+# 运行全部测试 (200 Rust + 18 TypeScript)
 cargo test --workspace
 npm --prefix packages/feiq-gui test
 
@@ -175,7 +184,7 @@ feiq_plus_plus#128#MAC地址#0#0#0#1#9
 ### 运行测试
 
 ```bash
-cargo test --workspace                    # 全部 192 个 Rust 测试
+cargo test --workspace                    # 全部 200 个 Rust 测试
 cargo test -p feiq-core                   # 仅核心库测试
 npm --prefix packages/feiq-gui test       # 前端 18 个 TypeScript 测试
 ```
@@ -183,20 +192,28 @@ npm --prefix packages/feiq-gui test       # 前端 18 个 TypeScript 测试
 ### 代码统计
 
 ```
-Rust 源码:    ~9,500 行 (30+ 文件, 3 crates)
-React/TS:     ~2,500 行 (9 组件 + 4 stores)
-测试覆盖:     210 个测试 (192 Rust + 18 TS), 全部通过
+Rust 源码:    ~11,000 行 (35+ 文件, 3 crates)
+React/TS:     ~3,000 行 (11 组件 + 5 stores)
+测试覆盖:     218 个测试 (200 Rust + 18 TS), 全部通过
+IPC 命令:     36 个
 ```
 
 ## 最近更新 (v0.1.4)
 
-- **审计修复**: 100-agent 全面审计，修复 17 个问题（含 AES-GCM nonce 重用、中继离线消息丢失、引擎停止泄漏等关键问题）
-- **中继服务器 (Relay Server)**: 独立 WebSocket 中继服务器 `feiq-relay`，跨网络通信。三种连接模式：纯局域网、纯中继、混合模式。修复离线消息队列（稳定 peer_key 路由）
-- **端到端加密**: ECDH (x25519) 密钥交换 + AES-256-GCM，随机 nonce 前缀防重放，仅 feiq++ 间通信自动启用
-- **文件传输**: 完整 IPMSG GETFILEDATA 拉取协议，进度追踪、取消/续传，文件大小安全校验
-- **主题系统**: 明/暗/自动主题，CSS 变量 + Tailwind，持久化保存
-- **群组聊天**: 创建群组、群发消息，P2P 分发无服务端依赖
-- **聊天记录增强**: 无限滚动历史加载、全文搜索、日期分隔线、JSON 导出/导入
+- **中继文件传输**: WebSocket 二进制隧道，支持跨网络文件收发，移除中继下载守卫
+- **文件共享**: 密码保护共享目录浏览 (`browse_shared_folder`)，兼容 IPMSG PASSWORDOPT
+- **传输限速**: 可配置文件上传/下载限速 (KB/s)，sleep-based pacing
+- **输入状态提示**: `IPMSG_INPUTING`/`IPMSG_INPUT_END` 协议支持，前端 debounce + 5s 自动清除
+- **隐身模式**: 全局不可见，不广播 BR_ENTRY，不应答 ANSENTRY
+- **拼音搜索**: 首字母 + 全拼匹配，`pinyin` crate 集成
+- **个人头像**: `IPMSG_GETAVATAR`/`IPMSG_SENDAVATAR` 协议扩展，SHA256 哈希交换
+- **主题增强**: 自定义主题 `CustomTheme` 结构体，运行时 CSS 变量注入
+- **字体自定义**: `--font-family` / `--font-size` CSS 变量，配置持久化
+- **涂鸦工具**: HTML5 Canvas 自由绘制 (画笔/橡皮擦/颜色/线宽/撤销)
+- **群组增强**: 群文件共享、群公告、群主权限控制 (owner_ip + settings)
+- **BR_ABSENCE**: 名称/状态变更检测，兼容飞秋旧版客户端
+- **READMSG/ANSREADMSG**: 密封消息已读回执处理
+- **审计修复**: AES-GCM nonce 重用、中继离线消息丢失、引擎停止泄漏等 17 个关键问题修复
 
 ## License
 

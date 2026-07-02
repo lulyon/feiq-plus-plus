@@ -68,9 +68,11 @@ impl HistoryDb {
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     group_name TEXT NOT NULL UNIQUE,
                     member_ips TEXT NOT NULL,
-                    created_at INTEGER NOT NULL
+                    created_at INTEGER NOT NULL,
+                    owner_ip TEXT NOT NULL DEFAULT '',
+                    settings TEXT NOT NULL DEFAULT '{}'
                 );
-                PRAGMA user_version = 1;",
+                PRAGMA user_version = 2;",
             )?;
         }
 
@@ -80,10 +82,16 @@ impl HistoryDb {
                 ip TEXT PRIMARY KEY,
                 alias TEXT NOT NULL DEFAULT '',
                 signature TEXT NOT NULL DEFAULT '',
-                group_name TEXT NOT NULL DEFAULT ''
+                group_name TEXT NOT NULL DEFAULT '',
+                avatar_hash TEXT NOT NULL DEFAULT ''
             )",
             [],
         )?;
+        // Migration: add avatar_hash column for older DBs
+        let _ = conn.execute(
+            "ALTER TABLE contact_meta ADD COLUMN avatar_hash TEXT NOT NULL DEFAULT ''",
+            [],
+        );
 
         // Always ensure blacklist table exists (for existing DBs without it)
         conn.execute(
@@ -110,7 +118,9 @@ impl HistoryDb {
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     group_name TEXT NOT NULL UNIQUE,
                     member_ips TEXT NOT NULL,
-                    created_at INTEGER NOT NULL
+                    created_at INTEGER NOT NULL,
+                    owner_ip TEXT NOT NULL DEFAULT '',
+                    settings TEXT NOT NULL DEFAULT '{}'
                 );
                 INSERT INTO groups_info_v2 (group_name, member_ips, created_at)
                     SELECT group_name, member_ips, created_at
@@ -120,9 +130,79 @@ impl HistoryDb {
                 ALTER TABLE groups_info_v2 RENAME TO groups_info;
                 PRAGMA user_version = 1;",
             )?;
+            // Migration v2: add owner_ip and settings columns to groups_info
+            let v: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+            if v < 3 {
+                let _ = conn.execute(
+                    "ALTER TABLE groups_info ADD COLUMN owner_ip TEXT NOT NULL DEFAULT ''",
+                    [],
+                );
+                let _ = conn.execute(
+                    "ALTER TABLE groups_info ADD COLUMN settings TEXT NOT NULL DEFAULT '{}'",
+                    [],
+                );
+                // Create group_announcements table
+                let _ = conn.execute(
+                    "CREATE TABLE IF NOT EXISTS group_announcements (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        group_name TEXT NOT NULL,
+                        content TEXT NOT NULL,
+                        sender_ip TEXT NOT NULL,
+                        created_at INTEGER NOT NULL
+                    )",
+                    [],
+                );
+                conn.pragma_update(None, "user_version", 3)?;
+            }
         }
 
         Ok(Self { conn })
+    }
+
+    // ─── Group Announcements ──────────────────────────────────
+
+    /// Save a group announcement
+    pub fn save_announcement(
+        &self,
+        group_name: &str,
+        content: &str,
+        sender_ip: &str,
+    ) -> anyhow::Result<i64> {
+        self.conn.execute(
+            "INSERT INTO group_announcements (group_name, content, sender_ip, created_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![group_name, content, sender_ip, Utc::now().timestamp_millis()],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Get announcements for a group (most recent first, limited)
+    pub fn get_announcements(
+        &self,
+        group_name: &str,
+        limit: usize,
+        offset: usize,
+    ) -> anyhow::Result<Vec<(i64, String, String, i64)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, content, sender_ip, created_at FROM group_announcements
+             WHERE group_name = ?1 ORDER BY created_at DESC LIMIT ?2 OFFSET ?3",
+        )?;
+        let rows = stmt.query_map(
+            params![group_name, limit as i64, offset as i64],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            },
+        )?;
+        let mut result = Vec::new();
+        for row in rows {
+            result.push(row?);
+        }
+        Ok(result)
     }
 
     /// Save a message to history
@@ -275,12 +355,54 @@ impl HistoryDb {
 
     /// Save a group definition (replaces existing group with same name)
     pub fn save_group(&self, name: &str, member_ips: &[String]) -> anyhow::Result<()> {
+        self.save_group_with_owner(name, member_ips, "")
+    }
+
+    /// Save a group with owner_ip and optional settings JSON
+    pub fn save_group_with_owner(
+        &self,
+        name: &str,
+        member_ips: &[String],
+        owner_ip: &str,
+    ) -> anyhow::Result<()> {
         let members_json = serde_json::to_string(member_ips)?;
         self.conn.execute(
-            "INSERT INTO groups_info (group_name, member_ips, created_at)
-             VALUES (?1, ?2, ?3)
-             ON CONFLICT(group_name) DO UPDATE SET member_ips = excluded.member_ips, created_at = excluded.created_at",
-            params![name, members_json, Utc::now().timestamp_millis()],
+            "INSERT INTO groups_info (group_name, member_ips, created_at, owner_ip)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(group_name) DO UPDATE SET member_ips = excluded.member_ips, owner_ip = excluded.owner_ip",
+            params![name, members_json, Utc::now().timestamp_millis(), owner_ip],
+        )?;
+        Ok(())
+    }
+
+    /// Delete a group by name
+    pub fn delete_group(&self, name: &str) -> anyhow::Result<()> {
+        self.conn.execute(
+            "DELETE FROM groups_info WHERE group_name = ?1",
+            params![name],
+        )?;
+        Ok(())
+    }
+
+    /// Get group owner and settings
+    pub fn get_group_info(&self, name: &str) -> anyhow::Result<Option<(String, String)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT owner_ip, settings FROM groups_info WHERE group_name = ?1",
+        )?;
+        let mut rows = stmt.query_map(params![name], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        match rows.next() {
+            Some(Ok(info)) => Ok(Some(info)),
+            _ => Ok(None),
+        }
+    }
+
+    /// Update group settings JSON
+    pub fn update_group_settings(&self, name: &str, settings_json: &str) -> anyhow::Result<()> {
+        self.conn.execute(
+            "UPDATE groups_info SET settings = ?1 WHERE group_name = ?2",
+            params![settings_json, name],
         )?;
         Ok(())
     }
@@ -307,22 +429,34 @@ impl HistoryDb {
 
     // ─── Contact Meta (alias, signature, group) ───────────────
 
-    /// Get contact meta for an IP: (alias, signature, group_name)
-    pub fn get_contact_meta(&self, ip: &str) -> anyhow::Result<Option<(String, String, String)>> {
+    /// Get contact meta for an IP: (alias, signature, group_name, avatar_hash)
+    pub fn get_contact_meta(&self, ip: &str) -> anyhow::Result<Option<(String, String, String, String)>> {
         let mut stmt = self.conn.prepare(
-            "SELECT alias, signature, group_name FROM contact_meta WHERE ip = ?1",
+            "SELECT alias, signature, group_name, avatar_hash FROM contact_meta WHERE ip = ?1",
         )?;
         let mut rows = stmt.query_map(params![ip], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
             ))
         })?;
         match rows.next() {
             Some(Ok(meta)) => Ok(Some(meta)),
             _ => Ok(None),
         }
+    }
+
+    /// Save avatar hash for a contact
+    pub fn save_avatar_hash(&self, ip: &str, hash: &str) -> anyhow::Result<()> {
+        self.conn.execute(
+            "INSERT INTO contact_meta (ip, alias, signature, group_name, avatar_hash)
+             VALUES (?1, '', '', '', ?2)
+             ON CONFLICT(ip) DO UPDATE SET avatar_hash = excluded.avatar_hash",
+            params![ip, hash],
+        )?;
+        Ok(())
     }
 
     /// Set (or update) the alias for a contact IP
@@ -347,11 +481,11 @@ impl HistoryDb {
         Ok(())
     }
 
-    /// Load all contact meta as a map: IP -> (alias, signature, group_name)
-    pub fn load_all_contact_meta(&self) -> anyhow::Result<HashMap<String, (String, String, String)>> {
+    /// Load all contact meta as a map: IP -> (alias, signature, group_name, avatar_hash)
+    pub fn load_all_contact_meta(&self) -> anyhow::Result<HashMap<String, (String, String, String, String)>> {
         let mut stmt =
             self.conn
-                .prepare("SELECT ip, alias, signature, group_name FROM contact_meta")?;
+                .prepare("SELECT ip, alias, signature, group_name, avatar_hash FROM contact_meta")?;
 
         let rows = stmt.query_map([], |row| {
             Ok((
@@ -359,13 +493,14 @@ impl HistoryDb {
                 row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?,
                 row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
             ))
         })?;
 
         let mut result = HashMap::new();
         for row in rows {
-            let (ip, alias, signature, group_name) = row?;
-            result.insert(ip, (alias, signature, group_name));
+            let (ip, alias, signature, group_name, avatar_hash) = row?;
+            result.insert(ip, (alias, signature, group_name, avatar_hash));
         }
         Ok(result)
     }

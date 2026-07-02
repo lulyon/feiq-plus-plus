@@ -50,6 +50,19 @@ enum ServerMsg {
         messages: Vec<OfflineMsgData>,
     },
     Pong,
+    /// Relay file transfer: start notification forwarded by server
+    FileStart {
+        from: String,
+        from_name: String,
+        file_id: u64,
+        file_name: String,
+        file_size: u64,
+    },
+    /// Relay file transfer: end notification forwarded by server
+    FileEnd {
+        from: String,
+        file_id: u64,
+    },
     Error {
         message: String,
     },
@@ -90,7 +103,7 @@ pub struct RelayClient {
     /// Shared write channel to the active WebSocket's write task.
     /// Set when connected, cleared on disconnect. Used by send_to/broadcast
     /// to reuse the persistent connection instead of opening a new one per message.
-    ws_write_tx: Arc<std::sync::Mutex<Option<mpsc::UnboundedSender<String>>>>,
+    ws_write_tx: Arc<std::sync::Mutex<Option<mpsc::UnboundedSender<Message>>>>,
 }
 
 impl RelayClient {
@@ -165,6 +178,47 @@ impl RelayClient {
         self.send_json(&msg).await
     }
 
+    /// Send a FileStart notification through the relay to initiate a file transfer.
+    pub async fn send_file_start(
+        &self,
+        to_peer_id: &str,
+        file_id: u64,
+        file_name: &str,
+        file_size: u64,
+    ) -> anyhow::Result<()> {
+        let msg = serde_json::json!({
+            "type": "file_start",
+            "to": to_peer_id,
+            "file_id": file_id,
+            "file_name": file_name,
+            "file_size": file_size,
+        });
+        self.send_json(&msg).await
+    }
+
+    /// Send a binary file chunk through the relay.
+    /// Format: [8 bytes file_id BE][chunk data]
+    pub async fn send_file_chunk(&self, file_id: u64, chunk: &[u8]) -> anyhow::Result<()> {
+        let mut frame = Vec::with_capacity(8 + chunk.len());
+        frame.extend_from_slice(&file_id.to_be_bytes());
+        frame.extend_from_slice(chunk);
+        self.send_raw(&frame).await
+    }
+
+    /// Send a FileEnd notification through the relay to end a file transfer.
+    pub async fn send_file_end(
+        &self,
+        to_peer_id: &str,
+        file_id: u64,
+    ) -> anyhow::Result<()> {
+        let msg = serde_json::json!({
+            "type": "file_end",
+            "to": to_peer_id,
+            "file_id": file_id,
+        });
+        self.send_json(&msg).await
+    }
+
     // ─── Internal — connection + send ─────────────────────────
 
     /// Connect, join, and start the receive loop. Blocks until shutdown.
@@ -220,9 +274,9 @@ impl RelayClient {
         // Channel for outbound messages from send_to/broadcast (engine side)
         // to the write task (WS side). This avoids opening a new WS connection
         // per message.
-        let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
         let send_tx = tx.clone();
-        // Share with send_json() so engine-triggered send_to/broadcast reuse
+        // Share with send_json/send_raw so engine-triggered sends reuse
         // the persistent WS connection instead of opening a new one.
         *self.ws_write_tx.lock().unwrap_or_else(|e| e.into_inner()) = Some(tx);
 
@@ -231,8 +285,8 @@ impl RelayClient {
                 tokio::select! {
                     msg = rx.recv() => {
                         match msg {
-                            Some(text) => {
-                                if ws_tx.send(Message::Text(text.into())).await.is_err() {
+                            Some(m) => {
+                                if ws_tx.send(m).await.is_err() {
                                     break;
                                 }
                             }
@@ -256,12 +310,29 @@ impl RelayClient {
                             break;
                         }
                         Some(Ok(Message::Ping(data))) => {
-                            let _ = send_tx.send(serde_json::to_string(&serde_json::json!({
+                            let _ = send_tx.send(Message::Text(serde_json::to_string(&serde_json::json!({
                                 "type": "pong"
-                            })).unwrap());
+                            })).unwrap()));
                             let _ = data; // silently ignore ping payload
                         }
-                        Some(Ok(_)) => {} // ignore binary
+                        Some(Ok(Message::Binary(data))) => {
+                            // Binary file chunk: [8 bytes file_id BE][chunk data]
+                            if data.len() >= 8 {
+                                let file_id = u64::from_be_bytes([
+                                    data[0], data[1], data[2], data[3],
+                                    data[4], data[5], data[6], data[7],
+                                ]);
+                                let chunk = data[8..].to_vec();
+                                // We don't have from_peer_id from the binary frame alone.
+                                // Use empty string — the engine will match by file_id.
+                                let _ = self.event_tx.send(NetworkEvent::FileChunk {
+                                    from_peer_id: String::new(),
+                                    file_id,
+                                    data: chunk,
+                                });
+                            }
+                        }
+                        Some(Ok(Message::Pong(_))) | Some(Ok(Message::Frame(_))) => {}
                         Some(Err(e)) => {
                             tracing::error!("Relay WS error: {e}");
                             break;
@@ -270,9 +341,9 @@ impl RelayClient {
                 }
                 _ = sleep(Duration::from_secs(30)) => {
                     // Send heartbeat ping
-                    let _ = send_tx.send(serde_json::to_string(&serde_json::json!({
+                    let _ = send_tx.send(Message::Text(serde_json::to_string(&serde_json::json!({
                         "type": "ping"
-                    })).unwrap());
+                    })).unwrap()));
                 }
             }
         }
@@ -341,6 +412,26 @@ impl RelayClient {
             }
             ServerMsg::Pong => {
                 tracing::trace!("Relay pong");
+            }
+            ServerMsg::FileStart {
+                from,
+                from_name: _,
+                file_id,
+                file_name,
+                file_size,
+            } => {
+                let _ = self.event_tx.send(NetworkEvent::FileStartViaRelay {
+                    from_peer_id: from,
+                    file_id,
+                    file_name,
+                    file_size,
+                });
+            }
+            ServerMsg::FileEnd { from, file_id } => {
+                let _ = self.event_tx.send(NetworkEvent::FileEndViaRelay {
+                    from_peer_id: from,
+                    file_id,
+                });
             }
             ServerMsg::Error { message } => {
                 let _ = self.event_tx.send(NetworkEvent::Error(message));
@@ -422,13 +513,23 @@ impl RelayClient {
     }
 
     async fn send_json(&self, msg: &serde_json::Value) -> anyhow::Result<()> {
-        // Use the persistent WebSocket connection's write channel instead of
-        // opening a new connection per message (which would require a new Join
-        // handshake and be silently dropped by the server).
         let tx_guard = self.ws_write_tx.lock().unwrap_or_else(|e| e.into_inner());
         match tx_guard.as_ref() {
             Some(tx) => {
-                tx.send(msg.to_string())
+                tx.send(Message::Text(msg.to_string()))
+                    .map_err(|e| anyhow::anyhow!("Relay send channel closed: {e}"))?;
+                Ok(())
+            }
+            None => Err(anyhow::anyhow!("Relay not connected — call run() first")),
+        }
+    }
+
+    /// Send a raw binary WebSocket frame through the persistent connection.
+    async fn send_raw(&self, data: &[u8]) -> anyhow::Result<()> {
+        let tx_guard = self.ws_write_tx.lock().unwrap_or_else(|e| e.into_inner());
+        match tx_guard.as_ref() {
+            Some(tx) => {
+                tx.send(Message::Binary(data.to_vec()))
                     .map_err(|e| anyhow::anyhow!("Relay send channel closed: {e}"))?;
                 Ok(())
             }

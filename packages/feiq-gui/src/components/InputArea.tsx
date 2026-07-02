@@ -1,16 +1,20 @@
 import { useState, useRef, useEffect, type KeyboardEvent } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { Send, Smile, Paperclip } from "lucide-react";
+import { Send, Smile, Paperclip, PenLine } from "lucide-react";
 import { useMessageStore } from "../stores/messageStore";
 import { useContactStore } from "../stores/contactStore";
 import { EmojiPicker } from "./EmojiPicker";
+import { DoodleDialog } from "./DoodleDialog";
 import { open as dialogOpen } from "@tauri-apps/plugin-dialog";
 
 export function InputArea({ fellowIp }: { fellowIp: string }) {
   const [text, setText] = useState("");
   const [showEmoji, setShowEmoji] = useState(false);
+  const [showDoodle, setShowDoodle] = useState(false);
   const [sendByEnter, setSendByEnter] = useState(true);
   const inputRef = useRef<HTMLTextAreaElement>(null);
+  const typingRef = useRef(false);
+  const typingTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // Load send_by_enter preference from backend
   useEffect(() => {
@@ -21,6 +25,56 @@ export function InputArea({ fellowIp }: { fellowIp: string }) {
 
   const addMessage = useMessageStore((s) => s.addMessage);
   const contacts = useContactStore((s) => s.contacts);
+  const fellow = contacts.find((c) => c.ip === fellowIp);
+
+  // Send typing indicator with debounce
+  const notifyTyping = (isTyping: boolean) => {
+    invoke("send_typing", { ip: fellowIp, isTyping }).catch(() => {});
+  };
+
+  const handleTypingChange = (value: string) => {
+    setText(value);
+
+    if (value.length > 0 && !typingRef.current) {
+      // Started typing
+      typingRef.current = true;
+      notifyTyping(true);
+    }
+
+    // Reset the idle timeout
+    if (typingTimeoutRef.current) {
+      clearTimeout(typingTimeoutRef.current);
+    }
+
+    if (value.length > 0) {
+      // After 3s of no change, consider typing stopped
+      typingTimeoutRef.current = setTimeout(() => {
+        if (typingRef.current) {
+          typingRef.current = false;
+          notifyTyping(false);
+        }
+      }, 3000);
+    } else {
+      // Text cleared: stop typing immediately
+      if (typingRef.current) {
+        typingRef.current = false;
+        notifyTyping(false);
+      }
+    }
+  };
+
+  // Cleanup typing state on unmount or fellowIp change
+  useEffect(() => {
+    return () => {
+      if (typingRef.current) {
+        notifyTyping(false);
+        typingRef.current = false;
+      }
+      if (typingTimeoutRef.current) {
+        clearTimeout(typingTimeoutRef.current);
+      }
+    };
+  }, [fellowIp]);
 
   const sendText = async () => {
     const trimmed = text.trim();
@@ -35,6 +89,15 @@ export function InputArea({ fellowIp }: { fellowIp: string }) {
       timestamp: Date.now(),
       direction: "sent",
     });
+
+    // Clear typing state on send
+    if (typingRef.current) {
+      typingRef.current = false;
+      notifyTyping(false);
+    }
+    if (typingTimeoutRef.current) {
+      clearTimeout(typingTimeoutRef.current);
+    }
 
     setText("");
     inputRef.current?.focus();
@@ -83,12 +146,26 @@ export function InputArea({ fellowIp }: { fellowIp: string }) {
   };
 
   return (
+    <>
+    {showDoodle && fellow && (
+      <DoodleDialog peerIp={fellowIp} onClose={() => setShowDoodle(false)} />
+    )}
     <div className="border-t border-border px-4 py-3 bg-surface-alt relative">
       {showEmoji && (
         <EmojiPicker onSelect={insertEmoji} onClose={() => setShowEmoji(false)} />
       )}
 
       <div className="flex items-end gap-2">
+        {/* Doodle button */}
+        <button
+          onClick={() => setShowDoodle(true)}
+          className="flex-shrink-0 w-8 h-8 flex items-center justify-center
+                     rounded-lg hover:bg-surface-alt text-text-muted transition-colors cursor-pointer mb-1"
+          title="Draw a doodle"
+        >
+          <PenLine className="w-5 h-5" />
+        </button>
+
         {/* Send files button */}
         <button
           onClick={handleSendFiles}
@@ -111,7 +188,7 @@ export function InputArea({ fellowIp }: { fellowIp: string }) {
         <textarea
           ref={inputRef}
           value={text}
-          onChange={(e) => setText(e.target.value)}
+          onChange={(e) => handleTypingChange(e.target.value)}
           onKeyDown={handleKeyDown}
           placeholder="Type a message... (Enter to send)"
           rows={2}
@@ -129,5 +206,6 @@ export function InputArea({ fellowIp }: { fellowIp: string }) {
         </button>
       </div>
     </div>
+    </>
   );
 }

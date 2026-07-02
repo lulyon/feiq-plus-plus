@@ -3,11 +3,14 @@ import { invoke } from "@tauri-apps/api/core";
 import { useContactStore } from "../stores/contactStore";
 import { useGroupStore } from "../stores/groupStore";
 import { useMessageStore, type Message, type Content } from "../stores/messageStore";
+import { useTypingStore } from "../stores/typingStore";
 import { MessageBubble } from "./MessageBubble";
 import { InputArea } from "./InputArea";
 import { FileTransferPanel } from "./FileTransferPanel";
-import { Search, X, Send, MessageSquare, Users, Loader2 } from "lucide-react";
+import { Search, X, Send, MessageSquare, Users, Loader2, Paperclip, FolderOpen } from "lucide-react";
+import { open as dialogOpen } from "@tauri-apps/plugin-dialog";
 import type { Group } from "../stores/groupStore";
+import { RemoteFileBrowser } from "./RemoteFileBrowser";
 
 /** Rust MessageRecord shape from get_chat_history */
 interface MessageRecord {
@@ -196,6 +199,9 @@ export function ChatPanel() {
   const searchInputRef = useRef<HTMLInputElement>(null);
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
+  // ─── Remote File Browser State ────────────────────────────────
+  const [showFileBrowser, setShowFileBrowser] = useState(false);
+
   const selectContact = useContactStore((s) => s.selectContact);
 
   const handleToggleSearch = () => {
@@ -375,6 +381,7 @@ export function ChatPanel() {
   const isLoading = selectedIp ? loadingHistory[selectedIp] : false;
 
   return (
+    <>
     <div className="flex-1 flex flex-col bg-surface">
       {/* Chat Header */}
       <div className="px-4 py-3 border-b border-border flex items-center gap-3 bg-surface-alt">
@@ -442,6 +449,13 @@ export function ChatPanel() {
                 {fellow.online ? "Online" : "Offline"} · {fellow.ip}
               </div>
             </div>
+            <button
+              onClick={() => setShowFileBrowser(true)}
+              className="w-7 h-7 flex items-center justify-center rounded-md hover:bg-surface-alt text-text-muted cursor-pointer flex-shrink-0"
+              title="Browse shared files"
+            >
+              <FolderOpen className="w-4 h-4" />
+            </button>
             <button
               onClick={handleToggleSearch}
               className="w-7 h-7 flex items-center justify-center rounded-md hover:bg-surface-alt text-text-muted cursor-pointer flex-shrink-0"
@@ -522,8 +536,31 @@ export function ChatPanel() {
         )}
       </div>
 
+      {/* Typing Indicator */}
+      <TypingIndicator fellowIp={fellow.ip} />
+
       {/* Input Area */}
       <InputArea fellowIp={fellow.ip} />
+    </div>
+
+    {/* Remote File Browser Modal */}
+    {showFileBrowser && selectedIp && fellow && (
+      <RemoteFileBrowser
+        peerIp={selectedIp}
+        peerName={displayName}
+        onClose={() => setShowFileBrowser(false)}
+      />
+    )}
+  </>);
+}
+
+/** Animated typing indicator shown above the input area */
+function TypingIndicator({ fellowIp }: { fellowIp: string }) {
+  const typer = useTypingStore((s) => s.typers[fellowIp]);
+  if (!typer) return null;
+  return (
+    <div className="px-4 py-1 text-xs text-text-muted italic">
+      {typer.name} is typing...
     </div>
   );
 }
@@ -674,6 +711,28 @@ function GroupChatPanel({ group }: { group: Group }) {
       {/* Group Input */}
       <div className="border-t border-border px-4 py-3 bg-surface-alt">
         <div className="flex items-end gap-2">
+          {/* File attach button */}
+          <button
+            onClick={async () => {
+              try {
+                const selected = await dialogOpen({ multiple: true });
+                if (!selected) return;
+                const paths = Array.isArray(selected) ? selected : [selected];
+                for (const filePath of paths) {
+                  if (!filePath) continue;
+                  invoke("send_group_file", { groupName: group.name, filePath })
+                    .catch((e) => console.error("send_group_file failed:", e));
+                }
+              } catch (e) {
+                console.error("File dialog failed:", e);
+              }
+            }}
+            className="flex-shrink-0 w-8 h-8 flex items-center justify-center
+                       rounded-lg hover:bg-surface-alt text-text-muted transition-colors cursor-pointer mb-1"
+            title="Send file(s) to group"
+          >
+            <Paperclip className="w-5 h-5" />
+          </button>
           <textarea
             value={inputValue}
             onChange={(e) => setInputValue(e.target.value)}

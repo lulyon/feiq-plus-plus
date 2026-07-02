@@ -69,7 +69,47 @@ pub struct AppConfig {
     /// Optional password for accessing the shared directory
     #[serde(default)]
     pub shared_dir_password: String,
+    /// Path to the user's own avatar image file
+    #[serde(default)]
+    pub avatar_path: String,
+    /// Stealth mode: don't broadcast presence, appear offline
+    #[serde(default)]
+    pub stealth_mode: bool,
+    /// Upload speed limit in KB/s (0 = unlimited)
+    #[serde(default)]
+    pub upload_speed_limit_kbps: u32,
+    /// Download speed limit in KB/s (0 = unlimited)
+    #[serde(default)]
+    pub download_speed_limit_kbps: u32,
+    /// Custom font family (empty = system default)
+    #[serde(default)]
+    pub font_family: String,
+    /// Font size in px (default: 14)
+    #[serde(default = "default_font_size")]
+    pub font_size: u32,
+    /// Custom theme overrides (only used when theme = "custom")
+    #[serde(default)]
+    pub custom_theme: CustomTheme,
 }
+
+/// User-customizable color overrides for the custom theme.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct CustomTheme {
+    #[serde(default)]
+    pub bg: String,
+    #[serde(default)]
+    pub surface: String,
+    #[serde(default)]
+    pub primary: String,
+    #[serde(default)]
+    pub text: String,
+    #[serde(default)]
+    pub bubble_sent: String,
+    #[serde(default)]
+    pub bubble_recv: String,
+}
+
+fn default_font_size() -> u32 { 14 }
 
 fn default_theme() -> String { "auto".to_string() }
 
@@ -97,6 +137,13 @@ impl Default for AppConfig {
             theme: default_theme(),
             shared_dir: String::new(),
             shared_dir_password: String::new(),
+            avatar_path: String::new(),
+            stealth_mode: false,
+            upload_speed_limit_kbps: 0,
+            download_speed_limit_kbps: 0,
+            font_family: String::new(),
+            font_size: 14,
+            custom_theme: CustomTheme::default(),
         }
     }
 }

@@ -10,7 +10,8 @@
 | Phase 4 — Group Chat + Offline Messages | **85%** | Group chat, offline messages, blacklist; folder transfer **deferred** |
 | Phase 4.5 — Relay Server | **100%** | WebSocket relay for cross-network chat |
 | Phase 5 — Encryption + File Share + Polish | **100%** | E2E encryption, sealed messages, themes, import/export |
-| Phase 6 — IPMSG v9 Legacy Encryption | **0% (deferred)** | RSA/RC2/Blowfish interop with legacy clients |
+| Phase 6 — Enhancements | **100%** | Typing indicators, relay file DL, stealth mode, avatar, speed limiting, pinyin search, file share, group features, theme, font, doodle |
+| Phase 7 — IPMSG v9 Legacy Encryption | **0% (deferred)** | RSA/RC2/Blowfish interop with legacy clients |
 
 ---
 
@@ -33,64 +34,59 @@
 
 ## Unimplemented Features
 
-### File Download via Relay
+### File Download via Relay ✅
 
 - **Priority**: Medium
-- **Status**: Not implemented.
-- **Details**: Peers connected through the relay server cannot download files. A guard in `commands.rs` returns: `"File download not supported for relay peers. Use direct LAN connection."`
-- **Reason**: File transfer uses direct TCP connections; relay uses WebSocket. No file tunneling through relay exists.
+- **Status**: **Implemented**.
+- **Details**: Binary WebSocket tunnel relays file chunks between peers. Relay client sends/receives `FileStart`/`FileEnd` JSON messages + binary frames with `[8 bytes file_id BE][chunk data]` format. Engine uses push model for relay file sends. Relay guard in `commands.rs` removed.
+- **Files**: `relay/server.rs`, `relay/client.rs`, `engine.rs`, `commands.rs`, `network/mod.rs`
 
-### Typing Indicator (`IPMSG_INPUTING` / `IPMSG_INPUT_END`)
+### Typing Indicator (`IPMSG_INPUTING` / `IPMSG_INPUT_END`) ✅
 
-- **Priority**: Low (P3)
-- **Status**: Not implemented.
-- **Details**: `IPMSG_INPUTING` (0x79) and `IPMSG_INPUT_END` (0x7A) constants are defined in `protocol/constants.rs`, but no parser handler or engine logic exists.
-- **Original feiq**: Supported.
+- **Priority**: Medium
+- **Status**: **Implemented**.
+- **Details**: Full-stack: parser handlers (`RecvInputing`/`RecvInputEnd`), `Content::Typing` variant, `FrontendEvent::TypingIndicator`, IPC `send_typing` command, frontend `InputArea.tsx` debounce detection, `ChatPanel.tsx` animated display, `typingStore.ts` with 5s auto-clear.
 
-### Transfer Speed Limiting
+### Transfer Speed Limiting ✅
 
-- **Priority**: Low (P4)
-- **Status**: Not implemented.
-- **Details**: No token bucket or rate limiting for file transfers. `send_file` / `recv_file` transfer at full available bandwidth.
+- **Priority**: Medium
+- **Status**: **Implemented**.
+- **Details**: Config fields `upload_speed_limit_kbps`/`download_speed_limit_kbps` (0=unlimited). Sleep-based pacing in `send_file`/`recv_file` after each chunk. Engine passes config values to TCP transfer. 2 tests verify throttling.
 
-### File Share (Password-Protected)
+### File Share (Password-Protected) ✅
 
-- **Priority**: Low (P5)
-- **Status**: **Partial** — backend skeleton exists, no frontend UI.
-- **Details**:
-  - `AppConfig` has `shared_dir` and `shared_dir_password` fields (`settings.rs:66-71`).
-  - `handle_file_share_request` method exists in `engine.rs`.
-  - `list_directory` function in `tcp.rs` walks a directory for sharing.
-  - No frontend UI in SettingsDialog to configure shared directory or password.
+- **Priority**: Medium
+- **Status**: **Implemented**.
+- **Details**: Standalone `check_file_share_request` with password validation via `IPMSG_PASSWORDOPT`. `browse_shared_folder` IPC command. `RemoteFileBrowser.tsx` frontend modal. Engine UDP event loop wired to call file share handler. 4 password tests.
 
-### Group Features (P5)
+### Group Features ✅
 
 | Feature | Status |
 |---------|--------|
-| In-group file sharing | Not implemented |
-| Group announcements | Not implemented |
+| In-group file sharing | **Implemented** — `send_file_to_group()` in engine, `send_group_file` IPC, file button in `GroupChatPanel` |
+| Group announcements | **Implemented** — `group_announcements` table, `save_announcement`/`get_announcements` in HistoryDb, `send_announcement_to_group` P2P dispatch, IPC commands |
 
-### User Management (P5)
-
-| Feature | Status |
-|---------|--------|
-| Group-level permission control | Not implemented |
-| Stealth mode (global + per-group) | Not implemented |
-| Personal avatar / profile picture | Data model field exists; no upload/selection UI (P3) |
-
-### Personalization (P5)
+### User Management ✅
 
 | Feature | Status |
 |---------|--------|
-| Full theme skinning (background images, custom color schemes) | Not implemented. Light/dark/auto theme exists. |
-| UI font customization | Not implemented |
-| Standalone doodle / drawing tool | Not implemented. Screenshot annotation removed from codebase (commit 85e23b4). |
+| Group-level permission control | **Implemented** — `owner_ip` + `settings` columns in `groups_info`, `save_group_with_owner`/`delete_group`/`update_group_settings`, `delete_group_cmd` IPC |
+| Stealth mode (global) | **Implemented** — `AppConfig.stealth_mode`, skips BR_ENTRY broadcast + ANSENTRY reply, `set_stealth_mode` IPC |
+| Personal avatar / profile picture | **Implemented** — `Fellow.avatar_hash`, `contact_meta.avatar_hash`, `AppConfig.avatar_path`, `IPMSG_GETAVATAR`/`IPMSG_SENDAVATAR` protocol handlers, `set_avatar`/`get_avatar` IPC, SHA256 hash exchange |
 
-### Pinyin-Based Contact Search
+### Personalization ✅
 
-- **Priority**: Low
-- **Status**: Not implemented.
-- **Details**: `ContactBook::search` doc says "Search contacts by name, IP, host, or pinyin" but only matches against display name, IP, and host. No pinyin conversion logic exists.
+| Feature | Status |
+|---------|--------|
+| Full theme skinning | **Implemented** — `CustomTheme` struct (bg, surface, primary, text, bubble_sent, bubble_recv), runtime CSS variable injection in `App.tsx` |
+| UI font customization | **Implemented** — `font_family`/`font_size` config fields, CSS `--font-family`/`--font-size` variables, `App.tsx` injection |
+| Standalone doodle / drawing tool | **Implemented** — `DoodleDialog.tsx`, HTML5 Canvas (pen, eraser, 10 colors, line width, undo), button in `InputArea.tsx` |
+
+### Pinyin-Based Contact Search ✅
+
+- **Priority**: High
+- **Status**: **Implemented**.
+- **Details**: `pinyin` crate in `feiq-core/Cargo.toml`. `ContactBook::search` enhanced with first-letter and full-pinyin matching. Frontend `Sidebar.tsx` search includes `pc_name` and `host` fields.
 
 ---
 
@@ -124,23 +120,25 @@ These are explicitly considered beyond the scope of an IM application:
 
 15+ IPMSG protocol commands are defined in `protocol/constants.rs` but have no parser handler or engine logic. They are non-essential for core chat functionality:
 
-| Command | Constant | Value | Purpose |
-|---------|----------|-------|---------|
-| BR_ABSENCE | `IPMSG_BR_ABSENCE` | 0x04 | Absence mode / status change |
-| BR_ISGETLIST | `IPMSG_BR_ISGETLIST` | 0x10 | Request member list |
-| OKGETLIST | `IPMSG_OKGETLIST` | 0x11 | Acknowledge list |
-| GETLIST | `IPMSG_GETLIST` | 0x12 | Get member list |
-| ANSLIST | `IPMSG_ANSLIST` | 0x13 | Return member list |
-| BR_ISGETLIST2 | `IPMSG_BR_ISGETLIST2` | 0x18 | Request list v2 |
-| READMSG | `IPMSG_READMSG` | 0x30 | Message read (sealed) |
-| DELMSG | `IPMSG_DELMSG` | 0x31 | Delete message |
-| ANSREADMSG | `IPMSG_ANSREADMSG` | 0x32 | Read receipt (v8+) |
-| GETINFO | `IPMSG_GETINFO` | 0x40 | Request protocol version |
-| SENDINFO | `IPMSG_SENDINFO` | 0x41 | Send protocol version |
-| GETABSENCEINFO | `IPMSG_GETABSENCEINFO` | 0x50 | Ask if away |
-| SENDABSENCEINFO | `IPMSG_SENDABSENCEINFO` | 0x51 | Reply away status |
-| GETPUBKEY | `IPMSG_GETPUBKEY` | 0x72 | Request RSA public key |
-| ANSPUBKEY | `IPMSG_ANSPUBKEY` | 0x73 | Reply RSA public key |
-| INPUTING | `IPMSG_INPUTING` | 0x79 | Typing indicator |
-| INPUT_END | `IPMSG_INPUT_END` | 0x7A | Typing ended |
-| SENDIMAGE_DATA | `IPMSG_SENDIMAGE_DATA` | 0xC1 | Image data (custom) |
+| Command | Constant | Value | Purpose | Status |
+|---------|----------|-------|---------|--------|
+| BR_ABSENCE | `IPMSG_BR_ABSENCE` | 0x04 | Absence mode / status change | ✅ Implemented |
+| BR_ISGETLIST | `IPMSG_BR_ISGETLIST` | 0x10 | Request member list | Deferred |
+| OKGETLIST | `IPMSG_OKGETLIST` | 0x11 | Acknowledge list | Deferred |
+| GETLIST | `IPMSG_GETLIST` | 0x12 | Get member list | Deferred |
+| ANSLIST | `IPMSG_ANSLIST` | 0x13 | Return member list | Deferred |
+| BR_ISGETLIST2 | `IPMSG_BR_ISGETLIST2` | 0x18 | Request list v2 | Deferred |
+| READMSG | `IPMSG_READMSG` | 0x30 | Message read (sealed) | ✅ Implemented |
+| DELMSG | `IPMSG_DELMSG` | 0x31 | Delete message | Deferred (privacy) |
+| ANSREADMSG | `IPMSG_ANSREADMSG` | 0x32 | Read receipt (v8+) | ✅ Implemented |
+| GETINFO | `IPMSG_GETINFO` | 0x40 | Request protocol version | Low priority |
+| SENDINFO | `IPMSG_SENDINFO` | 0x41 | Send protocol version | Low priority |
+| GETABSENCEINFO | `IPMSG_GETABSENCEINFO` | 0x50 | Ask if away | ✅ Impl. (stealth) |
+| SENDABSENCEINFO | `IPMSG_SENDABSENCEINFO` | 0x51 | Reply away status | ✅ Impl. (stealth) |
+| GETPUBKEY | `IPMSG_GETPUBKEY` | 0x72 | Request RSA public key | Deferred (P7) |
+| ANSPUBKEY | `IPMSG_ANSPUBKEY` | 0x73 | Reply RSA public key | Deferred (P7) |
+| INPUTING | `IPMSG_INPUTING` | 0x79 | Typing indicator | ✅ Implemented |
+| INPUT_END | `IPMSG_INPUT_END` | 0x7A | Typing ended | ✅ Implemented |
+| GETAVATAR | `IPMSG_GETAVATAR` | 0x75 | Request avatar (custom) | ✅ Implemented |
+| SENDAVATAR | `IPMSG_SENDAVATAR` | 0x76 | Send avatar (custom) | ✅ Implemented |
+| SENDIMAGE_DATA | `IPMSG_SENDIMAGE_DATA` | 0xC1 | Image data (custom) | N/A |

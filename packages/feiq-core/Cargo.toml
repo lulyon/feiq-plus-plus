@@ -9,6 +9,8 @@ tokio = { version = "1", features = ["full"] }
 tokio-tungstenite = "0.24"
 futures-util = "0.3"
 base64 = "0.22"
+sha2 = "0.10"
+hex = "0.4"
 encoding_rs = "0.8"
 rusqlite = { version = "0.32", features = ["bundled"] }
 ring = "0.17"
@@ -23,3 +25,4 @@ thiserror = "1"
 tracing = "0.1"
 tracing-subscriber = "0.3"
 socket2 = "0.5"
+pinyin = "0.10"

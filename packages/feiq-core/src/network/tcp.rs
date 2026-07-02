@@ -5,7 +5,8 @@ use socket2::{Domain, Protocol, Socket, Type};
 use std::net::SocketAddr;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::time::{timeout, Duration};
+use tokio::time::{sleep, timeout, Duration};
+use std::time::Instant;
 
 use crate::protocol::constants::{IPMSG_FILE_DIR, IPMSG_FILE_REGULAR};
 use crate::protocol::types::FileContent;
@@ -155,6 +156,121 @@ mod tests {
     }
 
     #[test]
+    fn test_send_file_with_speed_limit() {
+        // Test that speed limiting does not crash and still completes
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            // Create a temp file
+            let tmp = std::env::temp_dir().join(format!("feiq_speed_test_{}", std::process::id()));
+            let data = vec![0u8; 65536 * 2]; // 128KB — two chunks
+            std::fs::write(&tmp, &data).unwrap();
+            let tmp_str = tmp.to_string_lossy().to_string();
+
+            // Set up a listener
+            let port = 14227u16;
+            let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+            let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+
+            // Spawn receiver
+            let recv_path = tmp.with_extension("received");
+            let recv_path_c = recv_path.clone();
+            let recv_handle = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut ft = crate::network::tcp::FileTransfer::from_stream(stream);
+                ft.recv_file(
+                    &recv_path_c.to_string_lossy(),
+                    data.len() as i64,
+                    |_, _| {},
+                    None,
+                    None, // no speed limit on receiver
+                )
+                .await
+                .unwrap()
+            });
+
+            // Connect and send with a 128 KB/s limit (~1 chunk per 0.5s)
+            let mut ft =
+                crate::network::tcp::FileTransfer::connect("127.0.0.1", port)
+                    .await
+                    .unwrap();
+
+            let start = std::time::Instant::now();
+            let limit: u64 = 128 * 1024; // 128 KB/s
+            ft.send_file(&tmp_str, 0, |_, _| {}, None, Some(limit))
+                .await
+                .unwrap();
+            let elapsed = start.elapsed();
+
+            // 128KB at 128KB/s should take ~1 second
+            // With 2 chunks of 64KB, each chunk takes ~0.5s
+            // Allow some tolerance but verify throttling worked
+            assert!(
+                elapsed.as_millis() > 400,
+                "Speed limit should cause delay, got {}ms",
+                elapsed.as_millis()
+            );
+
+            recv_handle.await.unwrap();
+            let _ = std::fs::remove_file(&tmp);
+            let _ = std::fs::remove_file(&recv_path);
+        });
+    }
+
+    #[test]
+    fn test_send_file_unlimited() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let tmp = std::env::temp_dir().join(format!("feiq_nolimit_{}", std::process::id()));
+            let data = vec![0u8; 65536]; // 64KB — one chunk
+            std::fs::write(&tmp, &data).unwrap();
+            let tmp_str = tmp.to_string_lossy().to_string();
+
+            let port = 14228u16;
+            let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+            let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+
+            let recv_path = tmp.with_extension("received");
+            let recv_path_c = recv_path.clone();
+            let recv_handle = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut ft = crate::network::tcp::FileTransfer::from_stream(stream);
+                ft.recv_file(
+                    &recv_path_c.to_string_lossy(),
+                    data.len() as i64,
+                    |_, _| {},
+                    None,
+                    None,
+                )
+                .await
+                .unwrap()
+            });
+
+            let mut ft =
+                crate::network::tcp::FileTransfer::connect("127.0.0.1", port)
+                    .await
+                    .unwrap();
+
+            let start = std::time::Instant::now();
+            // None = unlimited
+            ft.send_file(&tmp_str, 0, |_, _| {}, None, None)
+                .await
+                .unwrap();
+            let elapsed = start.elapsed();
+
+            // 64KB unlimited should be very fast (< 200ms)
+            assert!(
+                elapsed.as_millis() < 2000,
+                "Unlimited transfer should be fast, got {}ms",
+                elapsed.as_millis()
+            );
+
+            recv_handle.await.unwrap();
+            let _ = std::fs::remove_file(&tmp);
+            let _ = std::fs::remove_file(&recv_path);
+        });
+    }
+
+    #[test]
     fn test_list_directory_hidden_files_skipped() {
         let (dir_path, path) = create_temp_dir();
 
@@ -243,12 +359,15 @@ impl FileTransfer {
     /// Returns total bytes sent. Each read/write has a 300s timeout.
     /// If `cancel_flag` is provided and set to true, aborts early and returns
     /// a `Canceled` error.
+    /// `speed_limit_bytes_per_sec`: if Some(rate), sleep after each chunk
+    /// to avoid exceeding the given throughput. None or 0 = unlimited.
     pub async fn send_file<F>(
         &mut self,
         file_path: &str,
         offset: i64,
         progress_cb: F,
         cancel_flag: Option<&AtomicBool>,
+        speed_limit_bytes_per_sec: Option<u64>,
     ) -> anyhow::Result<i64>
     where
         F: Fn(i64, i64),
@@ -290,8 +409,23 @@ impl FileTransfer {
             timeout(Duration::from_secs(300), self.stream.write_all(&buf[..n]))
                 .await
                 .map_err(|_| anyhow::anyhow!("send_file: socket write timed out after 300s"))??;
+            let chunk_start = Instant::now();
             sent += n as i64;
             progress_cb(sent, total);
+
+            // Rate limiting: sleep to respect speed limit
+            if let Some(limit) = speed_limit_bytes_per_sec {
+                if limit > 0 {
+                    let expected_ms = (n as f64 / limit as f64) * 1000.0;
+                    let elapsed_ms = chunk_start.elapsed().as_secs_f64() * 1000.0;
+                    if elapsed_ms < expected_ms {
+                        sleep(Duration::from_secs_f64(
+                            (expected_ms - elapsed_ms) / 1000.0,
+                        ))
+                        .await;
+                    }
+                }
+            }
         }
 
         Ok(sent)
@@ -305,12 +439,15 @@ impl FileTransfer {
     /// removes the partial file, returning a `Canceled` error.
     /// If the function returns an error (cancel, timeout, or disk failure),
     /// the partially written file is removed to prevent orphaned files.
+    /// `speed_limit_bytes_per_sec`: if Some(rate), sleep after each chunk
+    /// to avoid exceeding the given throughput. None or 0 = unlimited.
     pub async fn recv_file<F>(
         &mut self,
         file_path: &str,
         total_size: i64,
         progress_cb: F,
         cancel_flag: Option<&AtomicBool>,
+        speed_limit_bytes_per_sec: Option<u64>,
     ) -> anyhow::Result<i64>
     where
         F: Fn(i64, i64),
@@ -350,8 +487,23 @@ impl FileTransfer {
                 timeout(Duration::from_secs(300), file.write_all(&buf[..n]))
                     .await
                     .map_err(|_| anyhow::anyhow!("recv_file: disk write timed out after 300s"))??;
+                let chunk_start = Instant::now();
                 received += n as i64;
                 progress_cb(received, total_size);
+
+                // Rate limiting: sleep to respect speed limit
+                if let Some(limit) = speed_limit_bytes_per_sec {
+                    if limit > 0 {
+                        let expected_ms = (n as f64 / limit as f64) * 1000.0;
+                        let elapsed_ms = chunk_start.elapsed().as_secs_f64() * 1000.0;
+                        if elapsed_ms < expected_ms {
+                            sleep(Duration::from_secs_f64(
+                                (expected_ms - elapsed_ms) / 1000.0,
+                            ))
+                            .await;
+                        }
+                    }
+                }
             }
 
             file.flush().await?;

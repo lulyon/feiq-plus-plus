@@ -55,6 +55,20 @@ pub fn start_event_forwarder(app_handle: AppHandle, state: &crate::state::AppSta
                         "content": content,
                     }));
                 }
+                Some(FrontendEvent::MessageReadConfirmed { from_ip, from_name, packet_no }) => {
+                    let _ = app_handle.emit("message-read-confirmed", serde_json::json!({
+                        "fromIp": from_ip,
+                        "fromName": from_name,
+                        "packetNo": packet_no,
+                    }));
+                }
+                Some(FrontendEvent::TypingIndicator { from_ip, from_name, is_typing }) => {
+                    let _ = app_handle.emit("typing-indicator", serde_json::json!({
+                        "fromIp": from_ip,
+                        "fromName": from_name,
+                        "isTyping": is_typing,
+                    }));
+                }
                 Some(FrontendEvent::Error(msg)) => {
                     let _ = app_handle.emit("engine-error", &msg);
                 }

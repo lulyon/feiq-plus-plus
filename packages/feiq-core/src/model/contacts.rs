@@ -3,8 +3,33 @@
 //! Mirrors feiqmodel.cpp fellow management.
 
 use crate::protocol::types::Fellow;
+use pinyin::ToPinyin;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+
+/// Check if a query matches the pinyin representation of a name.
+/// Supports both full pinyin (e.g., "zhangsan") and first-letter (e.g., "zs") matching.
+fn pinyin_matches(name: &str, lower_query: &str) -> bool {
+    let mut first_letters = String::new();
+    let mut full_pinyin = String::new();
+
+    for (i, pinyin) in name.to_pinyin().enumerate() {
+        match pinyin {
+            Some(p) => {
+                first_letters.push_str(p.first_letter());
+                full_pinyin.push_str(p.plain());
+            }
+            None => {
+                // Non-CJK character: include as-is for mixed searches
+                let ch = name.chars().nth(i).unwrap();
+                first_letters.push(ch.to_ascii_lowercase());
+                full_pinyin.push(ch.to_ascii_lowercase());
+            }
+        }
+    }
+
+    first_letters.contains(lower_query) || full_pinyin.contains(lower_query)
+}
 
 /// Thread-safe contact book indexed by ip:port
 pub struct ContactBook {
@@ -92,7 +117,7 @@ impl ContactBook {
         }
     }
 
-    /// Search contacts by name, IP, host, or pinyin
+    /// Search contacts by name, IP, host, pc_name, or pinyin
     pub fn search(&self, query: &str) -> Vec<Fellow> {
         if query.is_empty() {
             return self.all();
@@ -104,6 +129,8 @@ impl ContactBook {
                 c.display_name().to_lowercase().contains(&lower)
                     || c.ip.contains(&lower)
                     || c.host.to_lowercase().contains(&lower)
+                    || c.pc_name.to_lowercase().contains(&lower)
+                    || pinyin_matches(c.display_name(), &lower)
             })
             .cloned()
             .collect()

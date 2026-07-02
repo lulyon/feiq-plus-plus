@@ -101,6 +101,94 @@ async fn test_two_clients_discovery_and_message() {
     ws_b.close(None).await.unwrap();
 }
 
+#[tokio::test]
+async fn test_file_transfer_via_relay() {
+    let port = PORT + 2;
+    let _ = tokio::spawn(server::run("127.0.0.1", port, 3600));
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let url = format!("ws://127.0.0.1:{port}");
+
+    // Alice joins
+    let (mut ws_a, _) = connect_async(&url).await.unwrap();
+    ws_a.send(Message::Text(serde_json::json!({
+        "type": "join", "room": "file_test", "name": "Alice", "host": "mbp", "version": "v1"
+    }).to_string())).await.unwrap();
+    let resp: serde_json::Value = serde_json::from_str(
+        &ws_a.next().await.unwrap().unwrap().into_text().unwrap()
+    ).unwrap();
+    assert_eq!(resp["type"], "joined");
+    let _alice_id = resp["client_id"].as_str().unwrap().to_string();
+
+    // Bob joins
+    let (mut ws_b, _) = connect_async(&url).await.unwrap();
+    ws_b.send(Message::Text(serde_json::json!({
+        "type": "join", "room": "file_test", "name": "Bob", "host": "imac", "version": "v1"
+    }).to_string())).await.unwrap();
+    let resp: serde_json::Value = serde_json::from_str(
+        &ws_b.next().await.unwrap().unwrap().into_text().unwrap()
+    ).unwrap();
+    assert_eq!(resp["type"], "joined");
+    let bob_id = resp["client_id"].as_str().unwrap().to_string();
+
+    // Consume Alice's peer_online notification
+    let _ = ws_a.next().await.unwrap().unwrap();
+
+    // Alice sends FileStart to Bob
+    ws_a.send(Message::Text(serde_json::json!({
+        "type": "file_start",
+        "to": &bob_id,
+        "file_id": 1,
+        "file_name": "test.txt",
+        "file_size": 14
+    }).to_string())).await.unwrap();
+
+    // Bob receives FileStart
+    let resp: serde_json::Value = serde_json::from_str(
+        &ws_b.next().await.unwrap().unwrap().into_text().unwrap()
+    ).unwrap();
+    assert_eq!(resp["type"], "file_start");
+    assert_eq!(resp["file_id"], 1);
+    assert_eq!(resp["file_name"], "test.txt");
+    assert_eq!(resp["file_size"], 14);
+    assert_eq!(resp["from_name"], "Alice");
+
+    // Alice sends binary chunk: [8 bytes file_id BE][chunk data]
+    let file_id: u64 = 1;
+    let chunk_data = b"Hello, World!";
+    let mut binary_frame = Vec::with_capacity(8 + chunk_data.len());
+    binary_frame.extend_from_slice(&file_id.to_be_bytes());
+    binary_frame.extend_from_slice(chunk_data);
+    ws_a.send(Message::Binary(binary_frame.clone())).await.unwrap();
+
+    // Bob receives binary chunk
+    let bob_msg = ws_b.next().await.unwrap().unwrap();
+    match bob_msg {
+        Message::Binary(data) => {
+            assert_eq!(&data[..8], &file_id.to_be_bytes());
+            assert_eq!(&data[8..], chunk_data);
+        }
+        other => panic!("Expected Binary message, got: {:?}", other),
+    }
+
+    // Alice sends FileEnd
+    ws_a.send(Message::Text(serde_json::json!({
+        "type": "file_end",
+        "to": &bob_id,
+        "file_id": 1
+    }).to_string())).await.unwrap();
+
+    // Bob receives FileEnd
+    let resp: serde_json::Value = serde_json::from_str(
+        &ws_b.next().await.unwrap().unwrap().into_text().unwrap()
+    ).unwrap();
+    assert_eq!(resp["type"], "file_end");
+    assert_eq!(resp["file_id"], 1);
+
+    ws_a.close(None).await.unwrap();
+    ws_b.close(None).await.unwrap();
+}
+
 // Note: full offline queue recovery after WS disconnect requires client identity
 // persistence. The current server queues messages by client_id, and a reconnecting
 // client gets a new UUID. In production, the feiq++ relay client maintains a

@@ -179,6 +179,35 @@ pub async fn send_text(state: State<'_, AppState>, ip: String, text: String) -> 
     engine.send_text_to(&ip, port, &text).await.map_err(|e| e.to_string())
 }
 
+#[tauri::command]
+pub async fn send_read_receipt(
+    state: State<'_, AppState>,
+    ip: String,
+    packet_id: String,
+) -> Result<(), String> {
+    let engine = state.engine.lock().await;
+    let port = engine.find_contact(&ip).map(|f| f.port).unwrap_or(2425);
+    tracing::info!("send_read_receipt to {ip}: packet_id={packet_id}");
+    engine
+        .send_readmsg(&ip, port, &packet_id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn send_typing(
+    state: State<'_, AppState>,
+    ip: String,
+    is_typing: bool,
+) -> Result<(), String> {
+    let engine = state.engine.lock().await;
+    let port = engine.find_contact(&ip).map(|f| f.port).unwrap_or(2425);
+    engine
+        .send_typing_to(&ip, port, is_typing)
+        .await
+        .map_err(|e| e.to_string())
+}
+
 // ─── Alias & Contact Meta ─────────────────────────────────────
 
 #[tauri::command]
@@ -266,6 +295,62 @@ pub async fn get_blacklist(state: State<'_, AppState>) -> Result<Vec<String>, St
 // ─── Group Chat ──────────────────────────────────────────────────
 
 #[tauri::command]
+pub async fn send_group_file(
+    state: State<'_, AppState>,
+    group_name: String,
+    file_path: String,
+) -> Result<(), String> {
+    let engine = state.engine.lock().await;
+    tracing::info!("send_group_file to group={group_name}: {file_path}");
+    engine
+        .send_file_to_group(&group_name, &file_path)
+        .await
+        .map(|results| {
+            tracing::info!("Group file sent: {} members, {} succeeded",
+                results.len(),
+                results.iter().filter(|(_, tid)| *tid > 0).count());
+        })
+        .map_err(|e| e.to_string())
+}
+
+// ─── Group Management ──────────────────────────────────────────
+
+#[tauri::command]
+pub async fn delete_group_cmd(
+    state: State<'_, AppState>,
+    group_name: String,
+) -> Result<(), String> {
+    let engine = state.engine.lock().await;
+    engine.delete_group(&group_name).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn send_group_announcement(
+    state: State<'_, AppState>,
+    group_name: String,
+    content: String,
+) -> Result<(), String> {
+    let engine = state.engine.lock().await;
+    engine
+        .send_announcement_to_group(&group_name, &content)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn get_group_announcements(
+    state: State<'_, AppState>,
+    group_name: String,
+    limit: usize,
+    offset: usize,
+) -> Result<Vec<(i64, String, String, i64)>, String> {
+    let engine = state.engine.lock().await;
+    engine
+        .get_announcements(&group_name, limit, offset)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 pub async fn send_group_text(
     state: State<'_, AppState>,
     group_name: String,
@@ -344,15 +429,47 @@ pub async fn download_file(
 
     let (peer_ip, peer_port, packet_no, file_id, total, filename) = task_info;
 
-    // Guard: relay peers use WebSocket, not direct TCP — file transfer not yet supported
+    // Relay peers: send GETFILEDATA request via relay and receive via binary chunks
     if peer_ip.starts_with("relay:") {
-        task.set_error("File download not supported for relay peers".into());
+        let relay_peer_id = peer_ip
+            .strip_prefix("relay:")
+            .unwrap_or(&peer_ip)
+            .to_string();
+
+        // Send GETFILEDATA request via relay
+        {
+            let engine = state.engine.lock().await;
+            if let Some(ref relay) = engine.relay_client() {
+                let getfile_data = feiq_core::engine::engine::build_get_file_data(packet_no, file_id, 0);
+                if let Err(e) = relay
+                    .send_to(&relay_peer_id, feiq_core::protocol::constants::IPMSG_GETFILEDATA, &getfile_data)
+                    .await
+                {
+                    task.set_error(e.to_string());
+                    let _ = event_tx.send(FrontendEvent::FileStateChanged {
+                        task_id,
+                        state: FileTaskState::Error(e.to_string()),
+                        message: format!("Relay file request failed: {}", e),
+                    });
+                    return Err(format!("Relay file request failed: {}", e));
+                }
+            } else {
+                task.set_error("Relay not connected".into());
+                return Err("Relay not connected".into());
+            }
+        }
+
+        task.set_running();
         let _ = event_tx.send(FrontendEvent::FileStateChanged {
             task_id,
-            state: FileTaskState::Error("File download not supported for relay peers".into()),
-            message: format!("Cannot download from relay peer: {}", filename),
+            state: FileTaskState::Running,
+            message: format!("Downloading via relay: {}", filename),
         });
-        return Err("File download not supported for relay peers. Use direct LAN connection.".into());
+
+        // The relay file data will arrive as FileChunk events handled by the engine,
+        // which will update the file task progress. Return success — the frontend
+        // will monitor FileProgress events.
+        return Ok(());
     }
 
     // Phase 2: TCP transfer (engine lock released)
@@ -385,6 +502,15 @@ pub async fn download_file(
     let recv_result = {
         let task_clone = task.clone();
         let tx_clone = event_tx.clone();
+        let download_limit: Option<u64> = {
+            let engine = state.engine.lock().await;
+            engine
+                .get_config()
+                .download_speed_limit_kbps
+                .checked_mul(1024)
+                .map(|v| v as u64)
+                .filter(|&v| v > 0)
+        };
         ft.recv_file(
             &save_path, total,
             move |progress, total_size| {
@@ -398,6 +524,7 @@ pub async fn download_file(
                 }
             },
             Some(&*task.cancel_flag),
+            download_limit,
         )
         .await
     };
@@ -474,6 +601,93 @@ pub async fn send_file(
         .map_err(|e| e.to_string())
 }
 
+
+// ─── Stealth Mode ──────────────────────────────────────────────
+
+#[tauri::command]
+pub async fn set_stealth_mode(
+    state: State<'_, AppState>,
+    enabled: bool,
+) -> Result<(), String> {
+    let mut engine = state.engine.lock().await;
+    engine.set_stealth_mode(enabled);
+    Ok(())
+}
+
+// ─── Avatar ────────────────────────────────────────────────────
+
+#[tauri::command]
+pub async fn set_avatar(
+    state: State<'_, AppState>,
+    path: String,
+) -> Result<(), String> {
+    validate_path(&path)?;
+    // Validate: must be PNG or JPEG, max 100KB
+    let meta = std::fs::metadata(&path).map_err(|e| format!("Cannot read file: {e}"))?;
+    if meta.len() > 102400 {
+        return Err("Avatar image must be ≤ 100KB".into());
+    }
+    let ext = std::path::Path::new(&path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+    if ext != "png" && ext != "jpg" && ext != "jpeg" {
+        return Err("Avatar must be PNG or JPEG".into());
+    }
+
+    let mut engine = state.engine.lock().await;
+    let mut config = engine.get_config();
+    config.avatar_path = path;
+    engine.update_config(config);
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn get_avatar(
+    state: State<'_, AppState>,
+    ip: String,
+) -> Result<Option<String>, String> {
+    let engine = state.engine.lock().await;
+    let contact = engine.find_contact(&ip);
+    match contact {
+        Some(fellow) if !fellow.avatar_hash.is_empty() => {
+            Ok(Some(fellow.avatar_hash.clone()))
+        }
+        _ => Ok(None),
+    }
+}
+
+// ─── File Share (Browse remote shared directories) ────────────
+
+#[tauri::command]
+pub async fn browse_shared_folder(
+    state: State<'_, AppState>,
+    ip: String,
+    password: Option<String>,
+) -> Result<(), String> {
+    let engine = state.engine.lock().await;
+
+    let peer = engine
+        .find_contact(&ip)
+        .ok_or_else(|| format!("Contact not found for IP: {}", ip))?;
+
+    let port = peer.port;
+    let data = feiq_core::engine::engine::build_get_dir_files(0, password.as_deref());
+
+    let network = engine
+        .network()
+        .ok_or("Network not available")?
+        .clone();
+
+    // Release engine lock before async send
+    drop(engine);
+
+    network
+        .send_to(&ip, port, &data)
+        .await
+        .map_err(|e| format!("Failed to send GETDIRFILES: {}", e))
+}
 
 // ─── Unread Badge ─────────────────────────────────────────────
 

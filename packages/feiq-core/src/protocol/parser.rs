@@ -138,6 +138,31 @@ impl RecvProtocol for RecvBrEntry {
     }
 }
 
+// ─── RecvBrAbsence: handles IPMSG_BR_ABSENCE (name/status change) ──
+
+pub struct RecvBrAbsence;
+
+impl RecvProtocol for RecvBrAbsence {
+    fn name(&self) -> &str {
+        "RecvBrAbsence"
+    }
+
+    fn read(&self, post: &mut Post, _chain: &ProtocolChain) -> bool {
+        if is_cmd_set(post.cmd_id, IPMSG_BR_ABSENCE) {
+            // Extract public key if feiq++ peer
+            extract_peer_public_key(post);
+
+            let is_utf8 = is_opt_set(post.cmd_id, IPMSG_UTF8OPT);
+            let name = decode_by_utf8opt(&post.extra, is_utf8);
+            if !name.is_empty() {
+                post.from.name = name;
+            }
+            return true; // fully handled
+        }
+        false
+    }
+}
+
 // ─── RecvBrExit: handles IPMSG_BR_EXIT (user offline) ───────
 
 pub struct RecvBrExit;
@@ -150,6 +175,42 @@ impl RecvProtocol for RecvBrExit {
     fn read(&self, post: &mut Post, _chain: &ProtocolChain) -> bool {
         if is_cmd_set(post.cmd_id, IPMSG_BR_EXIT) {
             post.from.online = false;
+            return true;
+        }
+        false
+    }
+}
+
+// ─── RecvInputing: handles IPMSG_INPUTING (typing indicator) ──
+
+pub struct RecvInputing;
+
+impl RecvProtocol for RecvInputing {
+    fn name(&self) -> &str {
+        "RecvInputing"
+    }
+
+    fn read(&self, post: &mut Post, _chain: &ProtocolChain) -> bool {
+        if is_cmd_set(post.cmd_id, IPMSG_INPUTING) {
+            post.contents.push(Content::Typing { is_typing: true });
+            return true;
+        }
+        false
+    }
+}
+
+// ─── RecvInputEnd: handles IPMSG_INPUT_END (typing ended) ──
+
+pub struct RecvInputEnd;
+
+impl RecvProtocol for RecvInputEnd {
+    fn name(&self) -> &str {
+        "RecvInputEnd"
+    }
+
+    fn read(&self, post: &mut Post, _chain: &ProtocolChain) -> bool {
+        if is_cmd_set(post.cmd_id, IPMSG_INPUT_END) {
+            post.contents.push(Content::Typing { is_typing: false });
             return true;
         }
         false
@@ -426,6 +487,48 @@ impl RecvProtocol for RecvReadMessage {
     }
 }
 
+// ─── RecvReadMsgSealed: handles IPMSG_READMSG (sealed message read) ──
+
+pub struct RecvReadMsgSealed;
+
+impl RecvProtocol for RecvReadMsgSealed {
+    fn name(&self) -> &str {
+        "RecvReadMsgSealed"
+    }
+
+    fn read(&self, post: &mut Post, _chain: &ProtocolChain) -> bool {
+        if is_cmd_set(post.cmd_id, IPMSG_READMSG) {
+            let extra_str = String::from_utf8_lossy(&post.extra);
+            if let Ok(id) = extra_str.trim().parse::<u64>() {
+                post.contents.push(Content::Id { id });
+            }
+            return true;
+        }
+        false
+    }
+}
+
+// ─── RecvAnsReadMsg: handles IPMSG_ANSREADMSG (read receipt ack) ──
+
+pub struct RecvAnsReadMsg;
+
+impl RecvProtocol for RecvAnsReadMsg {
+    fn name(&self) -> &str {
+        "RecvAnsReadMsg"
+    }
+
+    fn read(&self, post: &mut Post, _chain: &ProtocolChain) -> bool {
+        if is_cmd_set(post.cmd_id, IPMSG_ANSREADMSG) {
+            let extra_str = String::from_utf8_lossy(&post.extra);
+            if let Ok(id) = extra_str.trim().parse::<u64>() {
+                post.contents.push(Content::Id { id });
+            }
+            return true;
+        }
+        false
+    }
+}
+
 // ─── RecvGetFileData: handles IPMSG_GETFILEDATA (file data request) ──
 
 pub struct RecvGetFileData;
@@ -440,7 +543,7 @@ impl RecvProtocol for RecvGetFileData {
             return false;
         }
 
-        // Format: packetNo:fileId:offset:
+        // Format: packetNo:fileId:offset:[:password]
         let extra_str = String::from_utf8_lossy(&post.extra);
         let parts: Vec<&str> = extra_str.trim_end_matches(':').split(':').collect();
 
@@ -450,10 +553,16 @@ impl RecvProtocol for RecvGetFileData {
                 parts[1].parse::<u64>(),
                 parts[2].parse::<i64>(),
             ) {
+                let password = if is_opt_set(post.cmd_id, IPMSG_PASSWORDOPT) && parts.len() >= 4 {
+                    Some(parts[3].to_string())
+                } else {
+                    None
+                };
                 post.get_file_data = Some(GetFileData {
                     packet_no,
                     file_id,
                     offset,
+                    password,
                 });
             }
         }
@@ -488,11 +597,55 @@ impl RecvProtocol for RecvReleaseFiles {
                     packet_no,
                     file_id,
                     offset: 0,
+                    password: None,
                 });
             }
         }
 
         true // stop chain
+    }
+}
+
+// ─── RecvGetAvatar: handles IPMSG_GETAVATAR (avatar request) ──
+
+pub struct RecvGetAvatar;
+
+impl RecvProtocol for RecvGetAvatar {
+    fn name(&self) -> &str {
+        "RecvGetAvatar"
+    }
+
+    fn read(&self, post: &mut Post, _chain: &ProtocolChain) -> bool {
+        if is_cmd_set(post.cmd_id, IPMSG_GETAVATAR) {
+            post.contents.push(Content::Text {
+                text: "[AvatarRequest]".into(),
+                format: String::new(),
+            });
+            return true;
+        }
+        false
+    }
+}
+
+// ─── RecvSendAvatar: handles IPMSG_SENDAVATAR (avatar data) ──
+
+pub struct RecvSendAvatar;
+
+impl RecvProtocol for RecvSendAvatar {
+    fn name(&self) -> &str {
+        "RecvSendAvatar"
+    }
+
+    fn read(&self, post: &mut Post, _chain: &ProtocolChain) -> bool {
+        if is_cmd_set(post.cmd_id, IPMSG_SENDAVATAR) {
+            // Avatar data is in the extra field (SHA256:base64_image_data)
+            post.contents.push(Content::Text {
+                text: "[AvatarData]".into(),
+                format: String::new(),
+            });
+            return true;
+        }
+        false
     }
 }
 
@@ -520,16 +673,23 @@ pub fn build_default_chain() -> ProtocolChain {
     chain.add_handler(Box::new(DebugHandler));
     chain.add_handler(Box::new(RecvAnsEntry));
     chain.add_handler(Box::new(RecvBrEntry));
+    chain.add_handler(Box::new(RecvBrAbsence));
     chain.add_handler(Box::new(RecvBrExit));
     chain.add_handler(Box::new(RecvSendCheck));
     chain.add_handler(Box::new(RecvReadCheck));
     chain.add_handler(Box::new(RecvReadMessage));
+    chain.add_handler(Box::new(RecvReadMsgSealed));
+    chain.add_handler(Box::new(RecvAnsReadMsg));
     chain.add_handler(Box::new(RecvText));
     chain.add_handler(Box::new(RecvImage));
+    chain.add_handler(Box::new(RecvInputing));
+    chain.add_handler(Box::new(RecvInputEnd));
     chain.add_handler(Box::new(RecvKnock));
     chain.add_handler(Box::new(RecvFile));
     chain.add_handler(Box::new(RecvGetFileData));
     chain.add_handler(Box::new(RecvReleaseFiles));
+    chain.add_handler(Box::new(RecvGetAvatar));
+    chain.add_handler(Box::new(RecvSendAvatar));
     chain.add_handler(Box::new(EndRecv));
 
     chain
@@ -538,6 +698,22 @@ pub fn build_default_chain() -> ProtocolChain {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_chain_br_absence() {
+        let chain = build_default_chain();
+        let mut post = Post::new("192.168.1.100");
+        post.cmd_id = IPMSG_BR_ABSENCE;
+
+        // "李四" in GBK
+        let gbk_name = b"\xc0\xee\xcb\xc4".to_vec();
+        post.extra = gbk_name;
+
+        chain.process(&mut post);
+
+        assert_eq!(post.from.name, "李四");
+        assert!(post.contents.is_empty()); // BR_ABSENCE has no display content
+    }
 
     #[test]
     fn test_chain_br_entry() {

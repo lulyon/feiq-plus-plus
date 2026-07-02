@@ -3,7 +3,7 @@
 
 use crate::network::tcp::{FileServer, FileTransfer};
 use crate::network::udp::UdpTransport;
-use crate::protocol::constants::{IPMSG_ANSENTRY, IPMSG_BR_ENTRY, IPMSG_BR_EXIT, IPMSG_GETDIRFILES, IPMSG_GETFILEDATA, IPMSG_RELEASEFILES};
+use crate::protocol::constants::{IPMSG_ANSENTRY, IPMSG_BR_ABSENCE, IPMSG_BR_ENTRY, IPMSG_BR_EXIT, IPMSG_GETDIRFILES, IPMSG_GETFILEDATA, IPMSG_RELEASEFILES};
 use crate::protocol::parser::ProtocolChain;
 use crate::protocol::serializer::parse_raw;
 use super::NetworkEvent;
@@ -178,6 +178,7 @@ impl NetworkManager {
                 file_id: gfd.file_id,
                 offset: gfd.offset,
                 from: post.from,
+                password: gfd.password,
             });
             return;
         }
@@ -185,7 +186,7 @@ impl NetworkManager {
         // ─── Dispatch based on parsed contents ────────────────
         if post.contents.is_empty() {
             // System message: online/offline/ansentry
-            if is_cmd_set(post.cmd_id, IPMSG_BR_ENTRY) {
+            if is_cmd_set(post.cmd_id, IPMSG_BR_ENTRY) || is_cmd_set(post.cmd_id, IPMSG_BR_ABSENCE) {
                 let _ = self.event_tx.send(NetworkEvent::FellowOnline(post));
             } else if is_cmd_set(post.cmd_id, IPMSG_BR_EXIT) {
                 let _ = self.event_tx.send(NetworkEvent::FellowOffline(post));

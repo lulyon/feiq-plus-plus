@@ -152,14 +152,16 @@ impl Engine {
 
         // Ensure keypair and include public key in BR_ENTRY broadcast
         let our_pub_key = self.ensure_keypair()?;
-        let online_data = build_br_entry_ext(&self.config.name, &self.config.host, &self.version, Some(&our_pub_key));
-        network.broadcast(&online_data).await?;
+        if !self.config.stealth_mode {
+            let online_data = build_br_entry_ext(&self.config.name, &self.config.host, &self.version, Some(&our_pub_key));
+            network.broadcast(&online_data).await?;
 
-        if self.config.port != 2425 {
-            network.broadcast_to_port(2425, &online_data).await?;
-        }
-        for ip in &self.config.custom_ips {
-            let _ = network.send_to(ip, 2425, &online_data).await;
+            if self.config.port != 2425 {
+                network.broadcast_to_port(2425, &online_data).await?;
+            }
+            for ip in &self.config.custom_ips {
+                let _ = network.send_to(ip, 2425, &online_data).await;
+            }
         }
 
         let network = Arc::new(network);
@@ -172,6 +174,7 @@ impl Engine {
         let file_tasks_tcp = self.file_tasks().clone();
         let event_tx_tcp = self.event_tx.clone();
         let sem_spawn = transfer_semaphore.clone();
+        let config_tcp = self.config.clone();
         tokio::spawn(async move {
             while let Some((mut ft, peer_ip)) = tcp_queue_rx.recv().await {
                 // Acquire an OWNED semaphore permit to limit concurrent transfers.
@@ -183,6 +186,7 @@ impl Engine {
                 };
                 let file_tasks = file_tasks_tcp.clone();
                 let event_tx = event_tx_tcp.clone();
+                let config = config_tcp.clone();
                 tokio::spawn(async move {
                     // Hold the permit for the entire transfer lifetime
                     let _permit = permit;
@@ -291,15 +295,27 @@ impl Engine {
                     let result = {
                         let task_for_progress = task.clone();
                         let tx = event_tx.clone();
-                        ft.send_file(&file_path, offset, |progress, total_size| {
-                            if task_for_progress.update_progress(progress) {
-                                let _ = tx.send(FrontendEvent::FileProgress {
-                                    task_id,
-                                    progress,
-                                    total: total_size,
-                                });
-                            }
-                        }, Some(&cancel_flag)).await
+                        let upload_limit: Option<u64> = config
+                            .upload_speed_limit_kbps
+                            .checked_mul(1024)
+                            .map(|v| v as u64)
+                            .filter(|&v| v > 0);
+                        ft.send_file(
+                            &file_path,
+                            offset,
+                            |progress, total_size| {
+                                if task_for_progress.update_progress(progress) {
+                                    let _ = tx.send(FrontendEvent::FileProgress {
+                                        task_id,
+                                        progress,
+                                        total: total_size,
+                                    });
+                                }
+                            },
+                            Some(&cancel_flag),
+                            upload_limit,
+                        )
+                        .await
                     };
 
                     match result {
@@ -404,45 +420,43 @@ impl Engine {
                 }
 
 	                // ─── File share: handle GETDIRFILES (directory listing) ──
-	                let is_get_dir_files = match &event {
-	                    NetworkEvent::GetFileData { offset, file_id, .. } => {
-	                        *offset > 0 && *file_id == 0 && !config.shared_dir.is_empty()
-	                    }
-	                    _ => false,
+	                let gfd = match &event {
+	                    NetworkEvent::GetFileData {
+	                        packet_no,
+	                        file_id,
+	                        offset,
+	                        password,
+	                        ..
+	                    } => Some(GetFileData {
+	                        packet_no: *packet_no,
+	                        file_id: *file_id,
+	                        offset: *offset,
+	                        password: password.clone(),
+	                    }),
+	                    _ => None,
 	                };
 
-	                if is_get_dir_files {
-	                    if let NetworkEvent::GetFileData {
-	                        packet_no,
-	                        offset: _,
-	                        file_id: _,
-	                        ref from,
-	                    } = &event
-	                    {
-	                        let files =
-	                            crate::network::tcp::list_directory(&config.shared_dir, &config.shared_dir);
-	                        if !files.is_empty() {
-	                            let files: Vec<FileContent> = files
-	                                .into_iter()
-	                                .enumerate()
-	                                .map(|(i, mut f)| {
-	                                    f.file_id = (i + 1) as u64;
-	                                    f
-	                                })
-	                                .collect();
+	                if let Some(ref gfd) = gfd {
+	                    if let Some(files) = check_file_share_request(&config, gfd) {
+	                        if let NetworkEvent::GetFileData { ref from, .. } = &event {
 	                            let peer_is_feiq = is_feiq_plus_plus(&from.version);
 	                            let data = build_directory_listing(
-	                                *packet_no,
+	                                gfd.packet_no,
 	                                &self_name,
 	                                &self_host,
 	                                &self_version,
 	                                &files,
 	                                peer_is_feiq,
 	                            );
-	                            let _ = network_for_dispatch.send_to(&from.ip, from.port, &data).await;
+	                            let _ = network_for_dispatch
+	                                .send_to(&from.ip, from.port, &data)
+	                                .await;
 	                        }
 	                    }
-	                    continue;
+	                    if gfd.offset > 0 && gfd.file_id == 0 {
+	                        // Consumed as a directory listing — don't forward
+	                        continue;
+	                    }
 	                }
 
 	                let (reply, recv_reply) = handle_network_event(
@@ -589,6 +603,10 @@ impl Engine {
 
     /// Update config live (takes effect for new messages; periodic broadcast
     /// still uses the old name until restart)
+    pub fn get_config(&self) -> AppConfig {
+        self.config.clone()
+    }
+
     pub fn update_config(&mut self, config: AppConfig) {
         // Broadcast name change to peers if name actually changed
         if self.config.name != config.name && self.network.is_some() {
@@ -596,6 +614,190 @@ impl Engine {
             self.config = config;
         } else {
             self.config = config;
+        }
+    }
+
+    /// Enable or disable stealth mode.
+    pub fn set_stealth_mode(&mut self, enabled: bool) {
+        self.config.stealth_mode = enabled;
+        tracing::info!("Stealth mode: {}", if enabled { "ON" } else { "OFF" });
+    }
+
+    // ─── Group Permissions (Feature 14) ─────────────────────────
+
+    /// Create a group with owner tracking
+    pub fn create_group_with_owner(
+        &self,
+        name: &str,
+        member_ips: &[String],
+        owner_ip: &str,
+    ) -> anyhow::Result<()> {
+        if let Some(ref history) = self.history {
+            history
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .save_group_with_owner(name, member_ips, owner_ip)?;
+            Ok(())
+        } else {
+            Err(anyhow::anyhow!("History DB not available"))
+        }
+    }
+
+    /// Delete a group
+    pub fn delete_group(&self, name: &str) -> anyhow::Result<()> {
+        if let Some(ref history) = self.history {
+            history
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .delete_group(name)?;
+            Ok(())
+        } else {
+            Err(anyhow::anyhow!("History DB not available"))
+        }
+    }
+
+    /// Update group settings (JSON)
+    pub fn update_group_settings(&self, name: &str, settings_json: &str) -> anyhow::Result<()> {
+        if let Some(ref history) = self.history {
+            history
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .update_group_settings(name, settings_json)?;
+            Ok(())
+        } else {
+            Err(anyhow::anyhow!("History DB not available"))
+        }
+    }
+
+    // ─── Group Announcements (Feature 9b) ────────────────────────
+
+    /// Send an announcement to a group (P2P dispatch via relay/UDP)
+    pub async fn send_announcement_to_group(
+        &self,
+        group_name: &str,
+        content: &str,
+    ) -> anyhow::Result<()> {
+        let members = {
+            let book = self.contacts.lock().unwrap_or_else(|e| e.into_inner());
+            match self.history {
+                Some(ref h) => h
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get_groups()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .find(|(name, _)| name == group_name)
+                    .map(|(_, ips)| ips)
+                    .unwrap_or_default(),
+                None => vec![],
+            }
+        };
+
+        // Save to DB
+        if let Some(ref history) = self.history {
+            history
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .save_announcement(group_name, content, &self.config.name)?;
+        }
+
+        // P2P dispatch: send [announce:groupname] message to each member
+        for member_ip in &members {
+            if member_ip.starts_with("relay:") {
+                if let Some(ref relay) = self.relay_client {
+                    let peer_id = member_ip.strip_prefix("relay:").unwrap_or(member_ip);
+                    let body = format!("[announce:{}] {}", group_name, content);
+                    let data = pack_message(
+                        0, &self.config.name, &self.config.host, &self.version,
+                        IPMSG_SENDMSG | IPMSG_UTF8OPT,
+                        body.as_bytes(),
+                    );
+                    let _ = relay.send_to(peer_id, IPMSG_SENDMSG | IPMSG_UTF8OPT, &data).await;
+                }
+            } else if let Some(ref network) = self.network {
+                let peer = {
+                    let book = self.contacts.lock().unwrap_or_else(|e| e.into_inner());
+                    book.find_by_ip(member_ip).map(|f| f.port).unwrap_or(2425)
+                };
+                let body = format!("[announce:{}] {}", group_name, content);
+                let data = pack_message(
+                    0, &self.config.name, &self.config.host, &self.version,
+                    IPMSG_SENDMSG | IPMSG_UTF8OPT,
+                    body.as_bytes(),
+                );
+                let _ = network.send_to(member_ip, peer, &data).await;
+            }
+        }
+        Ok(())
+    }
+
+    /// Get announcements for a group
+    pub fn get_announcements(
+        &self,
+        group_name: &str,
+        limit: usize,
+        offset: usize,
+    ) -> anyhow::Result<Vec<(i64, String, String, i64)>> {
+        if let Some(ref history) = self.history {
+            history
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get_announcements(group_name, limit, offset)
+        } else {
+            Ok(vec![])
+        }
+    }
+
+    // ─── Avatar ──────────────────────────────────────────────────
+
+    /// Handle an incoming avatar request from a peer. Read our avatar file
+    /// and send it back as an IPMSG_SENDAVATAR response.
+    pub async fn handle_avatar_request(&self, from_ip: &str, from_port: u16) {
+        if self.config.avatar_path.is_empty() {
+            return;
+        }
+        let data = match std::fs::read(&self.config.avatar_path) {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::debug!("Cannot read avatar file: {e}");
+                return;
+            }
+        };
+        // Build SENDAVATAR: extra field contains SHA256 hash of avatar data
+        use sha2::{Digest, Sha256};
+        let hash = hex::encode(Sha256::digest(&data));
+        use base64::Engine;
+        let body = format!("{}:{}", hash, base64::engine::general_purpose::STANDARD.encode(&data));
+        let packed = pack_message(
+            0, "", "", "",
+            IPMSG_SENDAVATAR,
+            body.as_bytes(),
+        );
+        if let Some(ref network) = self.network {
+            let _ = network.send_to(from_ip, from_port, &packed).await;
+        }
+    }
+
+    /// Handle an incoming avatar data response from a peer.
+    pub fn handle_avatar_response(&self, from_ip: &str, extra: &[u8]) {
+        let extra_str = String::from_utf8_lossy(extra);
+        let parts: Vec<&str> = extra_str.splitn(2, ':').collect();
+        if parts.len() != 2 {
+            return;
+        }
+        let hash = parts[0].to_string();
+        // Save avatar hash to contact meta
+        if let Some(ref history) = self.history {
+            if let Ok(h) = history.lock() {
+                let _ = h.save_avatar_hash(from_ip, &hash);
+            }
+        }
+        // Update in-memory contact
+        if let Ok(mut book) = self.contacts.lock() {
+            if let Some(mut fellow) = book.find_by_ip(from_ip) {
+                fellow.avatar_hash = hash;
+                book.upsert(fellow);
+            }
         }
     }
 
@@ -837,6 +1039,39 @@ impl Engine {
         Ok(())
     }
 
+    /// Send typing indicator (IPMSG_INPUTING or IPMSG_INPUT_END).
+    /// Routes via relay if peer is from relay, else UDP.
+    pub async fn send_typing_to(&self, ip: &str, port: u16, is_typing: bool) -> anyhow::Result<()> {
+        let data = if is_typing {
+            build_inputing(&self.config.name, &self.config.host, &self.version)
+        } else {
+            build_input_end(&self.config.name, &self.config.host, &self.version)
+        };
+
+        let relay_peer_id = {
+            self.contacts
+                .lock()
+                .unwrap()
+                .find_by_ip(ip)
+                .and_then(|f| match &f.source {
+                    PeerSource::RelayPeer(id) => Some(id.clone()),
+                    _ => None,
+                })
+        };
+
+        if let Some(peer_id) = relay_peer_id {
+            if let Some(ref relay) = self.relay_client {
+                let cmd = if is_typing { IPMSG_INPUTING } else { IPMSG_INPUT_END };
+                return relay.send_to(&peer_id, cmd, &data).await;
+            }
+        }
+
+        if let Some(ref network) = self.network {
+            network.send_to(ip, port, &data).await?;
+        }
+        Ok(())
+    }
+
     /// Get chat history for a contact (paginated, chronological order)
     pub fn get_chat_history(
         &self,
@@ -919,11 +1154,12 @@ impl Engine {
             return Ok(());
         }
         let mut book = self.contacts.lock().unwrap_or_else(|e| e.into_inner());
-        for (ip, (alias, signature, group_name)) in meta_map {
+        for (ip, (alias, signature, group_name, avatar_hash)) in meta_map {
             if let Some(mut fellow) = book.find_by_ip(&ip) {
                 fellow.alias = alias;
                 fellow.signature = signature;
                 fellow.group_name = group_name;
+                fellow.avatar_hash = avatar_hash;
                 book.upsert(fellow);
             }
         }
@@ -1102,6 +1338,10 @@ impl Engine {
     }
 
     /// Get a reference to the network manager (for TCP file transfers).
+    pub fn relay_client(&self) -> Option<&Arc<RelayClient>> {
+        self.relay_client.as_ref()
+    }
+
     pub fn network(&self) -> Option<&Arc<NetworkManager>> {
         self.network.as_ref()
     }
@@ -1143,7 +1383,8 @@ impl Engine {
         let filename_only = std::path::Path::new(file_path)
             .file_name()
             .and_then(|n| n.to_str())
-            .unwrap_or(file_path);
+            .unwrap_or(file_path)
+            .to_string();
         let mut fc = create_file_content(file_path)
             .ok_or_else(|| anyhow::anyhow!("File not found: {}", filename_only))?;
         fc.file_id = packet_no;
@@ -1190,7 +1431,7 @@ impl Engine {
         );
 
         // Send via relay or UDP
-        if let Some(peer_id) = relay_peer_id {
+        if let Some(ref peer_id) = relay_peer_id {
             if let Some(ref relay) = self.relay_client {
                 relay
                     .send_to(&peer_id, IPMSG_SENDMSG | IPMSG_FILEATTACHOPT, &data)
@@ -1211,37 +1452,151 @@ impl Engine {
             message: format!("Sending file: {}", fc.filename),
         });
 
+        // For relay peers, proactively send the file via relay binary chunks
+        // (push model instead of TCP pull model)
+        if relay_peer_id.is_some() {
+            if let Some(task_arc) = self.get_file_task(task_id) {
+                let relay = self.relay_client.clone();
+                let event_tx = self.event_tx.clone();
+                let cancelled = task_arc.cancel_flag.clone();
+                let task_for_progress = task_arc.clone();
+                let peer_id = relay_peer_id.clone().unwrap();
+                let file_path_owned = file_path.to_string();
+                let file_size = fc.size;
+
+                tokio::spawn(async move {
+                    // Mark as running
+                    task_for_progress.set_running();
+                    let _ = event_tx.send(FrontendEvent::FileStateChanged {
+                        task_id,
+                        state: FileTaskState::Running,
+                        message: format!("Sending via relay: {}", filename_only),
+                    });
+
+                    if let Some(ref relay) = relay {
+                        // Send FileStart
+                        if let Err(e) = relay
+                            .send_file_start(&peer_id, packet_no, &filename_only, file_size as u64)
+                            .await
+                        {
+                            task_for_progress.set_error(e.to_string());
+                            return;
+                        }
+
+                        // Read and send file in 64KB chunks
+                        let file = match tokio::fs::File::open(&file_path_owned).await {
+                            Ok(f) => f,
+                            Err(e) => {
+                                task_for_progress.set_error(e.to_string());
+                                return;
+                            }
+                        };
+
+                        use tokio::io::AsyncReadExt;
+                        let mut reader = tokio::io::BufReader::new(file);
+                        let mut buf = vec![0u8; 65536]; // 64KB chunks
+                        let mut total_sent: i64 = 0;
+                        loop {
+                            // Check cancel
+                            if cancelled.load(std::sync::atomic::Ordering::Relaxed) {
+                                task_for_progress.set_canceled();
+                                let _ = relay.send_file_end(&peer_id, packet_no).await;
+                                return;
+                            }
+                            match reader.read(&mut buf).await {
+                                Ok(0) => break, // EOF
+                                Ok(n) => {
+                                    if let Err(e) =
+                                        relay.send_file_chunk(packet_no, &buf[..n]).await
+                                    {
+                                        task_for_progress.set_error(e.to_string());
+                                        return;
+                                    }
+                                    total_sent += n as i64;
+                                    task_for_progress.update_progress(total_sent);
+                                    let _ = event_tx.send(FrontendEvent::FileProgress {
+                                        task_id,
+                                        progress: total_sent,
+                                        total: file_size,
+                                    });
+                                }
+                                Err(e) => {
+                                    task_for_progress.set_error(e.to_string());
+                                    return;
+                                }
+                            }
+                        }
+
+                        // Send FileEnd
+                        if let Err(e) = relay.send_file_end(&peer_id, packet_no).await {
+                            task_for_progress.set_error(e.to_string());
+                            return;
+                        }
+
+                        task_for_progress.set_finish();
+                        let _ = event_tx.send(FrontendEvent::FileStateChanged {
+                            task_id,
+                            state: FileTaskState::Finish,
+                            message: format!("Sent via relay: {}", filename_only),
+                        });
+                        tracing::info!(
+                            "Relay file send complete: {filename_only} ({total_sent} bytes)"
+                        );
+                    }
+                });
+            }
+        }
+
         Ok(task_id)
     }
 
 }
 
 // ─── File Sharing (Phase 5.3) ─────────────────────────────────
+
+/// Check whether a GetFileData request is a directory listing (GETDIRFILES)
+/// and validate access against the configured shared directory and password.
+/// Returns the directory listing if access is granted, `None` otherwise.
+pub fn check_file_share_request(
+    config: &AppConfig,
+    request: &GetFileData,
+) -> Option<Vec<FileContent>> {
+    if request.offset > 0 && request.file_id == 0 {
+        if config.shared_dir.is_empty() {
+            tracing::debug!("File share request ignored: no shared directory configured");
+            return None;
+        }
+        // Check password if configured
+        if !config.shared_dir_password.is_empty() {
+            match &request.password {
+                Some(pw) if pw == &config.shared_dir_password => {}
+                _ => {
+                    tracing::debug!("File share request denied: wrong or missing password");
+                    return None;
+                }
+            }
+        }
+        let dir_path = &config.shared_dir;
+        let mut files = crate::network::tcp::list_directory(dir_path, dir_path);
+        if files.is_empty() {
+            tracing::debug!("File share request: shared directory is empty");
+            return None;
+        }
+        // Assign file IDs sequentially starting at 1 (0 means root)
+        for (i, f) in files.iter_mut().enumerate() {
+            f.file_id = (i + 1) as u64;
+        }
+        Some(files)
+    } else {
+        None
+    }
+}
+
 impl Engine {
     /// Handle a GETDIRFILES request from a peer for directory listing.
-    /// Returns `Some(Vec<FileContent>)` with the directory listing,
-    /// or `None` if no shared directory is configured.
+    /// Delegates to the standalone `check_file_share_request`.
     pub fn handle_file_share_request(&self, request: &GetFileData) -> Option<Vec<FileContent>> {
-        if request.offset > 0 && request.file_id == 0 {
-            let config = &self.config;
-            if config.shared_dir.is_empty() {
-                tracing::debug!("File share request ignored: no shared directory configured");
-                return None;
-            }
-            let dir_path = &config.shared_dir;
-            let mut files = crate::network::tcp::list_directory(dir_path, dir_path);
-            if files.is_empty() {
-                tracing::debug!("File share request: shared directory is empty");
-                return None;
-            }
-            // Assign file IDs sequentially starting at 1 (0 means root)
-            for (i, f) in files.iter_mut().enumerate() {
-                f.file_id = (i + 1) as u64;
-            }
-            Some(files)
-        } else {
-            None
-        }
+        check_file_share_request(&self.config, request)
     }
 }
 
@@ -1274,6 +1629,9 @@ fn handle_network_event(
         NetworkEvent::GetFileData { from, .. } => Some(&from.ip),
         NetworkEvent::ReleaseFiles { from, .. } => Some(&from.ip),
         NetworkEvent::Error(_) => None,
+        NetworkEvent::FileStartViaRelay { .. }
+        | NetworkEvent::FileEndViaRelay { .. }
+        | NetworkEvent::FileChunk { .. } => None,
     };
     if let Some(ip) = event_ip {
         if is_ip_blacklisted(ip, history) {
@@ -1344,6 +1702,10 @@ fn handle_network_event(
             }
 
             // Reply ANSENTRY for mutual discovery (return to caller)
+            // Skip if stealth mode is enabled
+            if config.stealth_mode {
+                return (None, None);
+            }
             (Some((ip, port)), None)
         }
         NetworkEvent::FellowAnsEntry(post) => {
@@ -1398,6 +1760,72 @@ fn handle_network_event(
                 }
             }
 
+            // ─── Handle READMSG/ANSREADMSG (sealed message read receipts) ──
+            if is_cmd_set(post.cmd_id, IPMSG_READMSG) || is_cmd_set(post.cmd_id, IPMSG_ANSREADMSG) {
+                for content in &post.contents {
+                    if let Content::Id { id } = content {
+                        let from_ip = post.from.ip.clone();
+                        let from_name = post.from.display_name().to_string();
+                        let _ = event_tx.send(FrontendEvent::MessageReadConfirmed {
+                            from_ip,
+                            from_name,
+                            packet_no: *id,
+                        });
+                    }
+                }
+            }
+
+            // ─── Handle typing indicators ─────────────────
+            for content in &post.contents {
+                if let Content::Typing { is_typing } = content {
+                    let _ = event_tx.send(FrontendEvent::TypingIndicator {
+                        from_ip: post.from.ip.clone(),
+                        from_name: post.from.display_name().to_string(),
+                        is_typing: *is_typing,
+                    });
+                }
+            }
+
+            // ─── Handle avatar protocol ────────────────────
+            for content in &post.contents {
+                match content {
+                    Content::Text { text, .. } if text == "[AvatarRequest]" => {
+                        // Avatar request will be handled in the engine's event loop
+                        // where we have access to the network sender.
+                        tracing::debug!("Avatar request from {}", post.from.ip);
+                    }
+                    Content::Text { text, .. } if text == "[AvatarData]" => {
+                        // Parse avatar hash from extra field
+                        if !post.extra.is_empty() {
+                            let extra_str = String::from_utf8_lossy(&post.extra);
+                            let parts: Vec<&str> = extra_str.splitn(2, ':').collect();
+                            if !parts.is_empty() {
+                                let hash = parts[0].to_string();
+                                if let Some(ref history) = history {
+                                    if let Ok(h) = history.lock() {
+                                        let _ = h.save_avatar_hash(&post.from.ip, &hash);
+                                    }
+                                }
+                                let mut book = contacts.lock().unwrap_or_else(|e| e.into_inner());
+                                if let Some(mut fellow) = book.find_by_ip(&post.from.ip) {
+                                    fellow.avatar_hash = hash;
+                                    let _ = event_tx.send(FrontendEvent::ContactUpdate {
+                                        fellow: fellow.clone(),
+                                    });
+                                    book.upsert(fellow);
+                                }
+                                tracing::debug!(
+                                    "Avatar data received from {}: hash={}",
+                                    post.from.ip,
+                                    parts[0]
+                                );
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
             // Filter unsupported content types (mirrors original onMsg)
             let mut reply_text = String::new();
             post.contents.retain(|c| {
@@ -1417,14 +1845,18 @@ fn handle_network_event(
                         false
                     }
                     Content::Text { text, .. } => {
-                        // Filter feiq encoded messages
-                        if starts_with(text, "/~#>") && ends_with(text, "<B~") {
+                        // Filter feiq encoded messages and avatar protocol
+                        if (starts_with(text, "/~#>") && ends_with(text, "<B~"))
+                            || text == "[AvatarRequest]"
+                            || text == "[AvatarData]"
+                        {
                             false
                         } else {
                             true
                         }
                     }
                     Content::Id { .. } => false, // Don't show read receipts as messages
+                    Content::Typing { .. } => false, // Don't show typing indicators as messages
                     _ => true,
                 }
             });
@@ -1568,6 +2000,7 @@ fn handle_network_event(
             file_id,
             offset,
             from,
+            password: _,
         } => {
             // File data request — handled in the engine's event loop
             // where async TCP accept is available. Here we just log it.
@@ -1619,6 +2052,35 @@ fn handle_network_event(
                     });
                 }
             }
+            (None, None)
+        }
+        NetworkEvent::FileStartViaRelay {
+            from_peer_id: _,
+            file_id,
+            file_name,
+            file_size,
+        } => {
+            tracing::info!(
+                "FileStart via relay: file_id={file_id}, name={file_name}, size={file_size}"
+            );
+            (None, None)
+        }
+        NetworkEvent::FileEndViaRelay {
+            from_peer_id: _,
+            file_id,
+        } => {
+            tracing::info!("FileEnd via relay: file_id={file_id}");
+            (None, None)
+        }
+        NetworkEvent::FileChunk {
+            from_peer_id: _,
+            file_id,
+            data,
+        } => {
+            tracing::trace!(
+                "FileChunk via relay: file_id={file_id}, len={}",
+                data.len()
+            );
             (None, None)
         }
         NetworkEvent::Error(msg) => {
@@ -1728,6 +2190,16 @@ pub fn build_knock(name: &str, host: &str, version: &str) -> Vec<u8> {
         IPMSG_KNOCK,
         &[],
     )
+}
+
+/// Build IPMSG_INPUTING (typing indicator)
+pub fn build_inputing(name: &str, host: &str, version: &str) -> Vec<u8> {
+    pack_message(0, name, host, version, IPMSG_INPUTING, &[])
+}
+
+/// Build IPMSG_INPUT_END (typing ended)
+pub fn build_input_end(name: &str, host: &str, version: &str) -> Vec<u8> {
+    pack_message(0, name, host, version, IPMSG_INPUT_END, &[])
 }
 
 /// Build IPMSG_SENDMSG | IPMSG_FILEATTACHOPT file notification
@@ -1840,6 +2312,19 @@ pub fn build_get_file_data(packet_no: u64, file_id: u64, offset: i64) -> Vec<u8>
     )
 }
 
+/// Build IPMSG_GETDIRFILES UDP request for browsing a peer's shared directory.
+/// Format: packetNo:0:1:[:password]
+pub fn build_get_dir_files(packet_no: u64, password: Option<&str>) -> Vec<u8> {
+    let mut cmd = IPMSG_GETDIRFILES;
+    let data = if let Some(pw) = password {
+        cmd |= IPMSG_PASSWORDOPT;
+        format!("{}:0:1:{}", packet_no, pw)
+    } else {
+        format!("{}:0:1:", packet_no)
+    };
+    pack_message(packet_no, "", "", "", cmd, data.as_bytes())
+}
+
 /// Create a FileContent from a local file path
 pub fn create_file_content(file_path: &str) -> Option<FileContent> {
     let meta = std::fs::metadata(file_path).ok()?;
@@ -1914,6 +2399,29 @@ impl Engine {
                 .save_message(&group_key, group_name, 0, &contents);
         }
         Ok(())
+    }
+
+    /// Send a file to all members of a group (P2P dispatch).
+    /// Returns a Vec of (member_ip, task_id) for tracking individual transfers.
+    pub async fn send_file_to_group(&self, group_name: &str, file_path: &str) -> anyhow::Result<Vec<(String, u64)>> {
+        let groups = match self.history {
+            Some(ref history) => history.lock().unwrap_or_else(|e| e.into_inner()).get_groups()?,
+            None => anyhow::bail!("History not available"),
+        };
+        let members = groups
+            .into_iter()
+            .find(|(name, _)| name == group_name)
+            .map(|(_, members)| members)
+            .ok_or_else(|| anyhow::anyhow!("Group '{}' not found", group_name))?;
+
+        let mut results = Vec::new();
+        for ip in &members {
+            match self.send_file_to(ip, file_path).await {
+                Ok(task_id) => results.push((ip.clone(), task_id)),
+                Err(e) => tracing::warn!("Failed to send file to group member {ip}: {e}"),
+            }
+        }
+        Ok(results)
     }
 }
 
@@ -2198,6 +2706,7 @@ mod tests {
             packet_no: 100,
             file_id: 0,
             offset: 1,
+            password: None,
         };
         let result = engine.handle_file_share_request(&req);
         assert!(result.is_none(), "Should return None when shared_dir is empty");
@@ -2213,6 +2722,7 @@ mod tests {
             packet_no: 100,
             file_id: 0,
             offset: 0,
+            password: None,
         };
         let result = engine.handle_file_share_request(&req);
         assert!(result.is_none(), "Should return None when offset == 0");
@@ -2228,6 +2738,7 @@ mod tests {
             packet_no: 100,
             file_id: 1,
             offset: 1,
+            password: None,
         };
         let result = engine.handle_file_share_request(&req);
         assert!(result.is_none(), "Should return None when file_id != 0");
@@ -2261,6 +2772,7 @@ mod tests {
             packet_no: 200,
             file_id: 0,
             offset: 1,
+            password: None,
         };
         let result = engine.handle_file_share_request(&req);
         assert!(result.is_some(), "Should return files when shared_dir has content");
@@ -2312,11 +2824,116 @@ mod tests {
             packet_no: 300,
             file_id: 0,
             offset: 1,
+            password: None,
         };
         let result = engine.handle_file_share_request(&req);
         assert!(result.is_none(), "Should return None when shared_dir is empty (no entries)");
         let _ = std::fs::remove_dir_all(&path);
+    }
 
+    #[test]
+    fn test_check_file_share_request_password_required_but_none() {
+        let mut config = AppConfig::default();
+        config.shared_dir = "/tmp".into();
+        config.shared_dir_password = "secret".into();
+        let req = GetFileData {
+            packet_no: 100,
+            file_id: 0,
+            offset: 1,
+            password: None,
+        };
+        let result = check_file_share_request(&config, &req);
+        assert!(
+            result.is_none(),
+            "Should return None when password required but not provided"
+        );
+    }
+
+    #[test]
+    fn test_check_file_share_request_wrong_password() {
+        let mut config = AppConfig::default();
+        config.shared_dir = "/tmp".into();
+        config.shared_dir_password = "secret".into();
+        let req = GetFileData {
+            packet_no: 100,
+            file_id: 0,
+            offset: 1,
+            password: Some("wrong".into()),
+        };
+        let result = check_file_share_request(&config, &req);
+        assert!(
+            result.is_none(),
+            "Should return None when wrong password provided"
+        );
+    }
+
+    #[test]
+    fn test_check_file_share_request_correct_password() {
+        let pid = std::process::id();
+        let path = std::path::PathBuf::from(format!(
+            "/tmp/feiq_test_share_pw_{}_{}",
+            pid,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        let dir_path = path.to_string_lossy().to_string();
+        std::fs::write(path.join("secret_file.txt"), "classified").unwrap();
+
+        let mut config = AppConfig::default();
+        config.shared_dir = dir_path.clone();
+        config.shared_dir_password = "secret".into();
+        let req = GetFileData {
+            packet_no: 200,
+            file_id: 0,
+            offset: 1,
+            password: Some("secret".into()),
+        };
+        let result = check_file_share_request(&config, &req);
+        assert!(
+            result.is_some(),
+            "Should return files when correct password provided"
+        );
+        let files = result.unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].filename, "secret_file.txt");
+
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    #[test]
+    fn test_check_file_share_request_no_password_when_unconfigured() {
+        let pid = std::process::id();
+        let path = std::path::PathBuf::from(format!(
+            "/tmp/feiq_test_share_nopw_{}_{}",
+            pid,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        let dir_path = path.to_string_lossy().to_string();
+        std::fs::write(path.join("public.txt"), "open").unwrap();
+
+        let mut config = AppConfig::default();
+        config.shared_dir = dir_path.clone();
+        // no password configured
+        let req = GetFileData {
+            packet_no: 300,
+            file_id: 0,
+            offset: 1,
+            password: None,
+        };
+        let result = check_file_share_request(&config, &req);
+        assert!(
+            result.is_some(),
+            "Should return files when no password is configured"
+        );
+
+        let _ = std::fs::remove_dir_all(&path);
     }
 
     // ─── Concurrent File Task Thread Safety ──────────────────────────

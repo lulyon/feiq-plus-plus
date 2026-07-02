@@ -52,6 +52,9 @@ pub struct Fellow {
     /// Peer's x25519 public key (32 bytes) for ECDH key exchange (feiq++ only)
     #[serde(default)]
     pub public_key: Vec<u8>,
+    /// SHA256 hash of the peer's avatar image, empty = no avatar
+    #[serde(default)]
+    pub avatar_hash: String,
 }
 
 fn default_fellow_port() -> u16 { 2425 }
@@ -73,6 +76,7 @@ impl Fellow {
             port: 2425,
             source: PeerSource::default(),
             public_key: Vec::new(),
+            avatar_hash: String::new(),
         }
     }
 
@@ -180,6 +184,8 @@ pub struct GetFileData {
     pub packet_no: u64,
     pub file_id: u64,
     pub offset: i64,
+    /// Optional password for directory listing (IPMSG_PASSWORDOPT)
+    pub password: Option<String>,
 }
 
 /// Message content enum
@@ -214,6 +220,10 @@ pub enum Content {
         #[serde(default)]
         ttl_seconds: u32,
     },
+    #[serde(rename = "typing")]
+    Typing {
+        is_typing: bool,
+    },
 }
 
 impl Content {
@@ -225,6 +235,7 @@ impl Content {
             Content::Image { .. } => "image",
             Content::Id { .. } => "id",
             Content::Sealed { .. } => "sealed",
+            Content::Typing { .. } => "typing",
         }
     }
 
@@ -431,6 +442,7 @@ mod tests {
             packet_no: 12345,
             file_id: 67890,
             offset: 0,
+            password: None,
         };
         assert_eq!(gfd.packet_no, 12345);
         assert_eq!(gfd.file_id, 67890);

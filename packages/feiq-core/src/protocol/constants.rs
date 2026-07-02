@@ -115,6 +115,13 @@ pub const IPMSG_FILE_EXHIDDENOPT: u32 = 0x00002000;
 pub const IPMSG_FILE_ARCHIVEOPT: u32 = 0x00004000;
 pub const IPMSG_FILE_SYSTEMOPT: u32 = 0x00008000;
 
+// ─── feiq++ custom extensions ─────────────────────────────────
+
+/// Request avatar from a peer (custom feiq++ command)
+pub const IPMSG_GETAVATAR: u32 = 0x00000075;
+/// Send avatar data to a peer (custom feiq++ command)
+pub const IPMSG_SENDAVATAR: u32 = 0x00000076;
+
 // ─── Separators (exact byte values from original) ────────────
 
 /// File list separator (0x07, ASCII BEL)
