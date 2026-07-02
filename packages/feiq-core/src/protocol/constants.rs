@@ -126,17 +126,6 @@ pub const HLIST_ENTRY_SEPARATOR: u8 = 0x3A;
 /// Null terminator
 pub const MSG_NULL: u8 = 0x00;
 
-// ─── Folder transfer TCP protocol markers (feiq++ custom) ─────
-
-/// Sent by receiver over TCP to request the folder manifest
-pub const FOLDER_MANIFEST_REQUEST: &[u8] = b"FOLDER_MANIFEST_REQUEST\n";
-/// Sent by sender after all files have been transferred successfully
-pub const FOLDER_TRANSFER_COMPLETE: &[u8] = b"FOLDER_TRANSFER_COMPLETE\n";
-/// Sent by either side to gracefully cancel the folder transfer
-pub const FOLDER_TRANSFER_CANCEL: &[u8] = b"FOLDER_TRANSFER_CANCEL\n";
-/// Sent by receiver to signal it's ready for the next file (acknowledges previous)
-pub const FOLDER_FILE_ACK: &[u8] = b"FOLDER_FILE_ACK\n";
-
 // ─── Helper functions ────────────────────────────────────────
 
 /// Check if command matches (compare low 8 bits)
@@ -218,52 +207,6 @@ mod tests {
                     t, a
                 );
             }
-        }
-    }
-
-    // ─── Marker byte sequence distinctness ──────────────────
-
-    #[test]
-    fn folder_marker_bytes_are_distinct() {
-        let markers: [&[u8]; 4] = [
-            FOLDER_MANIFEST_REQUEST,
-            FOLDER_TRANSFER_COMPLETE,
-            FOLDER_TRANSFER_CANCEL,
-            FOLDER_FILE_ACK,
-        ];
-        // No marker should be a prefix of another (wire protocol safety)
-        for (i, a) in markers.iter().enumerate() {
-            for (j, b) in markers.iter().enumerate() {
-                if i == j {
-                    continue;
-                }
-                let a_is_prefix = a.len() <= b.len() && &b[..a.len()] == *a;
-                assert!(
-                    !a_is_prefix,
-                    "{:?} is a prefix of {:?}",
-                    String::from_utf8_lossy(a),
-                    String::from_utf8_lossy(b)
-                );
-            }
-        }
-        // All markers are non-empty and end with newline
-        for m in &markers {
-            assert!(!m.is_empty(), "marker is empty");
-            assert_eq!(m[m.len() - 1], b'\n', "marker {:?} must end with newline", String::from_utf8_lossy(m));
-        }
-    }
-
-    #[test]
-    fn folder_marker_lengths_are_unique() {
-        let markers: [&[u8]; 4] = [
-            FOLDER_MANIFEST_REQUEST,
-            FOLDER_TRANSFER_COMPLETE,
-            FOLDER_TRANSFER_CANCEL,
-            FOLDER_FILE_ACK,
-        ];
-        let mut seen = HashSet::new();
-        for m in &markers {
-            assert!(seen.insert(m.len()), "duplicate marker length {}", m.len());
         }
     }
 

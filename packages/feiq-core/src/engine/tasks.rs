@@ -590,29 +590,6 @@ mod tests {
     }
 
     #[test]
-    fn test_cancel_during_folder_transfer_between_files() {
-        // Folder transfer: one file just finished, cancel is requested
-        // before the next file starts. The transfer loop checks the flag
-        // between files.
-        let handle = make_handle(1102, 5_000_000);
-        handle.set_running();
-
-        // No cancel flag before file 2
-        assert!(!handle.is_cancel_pending(), "between-file check: no cancel yet");
-
-        // Cancel arrives between files
-        handle.request_cancel();
-        assert!(handle.is_cancel_pending(),
-            "between-file check: cancel flag now set");
-
-        // Transfer loop discovers flag and cancels (never starts file 2)
-        handle.set_canceled();
-        let snap = handle.snapshot();
-        assert_eq!(snap.state, FileTaskState::Canceled,
-            "cancel between folder files must transition to Canceled");
-    }
-
-    #[test]
     fn test_cancel_before_transfer_starts() {
         // User cancels before the transfer loop even sets_running
         let handle = make_handle(1103, 1_000_000);

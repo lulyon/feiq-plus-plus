@@ -187,9 +187,7 @@ impl Engine {
                     // Hold the permit for the entire transfer lifetime
                     let _permit = permit;
 
-                    // Peek at first bytes to determine protocol:
-                    // - b"FOLDER_" prefix → folder transfer
-                    // - Otherwise → single file GETFILEDATA
+                    // Peek at first bytes — single file GETFILEDATA request
                     let mut peek_buf = [0u8; 32];
                     let peek_n = match timeout(Duration::from_secs(30), ft.recv(&mut peek_buf)).await {
                         Ok(Ok(n)) if n > 0 => n,
@@ -207,216 +205,6 @@ impl Engine {
                         }
                     };
 
-                    // ─── Folder transfer branch ────────────────────
-                    if &peek_buf[..std::cmp::min(peek_n, FOLDER_MANIFEST_REQUEST.len())] == FOLDER_MANIFEST_REQUEST {
-                        // Read the transfer_id: after the marker comes "transfer_id\n"
-                        let mut id_buf = vec![0u8; 64];
-                        let mut id_len = 0;
-                        // Copy remaining bytes after marker
-                        let marker_len = FOLDER_MANIFEST_REQUEST.len();
-                        if peek_n > marker_len {
-                            let rem = &peek_buf[marker_len..peek_n];
-                            let copy = std::cmp::min(rem.len(), id_buf.len());
-                            id_buf[..copy].copy_from_slice(&rem[..copy]);
-                            id_len = copy;
-                        }
-                        // Read more if needed until we get a newline (30s timeout)
-                        while id_len < id_buf.len() && !id_buf[..id_len].contains(&b'\n') {
-                            match timeout(Duration::from_secs(30), ft.recv(&mut id_buf[id_len..])).await {
-                                Ok(Ok(n)) if n > 0 => id_len += n,
-                                _ => break,
-                            }
-                        }
-                        let id_str = String::from_utf8_lossy(&id_buf[..id_len]);
-                        let transfer_id: u64 = match id_str.trim_end_matches('\n').trim().parse() {
-                            Ok(v) => v,
-                            Err(_) => {
-                                tracing::warn!("TCP accept: invalid folder transfer_id from {peer_ip}");
-                                return;
-                            }
-                        };
-
-                        // Look up upload task by packet_no == transfer_id AND verify peer IP
-                        let found = {
-                            let tasks = file_tasks.lock().unwrap_or_else(|e| e.into_inner());
-                            tasks.values().find(|t| {
-                                let s = t.snapshot();
-                                s.task_type == FileTaskType::Upload
-                                    && s.content.packet_no == transfer_id
-                                    && s.fellow_ip == peer_ip
-                            }).cloned()
-                        };
-
-                        let (task, folder_path) = match found {
-                            Some(t) => {
-                                let path = t.snapshot().content.path.clone();
-                                (t, path)
-                            }
-                            None => {
-                                tracing::warn!("TCP accept: no folder upload task for transfer_id={transfer_id}");
-                                return;
-                            }
-                        };
-
-                        if task.is_cancel_pending() {
-                            task.set_canceled();
-                            let _ = event_tx.send(FrontendEvent::FolderStateChanged {
-                                task_id: task.snapshot().id,
-                                state: FileTaskState::Canceled,
-                                message: "Folder transfer canceled".into(),
-                            });
-                            return;
-                        }
-
-                        task.set_running();
-                        let task_id = task.snapshot().id;
-                        let folder_name = task.snapshot().content.filename.clone();
-                        let _ = event_tx.send(FrontendEvent::FolderStateChanged {
-                            task_id,
-                            state: FileTaskState::Running,
-                            message: format!("Sending folder: {folder_name}"),
-                        });
-
-                        // Rebuild manifest from folder path
-                        let manifest = match crate::network::tcp::build_folder_manifest(
-                            &folder_path,
-                            transfer_id,
-                        ) {
-                            Some(m) => m,
-                            None => {
-                                task.set_error("Failed to build folder manifest".into());
-                                let _ = event_tx.send(FrontendEvent::FolderStateChanged {
-                                    task_id,
-                                    state: FileTaskState::Error("Failed to build folder manifest".into()),
-                                    message: "Failed to build folder manifest".into(),
-                                });
-                                return;
-                            }
-                        };
-
-                        let total_files = manifest.total_files;
-                        let total_bytes = manifest.total_bytes;
-
-                        // Send manifest
-                        if let Err(e) = ft.send_folder_manifest(&manifest).await {
-                            task.set_error(format!("Failed to send manifest: {e}"));
-                            let snap = task.snapshot();
-                            if snap.state != FileTaskState::Canceled && snap.state != FileTaskState::Finish {
-                                let _ = event_tx.send(FrontendEvent::FolderStateChanged {
-                                    task_id,
-                                    state: FileTaskState::Error(format!("Failed to send manifest: {e}")),
-                                    message: format!("Send manifest error: {e}"),
-                                });
-                            }
-                            return;
-                        }
-
-                        // Transfer files one by one
-                        let mut completed_files: u32 = 0;
-                        let mut overall_bytes: i64 = 0;
-                        for entry in &manifest.files {
-                            if task.is_cancel_pending() {
-                                task.set_canceled();
-                                let _ = event_tx.send(FrontendEvent::FolderStateChanged {
-                                    task_id,
-                                    state: FileTaskState::Canceled,
-                                    message: "Folder transfer canceled".into(),
-                                });
-                                return;
-                            }
-
-                            let full_path = std::path::Path::new(&folder_path)
-                                .join(&entry.relative_path);
-                            let full_path_str = full_path.to_string_lossy().to_string();
-
-                            // Send file header
-                            if let Err(e) = ft
-                                .send_folder_file_header(&entry.relative_path, entry.size)
-                                .await
-                            {
-                                task.set_error(format!("Failed to send file header: {e}"));
-                                let snap = task.snapshot();
-                                if snap.state != FileTaskState::Canceled && snap.state != FileTaskState::Finish {
-                                    let _ = event_tx.send(FrontendEvent::FolderStateChanged {
-                                        task_id,
-                                        state: FileTaskState::Error(format!("Failed to send file header: {e}")),
-                                        message: format!("Send file header error: {e}"),
-                                    });
-                                }
-                                return;
-                            }
-
-                            // Send file content FIRST, then optionally wait for ACK.
-                            // This avoids deadlock: sender was waiting for ACK while
-                            // receiver was waiting for file data. ACK is advisory only.
-                            let file_size = entry.size as i64;
-                            let tx = event_tx.clone();
-                            let rel_path = entry.relative_path.clone();
-                            let result = ft
-                                .send_file(&full_path_str, 0, |progress, total| {
-                                    let current_overall = overall_bytes + progress;
-                                    if progress % (1024 * 100) == 0 || progress >= total {
-                                        let _ = tx.send(FrontendEvent::FolderProgress {
-                                            task_id,
-                                            overall_progress: current_overall,
-                                            overall_total: i64::try_from(total_bytes).unwrap_or(i64::MAX),
-                                            current_file: rel_path.clone(),
-                                            current_file_progress: progress,
-                                            current_file_total: total,
-                                            files_completed: completed_files + 1,
-                                            total_files,
-                                        });
-                                    }
-                                }, Some(&task.cancel_flag)).await;
-
-                            match result {
-                                Ok(_) => {
-                                    overall_bytes += file_size;
-                                    completed_files += 1;
-                                    let _ = event_tx.send(FrontendEvent::FolderProgress {
-                                        task_id,
-                                        overall_progress: overall_bytes,
-                                        overall_total: i64::try_from(total_bytes).unwrap_or(i64::MAX),
-                                        current_file: entry.relative_path.clone(),
-                                        current_file_progress: file_size,
-                                        current_file_total: file_size,
-                                        files_completed: completed_files,
-                                        total_files,
-                                    });
-                                }
-                                Err(e) => {
-                                    task.set_error(format!(
-                                        "Failed to send {}: {}",
-                                        entry.relative_path, e
-                                    ));
-                                    // Check terminal state before emitting Error
-                                    let snap = task.snapshot();
-                                    if snap.state != FileTaskState::Canceled && snap.state != FileTaskState::Finish {
-                                        let _ = event_tx.send(FrontendEvent::FolderStateChanged {
-                                            task_id,
-                                            state: FileTaskState::Error(format!("Failed to send: {}", entry.relative_path)),
-                                            message: format!("Send file error: {}", entry.relative_path),
-                                        });
-                                    }
-                                    return;
-                                }
-                            }
-                        }
-
-                        // All files sent — send completion marker
-                        let _ = ft.send_marker(FOLDER_TRANSFER_COMPLETE).await;
-                        task.set_finish();
-                        let _ = event_tx.send(FrontendEvent::FolderStateChanged {
-                            task_id,
-                            state: FileTaskState::Finish,
-                            message: format!("Sent folder: {folder_name} ({} files)", completed_files),
-                        });
-                        tracing::info!(
-                            "Folder {} sent to {peer_ip}: {completed_files} files, {overall_bytes} bytes",
-                            folder_name
-                        );
-                        return;
-                    }
                     // ─── Single-file GETFILEDATA path ────────────────────
                     // peek_buf already contains the full request (format:
                     // "packet_no:file_id:offset:" — at most ~64 bytes, and
@@ -1268,16 +1056,11 @@ impl Engine {
 
     /// Cancel a file transfer task by local task ID.
     /// Sends IPMSG_RELEASEFILES to the peer so they know the transfer was canceled.
-    /// Emits the correct event type (FolderStateChanged for folder tasks).
     pub fn cancel_file_task(&self, task_id: u64) {
         if let Some(task) = self.file_tasks.lock().unwrap_or_else(|e| e.into_inner()).get(&task_id) {
             task.request_cancel();
             task.set_canceled();
             let snap = task.snapshot();
-
-            // Determine if this is a folder task
-            let is_folder = snap.content.file_type == IPMSG_FILE_DIR
-                && snap.content.filename.starts_with("__FOLDER__");
 
             // Send IPMSG_RELEASEFILES to peer to notify cancellation
             if let Some(ref network) = self.network {
@@ -1300,19 +1083,11 @@ impl Engine {
                 let _ = network.send_to(&snap.fellow_ip, port, &release_msg);
             }
 
-            if is_folder {
-                let _ = self.event_tx.send(FrontendEvent::FolderStateChanged {
-                    task_id,
-                    state: FileTaskState::Canceled,
-                    message: format!("Canceled: {}", snap.content.filename),
-                });
-            } else {
-                let _ = self.event_tx.send(FrontendEvent::FileStateChanged {
-                    task_id,
-                    state: FileTaskState::Canceled,
-                    message: format!("Canceled: {}", snap.content.filename),
-                });
-            }
+            let _ = self.event_tx.send(FrontendEvent::FileStateChanged {
+                task_id,
+                state: FileTaskState::Canceled,
+                message: format!("Canceled: {}", snap.content.filename),
+            });
         }
     }
 
@@ -1439,143 +1214,6 @@ impl Engine {
         Ok(task_id)
     }
 
-    /// Send a folder notification to a peer (feiq++ only).
-    /// Walks the directory tree, builds a manifest, creates an Upload task,
-    /// and sends the folder notification via UDP or relay.
-    /// Returns the local task ID for tracking the transfer.
-    pub async fn send_folder_to(&self, ip: &str, folder_path: &str) -> anyhow::Result<u64> {
-        let task_id = NEXT_FILE_TASK_ID
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-                Some(if v >= u64::MAX { 1 } else { v + 1 })
-            })
-            .unwrap();
-        let packet_no = self.packet_id();
-
-        // Build manifest by walking directory tree
-        let folder_display_name = std::path::Path::new(folder_path)
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or(folder_path);
-        let manifest = crate::network::tcp::build_folder_manifest(folder_path, packet_no)
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "Folder not found or empty: {}",
-                    folder_display_name
-                )
-            })?;
-
-        let folder_name = manifest.folder_name.clone();
-        let file_count = manifest.total_files;
-        // Clamp to i64::MAX (practically unreachable, but prevents silent wrapping)
-        let total_size = manifest.total_bytes.min(i64::MAX as u64);
-
-        // Look up peer info
-        let (port, relay_peer_id, fellow_name, is_feiq) = {
-            let contacts = self.contacts.lock().unwrap_or_else(|e| e.into_inner());
-            let fellow = contacts.find_by_ip(ip);
-            let port = fellow.as_ref().map(|f| f.port).unwrap_or(2425);
-            let relay_peer_id = fellow.as_ref().and_then(|f| match &f.source {
-                PeerSource::RelayPeer(id) => Some(id.clone()),
-                _ => None,
-            });
-            let is_feiq = fellow
-                .as_ref()
-                .map(|f| is_feiq_plus_plus(&f.version))
-                .unwrap_or(false);
-            let fellow_name = fellow
-                .map(|f| f.display_name().to_string())
-                .unwrap_or_else(|| ip.to_string());
-            (port, relay_peer_id, fellow_name, is_feiq)
-        };
-
-        // Only feiq++ peers support folder transfer
-        if !is_feiq {
-            anyhow::bail!(
-                "Folder transfer is only supported between feiq++ peers. \
-                 {} is a legacy client.",
-                fellow_name
-            );
-        }
-
-        // Create a FileContent-based task for tracking (reuse existing infra)
-        let fc = FileContent {
-            file_id: packet_no,
-            filename: folder_name.clone(),
-            path: folder_path.to_string(),
-            size: total_size as i64,
-            modify_time: 0,
-            file_type: IPMSG_FILE_DIR,
-            packet_no,
-            local_task_id: Some(task_id),
-        };
-
-        let task = FileTaskHandle::new(
-            task_id,
-            ip.to_string(),
-            fellow_name,
-            fc,
-            FileTaskType::Upload,
-        );
-        self.register_file_task(task);
-
-        // Build folder notification: encode metadata in filename as __FOLDER__{json}
-        let folder_meta = serde_json::json!({
-            "name": folder_name,
-            "count": file_count,
-            "size": total_size,
-            "tid": packet_no,
-        });
-        let folder_filename = format!("__FOLDER__{}", folder_meta);
-
-        let data = build_file_message(
-            packet_no,
-            &self.config.name,
-            &self.config.host,
-            &self.version,
-            &FileContent {
-                file_id: packet_no,
-                filename: folder_filename,
-                path: folder_path.to_string(),
-                size: i64::try_from(total_size).unwrap_or(i64::MAX),
-                modify_time: 0,
-                file_type: IPMSG_FILE_DIR,
-                packet_no,
-                local_task_id: Some(task_id),
-            },
-            true, // feiq++ only — uses UTF-8 encoding
-        );
-
-        // Send via relay or UDP
-        if let Some(peer_id) = relay_peer_id {
-            if let Some(ref relay) = self.relay_client {
-                relay
-                    .send_to(&peer_id, IPMSG_SENDMSG | IPMSG_FILEATTACHOPT, &data)
-                    .await?;
-            } else {
-                anyhow::bail!("Relay not connected");
-            }
-        } else if let Some(ref network) = self.network {
-            network.send_to(ip, port, &data).await?;
-        } else {
-            anyhow::bail!("No transport available");
-        }
-
-        let _ = self.event_tx.send(FrontendEvent::FolderStateChanged {
-            task_id,
-            state: FileTaskState::NotStart,
-            message: format!("Sending folder: {} ({} files)", folder_name, file_count),
-        });
-
-        tracing::info!(
-            "Folder transfer initiated: {} ({} files, {} bytes) to {}",
-            folder_name,
-            file_count,
-            total_size,
-            ip
-        );
-
-        Ok(task_id)
-    }
 }
 
 // ─── File Sharing (Phase 5.3) ─────────────────────────────────
@@ -1765,21 +1403,9 @@ fn handle_network_event(
             post.contents.retain(|c| {
                 match c {
                     Content::File(fc) => {
+                        // Filter out directory entries (not supported)
                         if fc.file_type == IPMSG_FILE_DIR {
-                            // Check if this is a feiq++ folder transfer
-                            // (filename starts with __FOLDER__ followed by JSON)
-                            if post.from.version.starts_with("feiq_plus_plus")
-                                && fc.filename.starts_with("__FOLDER__")
-                            {
-                                // Keep it — will be processed as a folder transfer below
-                                true
-                            } else {
-                                reply_text.push_str(
-                                    &format!("feiq++ does not support receiving folders: {}\n",
-                                        fc.filename),
-                                );
-                                false
-                            }
+                            false
                         } else {
                             true
                         }
@@ -1838,9 +1464,6 @@ fn handle_network_event(
 
                     for content in &mut post.contents {
                         if let Content::File(ref mut fc) = content {
-                            let is_folder = fc.file_type == IPMSG_FILE_DIR
-                                && fc.filename.starts_with("__FOLDER__");
-
                             let task_id = NEXT_FILE_TASK_ID
                                 .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
                                     Some(if v >= u64::MAX { 1 } else { v + 1 })
@@ -1849,45 +1472,19 @@ fn handle_network_event(
                             fc.packet_no = post.packet_no.parse::<u64>().unwrap_or(0);
                             fc.local_task_id = Some(task_id);
 
-                            if is_folder {
-                                // Parse folder metadata from filename
-                                let folder_json = fc.filename.strip_prefix("__FOLDER__")
-                                    .unwrap_or("{}");
-                                if let Ok(meta) = serde_json::from_str::<serde_json::Value>(folder_json) {
-                                    let folder_name = meta["name"].as_str().unwrap_or("Folder").to_string();
-                                    let file_count = meta["count"].as_u64().unwrap_or(0) as u32;
-                                    let task = FileTaskHandle::new(
-                                        task_id,
-                                        from_ip.clone(),
-                                        from_name.clone(),
-                                        fc.clone(),
-                                        FileTaskType::Download,
-                                    );
-                                    ft.lock().unwrap_or_else(|e| e.into_inner()).insert(task_id, Arc::new(task));
-                                    let _ = event_tx.send(FrontendEvent::FolderStateChanged {
-                                        task_id,
-                                        state: FileTaskState::NotStart,
-                                        message: format!(
-                                            "Folder received: {} ({} files)",
-                                            folder_name, file_count
-                                        ),
-                                    });
-                                }
-                            } else if fc.file_type != IPMSG_FILE_DIR {
-                                let task = FileTaskHandle::new(
-                                    task_id,
-                                    from_ip.clone(),
-                                    from_name.clone(),
-                                    fc.clone(),
-                                    FileTaskType::Download,
-                                );
-                                ft.lock().unwrap_or_else(|e| e.into_inner()).insert(task_id, Arc::new(task));
-                                let _ = event_tx.send(FrontendEvent::FileStateChanged {
-                                    task_id,
-                                    state: FileTaskState::NotStart,
-                                    message: format!("File received: {}", fc.filename),
-                                });
-                            }
+                            let task = FileTaskHandle::new(
+                                task_id,
+                                from_ip.clone(),
+                                from_name.clone(),
+                                fc.clone(),
+                                FileTaskType::Download,
+                            );
+                            ft.lock().unwrap_or_else(|e| e.into_inner()).insert(task_id, Arc::new(task));
+                            let _ = event_tx.send(FrontendEvent::FileStateChanged {
+                                task_id,
+                                state: FileTaskState::NotStart,
+                                message: format!("File received: {}", fc.filename),
+                            });
                         }
                     }
                 }
@@ -2800,43 +2397,6 @@ mod tests {
         for i in 0u64..10 {
             assert_eq!(engine.get_file_task(i).unwrap().snapshot().state, FileTaskState::Running, "Task {i}");
         }
-    }
-
-    #[test]
-    fn test_concurrent_folder_and_file_transfer() {
-        let (tx, _rx) = mpsc::unbounded_channel();
-        let engine = Engine::new(AppConfig::default(), tx, None);
-
-        let fc = FileContent {
-            file_id: 1, filename: "project_docs".into(), path: "/tmp/project_docs".into(),
-            size: 10_000_000, modify_time: 3000, file_type: IPMSG_FILE_DIR, packet_no: 100,
-            local_task_id: None,
-        };
-        engine.register_file_task(FileTaskHandle::new(1, "10.0.0.1".into(), "A".into(), fc, FileTaskType::Upload));
-
-        let rc = FileContent {
-            file_id: 2, filename: "report.pdf".into(), path: "/tmp/report.pdf".into(),
-            size: 500_000, modify_time: 4000, file_type: IPMSG_FILE_REGULAR, packet_no: 200,
-            local_task_id: None,
-        };
-        engine.register_file_task(FileTaskHandle::new(2, "10.0.0.2".into(), "B".into(), rc, FileTaskType::Download));
-
-        let fh = engine.get_file_task(1).unwrap();
-        let rh = engine.get_file_task(2).unwrap();
-        std::thread::scope(|s| {
-            s.spawn(|| { fh.set_running(); fh.update_progress(2_500_000); fh.update_progress(5_000_000); fh.set_finish(); });
-            s.spawn(|| { rh.set_running(); rh.update_progress(100_000); rh.set_finish(); });
-        });
-        let fs = fh.snapshot();
-        assert_eq!(fs.task_type, FileTaskType::Upload);
-        assert_eq!(fs.content.file_type, IPMSG_FILE_DIR);
-        assert_eq!(fs.state, FileTaskState::Finish);
-        assert_eq!(fs.progress, fs.total);
-        let rs = rh.snapshot();
-        assert_eq!(rs.task_type, FileTaskType::Download);
-        assert_eq!(rs.content.file_type, IPMSG_FILE_REGULAR);
-        assert_eq!(rs.state, FileTaskState::Finish);
-        assert_eq!(rs.progress, rs.total);
     }
 
     #[test]

@@ -49,34 +49,6 @@ pub fn start_event_forwarder(app_handle: AppHandle, state: &crate::state::AppSta
                         "message": message,
                     }));
                 }
-                Some(FrontendEvent::FolderProgress {
-                    task_id,
-                    overall_progress,
-                    overall_total,
-                    current_file,
-                    current_file_progress,
-                    current_file_total,
-                    files_completed,
-                    total_files,
-                }) => {
-                    let _ = app_handle.emit("folder-progress", serde_json::json!({
-                        "taskId": task_id,
-                        "overallProgress": overall_progress,
-                        "overallTotal": overall_total,
-                        "currentFile": current_file,
-                        "currentFileProgress": current_file_progress,
-                        "currentFileTotal": current_file_total,
-                        "filesCompleted": files_completed,
-                        "totalFiles": total_files,
-                    }));
-                }
-                Some(FrontendEvent::FolderStateChanged { task_id, state, message }) => {
-                    let _ = app_handle.emit("folder-state-changed", serde_json::json!({
-                        "taskId": task_id,
-                        "state": state,
-                        "message": message,
-                    }));
-                }
                 Some(FrontendEvent::SendTimeout { to_ip, content }) => {
                     let _ = app_handle.emit("send-timeout", serde_json::json!({
                         "toIp": to_ip,
