@@ -2,17 +2,17 @@
 
 ## 实现状态
 
-**最后更新**: 2026-06-30
+**最后更新**: 2026-07-02
 
 | Phase | 状态 | 测试 |
 |-------|:---:|:---:|
 | Phase 2 — 文件传输 | ✅ 100% | 完成 |
-| Phase 3 — 聊天记录+截图 | ✅ 100% | 完成 |
-| Phase 4 — 群聊+黑名单 | ✅ 85% | 文件夹推迟 |
-| Phase 5 — 加密+密封+主题+标注 | ✅ 100% | 完成 |
+| Phase 3 — 聊天记录+用户管理 | ✅ 100% | 完成 (截图已移除) |
+| Phase 4 — 群聊+黑名单 | ✅ 100% | 完成 (文件夹已移除) |
+| Phase 5 — 加密+密封+主题 | ✅ 100% | 完成 |
 
-**总测试**: 66 (63 单元 + 3 集成)，全部通过
-**IPC 命令**: 27
+**总测试**: 192 (154 单元 + 38 集成)，全部通过
+**IPC 命令**: 26
 **前端组件**: 9 / **Zustand stores**: 4
 
 ---
@@ -100,7 +100,7 @@ send_file(ip, file_path)          → create_file_content → build_file_message
 
 ---
 
-## Phase 3 — 聊天记录 + 截图 + 用户管理（已完成）
+## Phase 3 — 聊天记录 + 用户管理（已完成，截图已移除）
 
 ### 3.1 — 无限滚动历史加载
 
@@ -144,50 +144,6 @@ send_file(ip, file_path)          → create_file_content → build_file_message
 复杂度: 中，前后端均需改动
 ```
 
-### 3.4 — 截图命令
-
-**改动文件**: `commands.rs`, `main.rs`, `InputArea.tsx`
-
-```
-方案: 双通道 — 系统工具优先，dialog 兜底 (无需额外插件)
-
-  1. commands.rs: capture_screenshot 命令 (两阶段):
-     阶段 A — 尝试系统截图工具:
-       - macOS: screencapture -i /tmp/feiq_screenshot_xxx.png → 等文件落盘
-       - Windows: 尝试 ms-screenclip: URI 触发截图 → 读取剪贴板
-       - Linux: maim -s /tmp/... 或 gnome-screenshot -a
-       → 成功则返回文件路径
-     阶段 B — 降级到文件选择:
-       → 返回特殊标记 "FALLBACK"
-       → 前端调用 @tauri-apps/plugin-dialog open() 让用户手动选文件
-
-  2. 前端处理:
-     - invoke("capture_screenshot") → 如果是 "FALLBACK" → open() dialog
-     - 否则收到文件路径 → 自动预览 → 作为文件发送
-
-  3. InputArea: 加截图按钮 (Camera 图标)
-  4. 快捷键: tauri-plugin-global-shortcut 注册 CmdOrCtrl+Shift+S
-
-优势: macOS/Linux 体验好，Windows 有兜底，无需捆绑第三方工具
-复杂度: 中，平台差异需分别处理
-```
-
-### 3.5 — 截图标注工具
-
-**改动文件**: `components/ScreenshotAnnotation.tsx` (新), `InputArea.tsx`
-
-```
-方案: 原始 Canvas API (零依赖)，后续可升级 fabric.js
-  工具: 矩形 / 箭头 / 文字 / 自由绘制 / 颜色选择 / 撤销
-  1. 截完图 → 打开全屏 overlay → <canvas> 显示截图
-  2. 上层透明 Canvas 用于标注绘制
-  3. 工具栏: 工具切换 + 颜色选择 + 撤销 (Canvas 状态快照栈)
-  4. 完成 → canvas.toBlob() → write to tmp → send as file
-  5. 代码量约 200 行 (4 种工具 × ~50 行 each)
-  6. 如果后续需要调整大小/移动/图层 → 引入 fabric.js (按需升级)
-复杂度: 中高，~200 行 Canvas 交互代码
-```
-
 ### 3.6 — 联系人分组树形视图
 
 **改动文件**: `Sidebar.tsx`, `contactStore.ts`, `commands.rs`, `engine.rs`
@@ -222,14 +178,12 @@ send_file(ip, file_path)          → create_file_content → build_file_message
 | 3.1 无限滚动 | 低 | 0 | ChatPanel + store |
 | 3.2 日期分隔线 | 低 | 0 | ChatPanel |
 | 3.3 消息搜索 | 中 | engine + commands | ChatPanel |
-| 3.4 截图 | 中 | commands | InputArea |
-| 3.5 标注 | 中高 | 0 | 新组件 |
 | 3.6 分组树 | 中 | engine + commands | Sidebar |
 | 3.7 别名签名 | 低 | engine + commands | ChatPanel + Sidebar |
 
 ---
 
-## Phase 4 — 群聊 + 文件夹 + 离线消息（当前 85%，文件夹推迟）
+## Phase 4 — 群聊 + 离线消息（已完成，文件夹传输已移除）
 
 ### 4.1 — P2P 群组分发
 
@@ -245,22 +199,6 @@ send_file(ip, file_path)          → create_file_content → build_file_message
   4. 群创建: CreateGroupDialog (新组件) → 多选联系人 → invoke("create_group")
   5. Sidebar: "Groups" 区域 + "创建群组" 按钮
 复杂度: 中
-```
-
-### 4.2 — 文件夹传输
-
-**改动文件**: `engine.rs`, `tcp.rs`, `commands.rs`
-
-```
-方案: IPMSG GETDIRFILES 协议标准流程
-  1. engine.rs: 移除文件夹拒绝逻辑 (line 574-579)
-  2. engine.rs: build_folder_manifest(dir_path) → 递归生成 FileContent 清单
-  3. engine.rs: handle_network_event 处理 IPMSG_GETDIRFILES:
-     - 创建根目录
-     - 遍历清单 → 逐文件 TCP 请求 → recv_file
-  4. sender: 发送文件清单 → 监听 TCP → 收到 GETDIRFILES 请求 → send_file(offset)
-  5. commands.rs: send_folder(ip, dir_path) 命令
-复杂度: 高，涉及 TCP 协议双向交互
 ```
 
 ### 4.3 — 黑名单
@@ -283,7 +221,6 @@ send_file(ip, file_path)          → create_file_content → build_file_message
 | 功能 | 复杂度 | Rust 改动 | 前端改动 |
 |------|--------|-----------|----------|
 | 4.1 群组分发 | 中 | engine + commands | Sidebar + ChatPanel + Dialog |
-| 4.2 文件夹传输 | 高 | engine + tcp + commands | 0 (复用文件传输 UI) |
 | 4.3 黑名单 | 低 | history + engine + commands | Sidebar |
 
 ---
@@ -416,7 +353,6 @@ send_file(ip, file_path)          → create_file_content → build_file_message
   Phase 3.3  消息搜索            (2h)
   Phase 4.1  群组分发 + UI       (3h)
   Phase 2.1  文件引擎层          (3h)
-  Phase 3.4  截图命令            (1h)
 
 第 4 批 (需要协议变更) [✅ 已完成]:
   Phase 2.2  文件 Tauri 命令     (2h)
@@ -427,8 +363,6 @@ send_file(ip, file_path)          → create_file_content → build_file_message
   Phase 5.2  密封消息            (2h)
 
 第 5 批 (复杂协议) [✅ 已完成]:
-  Phase 3.5  截图标注            (3h)
-  Phase 4.2  文件夹传输          (4h)
   Phase 5.3  文件共享服务        (2h)
 ```
 
@@ -438,11 +372,11 @@ send_file(ip, file_path)          → create_file_content → build_file_message
 
 | 决策 | 结论 |
 |------|------|
-| 截图 Windows 方案 | 双通道：系统工具优先（screencapture/ms-screenclip/maim），失败则 dialog 兜底。引入 `arboard` crate 读剪贴板 |
+| 截图方案 | 已移除（commit 85e23b4）。原方案：系统工具优先（screencapture/ms-screenclip/maim），失败则 dialog 兜底 |
 | 加密密钥持久化 | 当前阶段临时密钥（前向安全），未来加 `settings.persist_keypair` 选项给 relay 长期离线场景 |
-| Canvas 标注库 | 原始 Canvas API 零依赖起步，需要时再升级 fabric.js；导出用 `@tauri-apps/plugin-fs` 前端包 |
+| Canvas 标注 | 已移除（commit 85e23b4）。原方案：原始 Canvas API 零依赖起步 |
 | 群聊方案 | 纯 P2P 无服务器：`send_text_to_group` 遍历成员逐人发送，消息前缀 `[群名]`，前端用 `group:群名` 作为 store key |
-| 文件夹传输 | **推迟**——原 feiq 也未实现（"Mac飞秋还不支持接收目录"），留给后续版本 |
+| 文件夹传输 | **已移除**（commit f6c7616）——原 feiq 也未实现（"Mac飞秋还不支持接收目录"） |
 | 4 个严重 bug | ✅ 已修复：crypto nonce 重用、别名覆盖、群组重复插入、搜索缺少 contact_name |
 
 ## 跨 Agent 审计发现的问题

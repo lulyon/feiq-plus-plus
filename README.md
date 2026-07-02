@@ -45,11 +45,6 @@
 - 系统原生通知 + Dock/Taskbar 未读角标
 - 系统托盘快捷操作
 
-### 截图与标注
-- 跨平台截图捕获
-- Canvas 标注工具（自由绘制/矩形/箭头/文字）
-- 标注结果通过文件通道发送
-
 ## 平台支持
 
 | 平台 | 状态 |
@@ -83,14 +78,14 @@ feiq-plus-plus/
 │   │       ├── model/          # 联系人簿 (线程安全)
 │   │       └── storage/        # SQLite 聊天记录 + INI 配置
 │   ├── feiq-app/               # Tauri 2 桌面壳
-│   │   └── src/                # commands (27), events, state, tray
+│   │   └── src/                # commands (26), events, state, tray
 │   ├── feiq-relay/             # Rust WebSocket 中继服务器
 │   │   └── src/                # server, main, lib
 │   └── feiq-gui/               # React 前端
 │       └── src/
 │           ├── components/     # Sidebar, ChatPanel, MessageBubble, InputArea,
 │           │                   # EmojiPicker, SettingsDialog, CreateGroupDialog,
-│           │                   # FileTransferPanel, ScreenshotAnnotation
+│           │                   # FileTransferPanel
 │           └── stores/         # Zustand: contactStore, messageStore,
 │                               # fileTransferStore, groupStore
 ├── docs/
@@ -126,7 +121,7 @@ cargo tauri dev
 # 仅编译 Rust 核心库
 cargo build --workspace
 
-# 运行全部测试 (77 Rust + 18 TypeScript)
+# 运行全部测试 (192 Rust + 18 TypeScript)
 cargo test --workspace
 npm --prefix packages/feiq-gui test
 
@@ -180,7 +175,7 @@ feiq_plus_plus#128#MAC地址#0#0#0#1#9
 ### 运行测试
 
 ```bash
-cargo test --workspace                    # 全部 77 个 Rust 测试
+cargo test --workspace                    # 全部 192 个 Rust 测试
 cargo test -p feiq-core                   # 仅核心库测试
 npm --prefix packages/feiq-gui test       # 前端 18 个 TypeScript 测试
 ```
@@ -188,9 +183,9 @@ npm --prefix packages/feiq-gui test       # 前端 18 个 TypeScript 测试
 ### 代码统计
 
 ```
-Rust 源码:    ~8,100 行 (34 文件, 3 crates)
-React/TS:     ~3,500 行 (10 组件 + 4 stores)
-测试覆盖:     95 个测试 (77 Rust + 18 TS), 全部通过
+Rust 源码:    ~9,500 行 (30+ 文件, 3 crates)
+React/TS:     ~2,500 行 (9 组件 + 4 stores)
+测试覆盖:     210 个测试 (192 Rust + 18 TS), 全部通过
 ```
 
 ## 最近更新 (v0.1.4)
@@ -199,7 +194,6 @@ React/TS:     ~3,500 行 (10 组件 + 4 stores)
 - **中继服务器 (Relay Server)**: 独立 WebSocket 中继服务器 `feiq-relay`，跨网络通信。三种连接模式：纯局域网、纯中继、混合模式。修复离线消息队列（稳定 peer_key 路由）
 - **端到端加密**: ECDH (x25519) 密钥交换 + AES-256-GCM，随机 nonce 前缀防重放，仅 feiq++ 间通信自动启用
 - **文件传输**: 完整 IPMSG GETFILEDATA 拉取协议，进度追踪、取消/续传，文件大小安全校验
-- **截图标注**: Canvas 截图捕获 + 自由绘画、文字、形状标注
 - **主题系统**: 明/暗/自动主题，CSS 变量 + Tailwind，持久化保存
 - **群组聊天**: 创建群组、群发消息，P2P 分发无服务端依赖
 - **聊天记录增强**: 无限滚动历史加载、全文搜索、日期分隔线、JSON 导出/导入

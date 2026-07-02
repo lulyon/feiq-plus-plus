@@ -4,14 +4,14 @@
 - **Name**: feiq-plus-plus
 - **Purpose**: Modern cross-platform LAN + Relay chat app implementing IP Messenger protocol
 - **Origin**: Rewrite of feiq (Qt5/C++ macOS-only) using Rust + Tauri + React
-- **Status**: Phase 1-5 complete, 77 Rust + 18 TS tests pass, 0 compile errors. 100-agent security audit passed (17 issues fixed, 0 remaining)
+- **Status**: Phase 1-5 complete, 192 Rust + 18 TS tests pass, 0 compile errors
 - **Version**: 0.1.4
 
 ## Build & Test
 
 ```bash
 cargo check --workspace     # fast compile check
-cargo test --workspace       # run all 77 Rust tests + 18 TS tests (95 total)
+cargo test --workspace       # run all 192 Rust tests + 18 TS tests (210 total)
 cargo build --workspace      # full build
 cargo tauri dev              # dev mode with hot-reload frontend
 
@@ -88,7 +88,7 @@ LAN Peers                feiq-relay Server
 ### Tauri Bridge (`packages/feiq-app/src/`)
 | File | Purpose |
 |------|---------|
-| `commands.rs` | 27 IPC commands (start_engine, stop_engine, get_contacts, search_contacts, add_contact, get_settings, update_settings, get_chat_history, search_chat_history, get_emoji_list, send_knock, send_text, set_alias, set_contact_group, create_group, get_groups, export_history, import_history, add_to_blacklist, remove_from_blacklist, get_blacklist, send_group_text, capture_screenshot, download_file, cancel_file_task, send_file, reset_unread_count) |
+| `commands.rs` | 26 IPC commands (start_engine, stop_engine, get_contacts, search_contacts, add_contact, get_settings, update_settings, get_chat_history, search_chat_history, get_emoji_list, send_knock, send_text, set_alias, set_contact_group, create_group, get_groups, export_history, import_history, add_to_blacklist, remove_from_blacklist, get_blacklist, send_group_text, download_file, cancel_file_task, send_file, reset_unread_count) |
 | `state.rs` | AppState (Engine + Config + event channels) |
 | `events.rs` | Forwards FrontendEvent → Tauri window events |
 | `tray.rs` | System tray icon + context menu |
@@ -112,7 +112,6 @@ LAN Peers                feiq-relay Server
 | `components/SettingsDialog.tsx` | Config editor (name, host, connection mode, relay URL, IP ranges, send_by_enter, theme) |
 | `components/CreateGroupDialog.tsx` | Group creation modal (name, member selection) |
 | `components/FileTransferPanel.tsx` | File transfer list with progress bars, send/recv status, cancel/resume |
-| `components/ScreenshotAnnotation.tsx` | Canvas-based screenshot capture + annotation (drawing, text, shapes) |
 | `stores/contactStore.ts` | Zustand: contacts list, upsert, select, alias editing |
 | `stores/messageStore.ts` | Zustand: messages by IP, unread counts, history search |
 | `stores/fileTransferStore.ts` | Zustand: file transfer queue, progress, status per task |
@@ -146,7 +145,6 @@ LAN Peers                feiq-relay Server
 6. **dingo**: Use `LessSafeKey` not `SealingKey` — `SealingKey::new` is on `BoundKey` trait, not inherent; `UnboundKey` not Clone
 7. **File transfer engine**: FileTaskHandle state machine with progress throttling (1%/100KB), implements IPMSG GETFILEDATA protocol for pull-based transfers, supports cancel/resume
 8. **Theme system**: CSS variables via Tailwind v4 `@theme` directive — light/dark/auto with CSS `prefers-color-scheme` detection, persisted in settings
-9. **Screenshot annotation**: Raw Canvas API (no library) for capture, freehand drawing, text overlay, shape annotation — exported via `@tauri-apps/plugin-fs`
 
 ## Known Limitations
 - Image protocol data channel not reverse-engineered
@@ -154,10 +152,11 @@ LAN Peers                feiq-relay Server
 - Remote desktop not implemented (beyond IM scope)
 - Schedule/calendar not implemented (beyond IM scope)
 - IPMSG v9 legacy encryption (RSA/RC2/Blowfish) deferred to P6
-- Folder transfer not yet implemented (deferred)
+- Folder transfer removed from codebase (see docs/UNIMPLEMENTED_FEATURES.md)
+- Screenshot annotation removed from codebase
 
 ## Dependencies
 - **Rust**: tokio(full), tokio-tungstenite, encoding_rs, rusqlite(bundled), ring 0.17, serde, chrono, mac_address, base64, futures-util
 - **Relay**: clap 4 (derive), uuid 1
 - **Tauri**: 2.11.3 + notification/dialog/global-shortcut/fs plugins
-- **Frontend**: react 18, zustand 4, tailwindcss 3, lucide-react, @tauri-apps/api 2.x, @tauri-apps/plugin-fs (screenshot annotation export)
+- **Frontend**: react 18, zustand 4, tailwindcss 3, lucide-react, @tauri-apps/api 2.x, @tauri-apps/plugin-dialog

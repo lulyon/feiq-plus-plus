@@ -14,7 +14,7 @@ Built with **Rust + Tauri 2 + React**, delivering native performance with a mode
 - **End-to-end encryption** — ECDH (x25519) + AES-256-GCM between feiq++ peers (random nonce prefix prevents reuse)
 - **Cross-platform** — macOS (Intel + Apple Silicon), Windows, Linux
 - **100-agent security audit** — 17 issues found and fixed, 0 remaining. Includes critical AES-GCM nonce reuse fix
-- **77 Rust + 18 TypeScript = 95 tests** passing, zero compile errors
+- **192 Rust + 18 TypeScript = 210 tests** passing, zero compile errors
 
 ---
 
@@ -58,12 +58,6 @@ Built with **Rust + Tauri 2 + React**, delivering native performance with a mode
 - Only activated between feiq++ peers (detected via version string)
 - Sealed messages (self-destruct / 阅后即焚)
 - Legacy clients communicate in plaintext
-
-### Screenshot & Annotation
-- Cross-platform screenshot capture
-- Canvas-based annotation: freehand drawing, rectangles, arrows, text
-- Color selection and undo support
-- Annotation exported as image via file transfer
 
 ### Chat History
 - SQLite persistent storage with full-text search
@@ -119,7 +113,7 @@ feiq++ peers additionally support end-to-end encrypted communication.
 | Rust source lines | ~8,100 |
 | TypeScript source lines | ~3,500 |
 | Rust source files | 34 |
-| Rust unit tests | 77 (all passing) |
+| Rust unit tests | 192 (all passing) |
 | TypeScript tests | 18 (all passing) |
 | Tauri IPC commands | 27 |
 | Protocol parser handlers | 14 (chain-of-responsibility) |
@@ -193,7 +187,6 @@ room = default
 ### v0.1.4 (Current)
 - Relay server with hybrid LAN+Relay mode
 - End-to-end encryption (ECDH + AES-256-GCM)
-- Screenshot capture + Canvas annotation
 - Theme system (light/dark/auto)
 - Group chat (P2P dispatch)
 - Full-text chat history search
@@ -218,6 +211,6 @@ room = default
 
 ---
 
-**95 tests · 0 errors · ~8,100 lines Rust · ~3,500 lines TypeScript**  
+**210 tests · 0 errors · ~9,500 lines Rust · ~2,500 lines TypeScript**  
 Built with Rust, Tauri, and React.  
 [Full Implementation Plan →](https://github.com/lulyon/feiq-plus-plus/blob/main/docs/PLAN.md)

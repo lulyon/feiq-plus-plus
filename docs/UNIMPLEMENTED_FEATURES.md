@@ -6,7 +6,7 @@
 |-------|--------|-----------------|
 | Phase 1 — MVP | **100%** | Basic messaging |
 | Phase 2 — File Transfer + Emoji | **100%** | File transfer, emoji, knock |
-| Phase 3 — Chat History + Screenshot + User Mgmt | **100%** | History, search, screenshot annotation, contact groups, alias |
+| Phase 3 — Chat History + User Mgmt | **100%** | History, search, contact groups, alias |
 | Phase 4 — Group Chat + Offline Messages | **85%** | Group chat, offline messages, blacklist; folder transfer **deferred** |
 | Phase 4.5 — Relay Server | **100%** | WebSocket relay for cross-network chat |
 | Phase 5 — Encryption + File Share + Polish | **100%** | E2E encryption, sealed messages, themes, import/export |
@@ -84,7 +84,7 @@
 |---------|--------|
 | Full theme skinning (background images, custom color schemes) | Not implemented. Light/dark/auto theme exists. |
 | UI font customization | Not implemented |
-| Standalone doodle / drawing tool | Not implemented. Screenshot annotation exists. |
+| Standalone doodle / drawing tool | Not implemented. Screenshot annotation removed from codebase (commit 85e23b4). |
 
 ### Pinyin-Based Contact Search
 

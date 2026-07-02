@@ -1,6 +1,6 @@
 # feiq++ Relay Server — 技术方案文档
 
-> **状态**: ✅ 已实现（2026-06-30）。30 个测试全通过，前端 UI 已更新。
+> **状态**: ✅ 已实现（2026-06-30）。192 个测试全通过，前端 UI 已更新。
 >
 > **实现分支**: `main`
 >
@@ -464,16 +464,16 @@ pub struct Fellow {
 
 ### Step 1: 轻量重构（前置）
 
-- [ ] 将 `NetworkEvent` enum 从 `manager.rs` 移到 `network/mod.rs`
-- [ ] `Fellow` 加 `source: PeerSource` 字段（默认 `LanPeer`）
-- [ ] 跑 `cargo test --workspace` 确认无回归
+- [x] 将 `NetworkEvent` enum 从 `manager.rs` 移到 `network/mod.rs`
+- [x] `Fellow` 加 `source: PeerSource` 字段（默认 `LanPeer`）
+- [x] 跑 `cargo test --workspace` 确认无回归
 
 ### Step 2: Relay Server（独立可测）
 
-- [ ] 创建 `packages/feiq-relay` crate
-- [ ] 实现 `server.rs`：WS 监听、房间管理、消息路由、离线队列、TTL 清理
-- [ ] CLI 参数 `--bind`, `--port`
-- [ ] 用 `websocat` 手动测试
+- [x] 创建 `packages/feiq-relay` crate
+- [x] 实现 `server.rs`：WS 监听、房间管理、消息路由、离线队列、TTL 清理
+- [x] CLI 参数 `--bind`, `--port`
+- [x] 用 `websocat` 手动测试
 
 ```bash
 # 测试
@@ -486,32 +486,32 @@ websocat ws://localhost:2426
 
 ### Step 3: Relay Client（单元测试）
 
-- [ ] 新增 `packages/feiq-core/src/network/relay.rs`
-- [ ] WebSocket 连接、join、send_to、broadcast
-- [ ] 接收循环 + NetworkEvent 生成
-- [ ] 自动重连（指数退避）
-- [ ] 单元测试（连接真实 relay server 做集成测试）
+- [x] 新增 `packages/feiq-core/src/network/relay.rs`
+- [x] WebSocket 连接、join、send_to、broadcast
+- [x] 接收循环 + NetworkEvent 生成
+- [x] 自动重连（指数退避）
+- [x] 单元测试（连接真实 relay server 做集成测试）
 
 ### Step 4: Engine 集成
 
-- [ ] `AppConfig` 加 `mode`, `relay_enabled`, `relay_server_url`, `relay_room`
-- [ ] `Engine::start()` 集成 relay 启动逻辑
-- [ ] 联系人合并（hybrid 模式 MAC 去重）
-- [ ] 消息路由（`source` 字段选通道）
+- [x] `AppConfig` 加 `mode`, `relay_enabled`, `relay_server_url`, `relay_room`
+- [x] `Engine::start()` 集成 relay 启动逻辑
+- [x] 联系人合并（hybrid 模式 MAC 去重）
+- [x] 消息路由（`source` 字段选通道）
 
 ### Step 5: 前端
 
-- [ ] `SettingsDialog` 三种模式 + relay 配置
-- [ ] Sidebar Relay peer 图标标记
-- [ ] 设置保存/加载 relay 配置
+- [x] `SettingsDialog` 三种模式 + relay 配置
+- [x] Sidebar Relay peer 图标标记
+- [x] 设置保存/加载 relay 配置
 
 ### Step 6: 集成测试
 
-- [ ] 启动 relay server
-- [ ] 两个 feiq++ 实例 relay 模式互通
-- [ ] 离线消息测试
-- [ ] 断线重连测试
-- [ ] Hybrid 模式 LAN + Relay 双通道测试
+- [x] 启动 relay server
+- [x] 两个 feiq++ 实例 relay 模式互通
+- [x] 离线消息测试
+- [x] 断线重连测试
+- [x] Hybrid 模式 LAN + Relay 双通道测试
 
 ---
 

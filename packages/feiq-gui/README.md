@@ -40,7 +40,6 @@ App
 │   └── InputArea
 │       ├── Text input (Enter/Ctrl+Enter send)
 │       ├── EmojiPicker popup (16×6 grid with hover preview)
-│       ├── Screenshot button → ScreenshotAnnotation (Canvas overlay portal)
 │       └── File attachment button
 ├── FileTransferPanel (collapsible, progress bars)
 ├── SettingsDialog (modal)
@@ -134,5 +133,4 @@ App
 ### Other
 | Command | Args | Returns |
 |---------|------|---------|
-| `capture_screenshot` | — | `filePath \| "FALLBACK"` |
 | `reset_unread_count` | `ip` | — |
