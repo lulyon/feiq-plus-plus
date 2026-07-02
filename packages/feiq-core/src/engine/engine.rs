@@ -417,34 +417,15 @@ impl Engine {
                         );
                         return;
                     }
-                    // Read additional data from stream. Use timeout to prevent
-                    // indefinite blocking if peer connects but sends nothing.
-                    let mut buf = [0u8; 256];
-                    let n = match timeout(Duration::from_secs(30), ft.recv(&mut buf)).await {
-                        Ok(Ok(n)) if n > 0 => n,
-                        Ok(Ok(_)) => {
-                            tracing::debug!("TCP accept: empty request from {peer_ip}");
-                            return;
-                        }
-                        Ok(Err(e)) => {
-                            tracing::error!("TCP accept: read error from {peer_ip}: {e}");
-                            return;
-                        }
-                        Err(_) => {
-                            tracing::debug!("TCP accept: read timeout from {peer_ip}");
-                            return;
-                        }
-                    };
                     // ─── Single-file GETFILEDATA path ────────────────────
-                    // Combine peek_buf data with the recv data we already have in buf.
-                    // Avoids an unnecessary second recv that could lose data or cause
-                    // protocol desync (see H-3 consolidated audit finding).
-                    let request_bytes = {
-                        let peek_len = peek_n.min(peek_buf.len());
-                        let mut all = peek_buf[..peek_len].to_vec();
-                        all.extend_from_slice(&buf[..n]);
-                        all
-                    };
+                    // peek_buf already contains the full request (format:
+                    // "packet_no:file_id:offset:" — at most ~64 bytes, and
+                    // peek_buf is 32 bytes — sufficient for all practical IDs).
+                    // Do NOT do a second recv here: the peer has already sent
+                    // the request and is now waiting for file data; a second
+                    // recv would block until timeout, causing the sender to
+                    // never send the file (empty download on receiver side).
+                    let request_bytes = peek_buf[..peek_n].to_vec();
 
                     // Parse colon-separated format: packet_no:file_id:offset:
                     let request = String::from_utf8_lossy(&request_bytes);
