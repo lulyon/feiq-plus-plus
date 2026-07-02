@@ -444,21 +444,39 @@ pub async fn send_file(
     file_path: String,
 ) -> Result<u64, String> {
     validate_path(&file_path)?;
+
+    // Resolve non-absolute paths: macOS dialog may return a bare name
+    // when selecting directories from the sidebar. Try home dir first.
+    let resolved = if std::fs::metadata(&file_path).is_err() && !file_path.starts_with('/') {
+        if let Ok(home) = std::env::var("HOME") {
+            let candidate = format!("{}/{}", home, file_path);
+            if std::fs::metadata(&candidate).is_ok() {
+                candidate
+            } else {
+                file_path
+            }
+        } else {
+            file_path
+        }
+    } else {
+        file_path
+    };
+
     let engine = state.engine.lock().await;
 
     // Auto-detect: if path is a directory, route to folder transfer
-    let is_dir = std::fs::metadata(&file_path)
+    let is_dir = std::fs::metadata(&resolved)
         .map(|m| m.is_dir())
         .unwrap_or(false);
 
     if is_dir {
         engine
-            .send_folder_to(&ip, &file_path)
+            .send_folder_to(&ip, &resolved)
             .await
             .map_err(|e| e.to_string())
     } else {
         engine
-            .send_file_to(&ip, &file_path)
+            .send_file_to(&ip, &resolved)
             .await
             .map_err(|e| e.to_string())
     }

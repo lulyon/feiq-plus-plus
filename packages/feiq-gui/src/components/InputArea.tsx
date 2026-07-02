@@ -1,5 +1,6 @@
 import { useState, useRef, useEffect, type KeyboardEvent } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { homeDir } from "@tauri-apps/api/path";
 import { Send, Smile, Paperclip, FolderOpen } from "lucide-react";
 import { useMessageStore } from "../stores/messageStore";
 import { useContactStore } from "../stores/contactStore";
@@ -84,12 +85,24 @@ export function InputArea({ fellowIp }: { fellowIp: string }) {
 
   const handleSendFolder = async () => {
     try {
-      const selected = await dialogOpen({ directory: true, multiple: false });
+      const home = await homeDir();
+      const selected = await dialogOpen({
+        directory: true,
+        multiple: false,
+        defaultPath: home,
+      });
       if (!selected) return;
 
       // Normalize: on some platforms the dialog may return an array
-      const folderPath = Array.isArray(selected) ? selected[0] : selected;
+      let folderPath = Array.isArray(selected) ? selected[0] : selected;
       if (!folderPath) return;
+
+      // macOS dialog may return a bare name instead of a full path
+      // when selecting from the sidebar. Resolve relative paths.
+      if (!folderPath.startsWith("/") && !folderPath.startsWith("\\\\")) {
+        folderPath = `${home}${folderPath}`;
+        console.log("Resolved relative folder path:", folderPath);
+      }
 
       const fellow = contacts.find((c) => c.ip === fellowIp);
       if (!fellow) {
