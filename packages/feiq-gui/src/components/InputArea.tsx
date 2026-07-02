@@ -87,16 +87,27 @@ export function InputArea({ fellowIp }: { fellowIp: string }) {
       const selected = await dialogOpen({ directory: true, multiple: false });
       if (!selected) return;
 
+      // Normalize: on some platforms the dialog may return an array
+      const folderPath = Array.isArray(selected) ? selected[0] : selected;
+      if (!folderPath) return;
+
       const fellow = contacts.find((c) => c.ip === fellowIp);
-      if (!fellow) { console.warn("No contact selected"); return; }
+      if (!fellow) {
+        console.warn("No contact selected for folder transfer");
+        return;
+      }
 
       try {
-        await invoke("send_folder", { ip: fellow.ip, folderPath: selected as string });
+        // Use "send_file" IPC — the backend auto-detects directories
+        // via std::fs::metadata and routes to send_folder_to accordingly.
+        await invoke("send_file", { ip: fellow.ip, filePath: folderPath });
       } catch (e) {
         console.error("send_folder failed:", e);
+        alert(`Failed to send folder: ${e}`);
       }
     } catch (e) {
       console.error("Folder dialog failed:", e);
+      alert(`Folder dialog error: ${e}`);
     }
   };
 
